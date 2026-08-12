@@ -1,0 +1,8 @@
+<script setup lang="ts">
+import { reactive, watch } from 'vue'
+import { ElMessage } from 'element-plus'
+import { api, json } from '../api'
+import type { Credential } from '../types'
+const props=defineProps<{modelValue:boolean}>();const emit=defineEmits<{'update:modelValue':[boolean];saved:[Credential]}>();const form=reactive({name:'',kind:'password' as 'password'|'key',secret:'',passphrase:''});watch(()=>props.modelValue,o=>{if(o)Object.assign(form,{name:'',kind:'password',secret:'',passphrase:''})});async function save(){try{const c=await api<Credential>('/api/credentials',{method:'POST',body:json(form)});emit('saved',c);emit('update:modelValue',false);ElMessage.success('凭据已安全保存')}catch(e){ElMessage.error(e instanceof Error?e.message:'保存失败')}}
+</script>
+<template><el-dialog :model-value="modelValue" title="新增凭据" width="min(520px, 94vw)" @update:model-value="emit('update:modelValue',$event)"><el-form label-position="top"><el-form-item label="名称"><el-input v-model="form.name" /></el-form-item><el-form-item label="类型"><el-segmented v-model="form.kind" :options="[{label:'密码',value:'password'},{label:'私钥',value:'key'}]" /></el-form-item><el-form-item :label="form.kind==='key'?'私钥内容':'密码'"><el-input v-model="form.secret" :type="form.kind==='key'?'textarea':'password'" :rows="8" show-password /></el-form-item><el-form-item v-if="form.kind==='key'" label="私钥口令（可选）"><el-input v-model="form.passphrase" type="password" show-password /></el-form-item></el-form><template #footer><el-button @click="emit('update:modelValue',false)">取消</el-button><el-button type="primary" @click="save">保存</el-button></template></el-dialog></template>

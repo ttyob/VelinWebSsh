@@ -1,0 +1,12 @@
+services:
+  velin:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      VELIN_ADMIN_USER: ${VELIN_ADMIN_USER:-admin}
+      VELIN_ADMIN_PASSWORD: ${VELIN_ADMIN_PASSWORD:?Set VELIN_ADMIN_PASSWORD}
+      VELIN_COOKIE_SECURE: ${VELIN_COOKIE_SECURE:-false}
+    volumes:
+      - ./data:/app/data
