@@ -1,4 +1,4 @@
-FROM node:20-alpine AS web-build
+FROM node:18.20-alpine AS web-build
 WORKDIR /src/web
 COPY web/package*.json ./
 RUN npm ci

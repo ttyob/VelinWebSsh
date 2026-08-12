@@ -17,7 +17,7 @@ Velin Web SSH 是一个自托管的浏览器 SSH 工作区。前端使用 Vue 3�
 ## 环境要求
 
 - Go 1.24+
-- Node.js 20+
+- Node.js 18.20.4+（构建链锁定为兼容 Node 18 的 Vite 6）
 - 被连接的远程 Linux/Unix 主机已安装 `tmux`
 - 生产环境使用 HTTPS/WSS 反向代理
 
