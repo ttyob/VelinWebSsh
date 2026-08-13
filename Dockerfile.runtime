@@ -5,7 +5,7 @@ COPY velin /app/velin
 COPY web/dist /app/web/dist
 RUN mkdir /app/data && chown -R velin:velin /app
 USER velin
-ENV VELIN_ADDR=:8377 VELIN_DATA_DIR=/app/data VELIN_WEB_DIST=/app/web/dist
+ENV VELIN_ADDR=:8377 VELIN_DATA_DIR=/app/data VELIN_WEB_DIST=/app/web/dist VELIN_HOST_PORT_ADDR=127.0.0.1
 VOLUME ["/app/data"]
 EXPOSE 8377
 ENTRYPOINT ["/app/velin"]

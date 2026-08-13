@@ -58,7 +58,7 @@ func main() {
 	manager := terminal.NewManager(s, vault, cfg.DeploymentID)
 	forwardManager := forward.NewManager(s, manager)
 	handler := api.New(cfg, s, vault, manager, forwardManager).Router()
-	server := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10_000_000_000, IdleTimeout: 60_000_000_000}
+	server := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp4", cfg.Addr)
 	if err != nil {
 		log.Fatal(err)

@@ -264,8 +264,25 @@ func TestRootProxyCannotOverwriteVelinSession(t *testing.T) {
 	}
 }
 
+func TestPathProxyCannotOverwriteVelinSecurityCookies(t *testing.T) {
+	target, _ := url.Parse("http://router.internal")
+	session := &webProxySession{routePrefix: "/web-service-proxy/id", target: target}
+	request, _ := http.NewRequest(http.MethodGet, "https://velin.example/web-service-proxy/id/", nil)
+	response := &http.Response{
+		Header: http.Header{"Set-Cookie": {cookieName + "=attacker; Path=/", csrfCookieName + "=attacker; Path=/", "upstream=value; Path=/"}},
+		Body:   io.NopCloser(bytes.NewReader(nil)), Request: request,
+	}
+	if err := session.modifyResponse(response); err != nil {
+		t.Fatal(err)
+	}
+	cookies := response.Header.Values("Set-Cookie")
+	if len(cookies) != 1 || !strings.Contains(cookies[0], "upstream=value") {
+		t.Fatalf("path proxy cookies=%v", cookies)
+	}
+}
+
 func TestHostPortValidation(t *testing.T) {
-	manager := &webProxyManager{hostPorts: make(map[string]*hostPortWebProxy)}
+	manager := &webProxyManager{listenAddress: "127.0.0.1", hostPorts: make(map[string]*hostPortWebProxy)}
 	if err := manager.checkHostPort("service", 0); err == nil {
 		t.Fatal("invalid host port was accepted")
 	}
@@ -291,7 +308,7 @@ func TestHostPortListenerLifecycle(t *testing.T) {
 	}
 	port := probe.Addr().(*net.TCPAddr).Port
 	_ = probe.Close()
-	manager := &webProxyManager{hostPorts: make(map[string]*hostPortWebProxy)}
+	manager := &webProxyManager{listenAddress: "127.0.0.1", hostPorts: make(map[string]*hostPortWebProxy)}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	if err = manager.setHostPort("service", port, handler); err != nil {
 		t.Fatal(err)
@@ -311,6 +328,34 @@ func TestHostPortListenerLifecycle(t *testing.T) {
 		t.Fatalf("host port was not released: %v", err)
 	}
 	_ = released.Close()
+}
+
+func TestHostPortAccessIsSingleUseAndServiceScoped(t *testing.T) {
+	manager := &webProxyManager{hostPortAccess: make(map[string]*hostPortAccess)}
+	token, err := manager.issueHostPortAccess("user", "service", "auth-hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.hostPortAuthorization(token, "user", "other", true); ok {
+		t.Fatal("access token was accepted for another service")
+	}
+	token, _ = manager.issueHostPortAccess("user", "service", "auth-hash")
+	if hash, ok := manager.hostPortAuthorization(token, "user", "service", true); !ok || hash != "auth-hash" {
+		t.Fatalf("activation hash=%q ok=%v", hash, ok)
+	}
+	if _, ok := manager.hostPortAuthorization(token, "user", "service", true); ok {
+		t.Fatal("access token activated twice")
+	}
+	if hash, ok := manager.hostPortAuthorization(token, "user", "service", false); !ok || hash != "auth-hash" {
+		t.Fatalf("activated access hash=%q ok=%v", hash, ok)
+	}
+}
+
+func TestUpstreamCookiesRemoveVelinSecurityCookies(t *testing.T) {
+	request := &http.Request{Header: http.Header{"Cookie": {"velin_session=secret; velin_csrf=token; velin_host_port_abcd=ticket; upstream=value"}}}
+	if actual := upstreamCookies(request); actual != "upstream=value" {
+		t.Fatalf("upstream cookies=%q", actual)
+	}
 }
 
 func TestHostPortURL(t *testing.T) {

@@ -29,11 +29,13 @@ import (
 )
 
 const (
-	webProxyIdleTTL = 2 * time.Hour
-	webProxyMaxTTL  = 12 * time.Hour
-	maxRewriteBody  = 8 << 20
-	maxWebProxies   = 8
-	webServiceQuery = "__velin_web_service"
+	webProxyIdleTTL      = 2 * time.Hour
+	webProxyMaxTTL       = 12 * time.Hour
+	maxRewriteBody       = 8 << 20
+	maxWebProxies        = 8
+	webServiceQuery      = "__velin_web_service"
+	hostPortAccessQuery  = "__velin_access"
+	hostPortAccessCookie = "velin_host_port_"
 )
 
 var (
@@ -43,11 +45,19 @@ var (
 
 type webProxyManager struct {
 	terminals      *terminal.Manager
+	listenAddress  string
 	mu             sync.Mutex
 	sessions       map[string]*webProxySession
 	stableSessions map[string]*webProxySession
 	stableCreating map[string]*webProxyCreation
 	hostPorts      map[string]*hostPortWebProxy
+	hostPortAccess map[string]*hostPortAccess
+}
+
+type hostPortAccess struct {
+	userID, serviceID, authTokenHash string
+	expiresAt                        time.Time
+	activated                        bool
 }
 
 type hostPortWebProxy struct {
@@ -86,15 +96,50 @@ type webProxyInput struct {
 	SkipTLSVerify bool   `json:"skipTLSVerify"`
 }
 
-func newWebProxyManager(terminals *terminal.Manager) *webProxyManager {
+func newWebProxyManager(terminals *terminal.Manager, listenAddress string) *webProxyManager {
 	m := &webProxyManager{
-		terminals: terminals, sessions: make(map[string]*webProxySession),
+		terminals: terminals, listenAddress: listenAddress, sessions: make(map[string]*webProxySession),
 		stableSessions: make(map[string]*webProxySession),
 		stableCreating: make(map[string]*webProxyCreation),
 		hostPorts:      make(map[string]*hostPortWebProxy),
+		hostPortAccess: make(map[string]*hostPortAccess),
 	}
 	go m.cleanupLoop()
 	return m
+}
+
+func (m *webProxyManager) issueHostPortAccess(userID, serviceID, authTokenHash string) (string, error) {
+	token, err := security.RandomToken(24)
+	if err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	m.hostPortAccess[token] = &hostPortAccess{userID: userID, serviceID: serviceID, authTokenHash: authTokenHash, expiresAt: time.Now().Add(12 * time.Hour)}
+	m.mu.Unlock()
+	return token, nil
+}
+
+func (m *webProxyManager) hostPortAuthorization(token, userID, serviceID string, activate bool) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	access := m.hostPortAccess[token]
+	if access == nil || access.userID != userID || access.serviceID != serviceID || time.Now().After(access.expiresAt) || (!activate && !access.activated) {
+		delete(m.hostPortAccess, token)
+		return "", false
+	}
+	if activate {
+		if access.activated {
+			return "", false
+		}
+		access.activated = true
+	}
+	return access.authTokenHash, true
+}
+
+func (m *webProxyManager) activeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sessions) + len(m.stableSessions)
 }
 
 func validateWebProxyInput(in webProxyInput) (*url.URL, string, error) {
@@ -337,7 +382,7 @@ func (m *webProxyManager) checkHostPort(serviceID string, port int) error {
 	if current != nil && current.port == port {
 		return nil
 	}
-	listener, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+	listener, err := net.Listen("tcp4", net.JoinHostPort(m.hostPortAddress(), strconv.Itoa(port)))
 	if err != nil {
 		return fmt.Errorf("无法监听主机端口 %d：%w", port, err)
 	}
@@ -351,7 +396,7 @@ func (m *webProxyManager) setHostPort(serviceID string, port int, handler http.H
 		return nil
 	}
 	m.mu.Unlock()
-	listener, err := net.Listen("tcp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+	listener, err := net.Listen("tcp4", net.JoinHostPort(m.hostPortAddress(), strconv.Itoa(port)))
 	if err != nil {
 		return fmt.Errorf("无法监听主机端口 %d：%w", port, err)
 	}
@@ -375,6 +420,13 @@ func (m *webProxyManager) setHostPort(serviceID string, port int, handler http.H
 		}
 	}()
 	return nil
+}
+
+func (m *webProxyManager) hostPortAddress() string {
+	if strings.TrimSpace(m.listenAddress) == "" {
+		return "127.0.0.1"
+	}
+	return m.listenAddress
 }
 
 func (m *webProxyManager) deleteHostPort(serviceID string) {
@@ -440,6 +492,11 @@ func (m *webProxyManager) cleanupLoop() {
 			if session.expired(now) {
 				delete(m.stableSessions, key)
 				expired = append(expired, session)
+			}
+		}
+		for token, access := range m.hostPortAccess {
+			if now.After(access.expiresAt) {
+				delete(m.hostPortAccess, token)
 			}
 		}
 		m.mu.Unlock()
@@ -532,7 +589,7 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	response.Header.Del("Set-Cookie")
 	for _, raw := range setCookies {
 		if cookie, err := http.ParseSetCookie(raw); err == nil {
-			if s.rootProxy && cookie.Name == cookieName {
+			if cookie.Name == cookieName || cookie.Name == csrfCookieName || strings.HasPrefix(cookie.Name, hostPortAccessCookie) {
 				continue
 			}
 			cookie.Domain = ""
@@ -575,7 +632,7 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 func upstreamCookies(request *http.Request) string {
 	values := make([]string, 0)
 	for _, cookie := range request.Cookies() {
-		if cookie.Name != cookieName {
+		if cookie.Name != cookieName && cookie.Name != csrfCookieName && !strings.HasPrefix(cookie.Name, hostPortAccessCookie) {
 			values = append(values, cookie.String())
 		}
 	}
@@ -1059,7 +1116,12 @@ func (a *API) openWebService(w http.ResponseWriter, r *http.Request) {
 	a.store.Audit(user.ID, "web_service_opened", "web_service", value.ID, ipOf(r), map[string]string{"name": value.Name, "mode": value.ProxyMode})
 	openURL := "/?" + url.Values{webServiceQuery: []string{value.ID}}.Encode()
 	if value.ProxyMode == "host_port" {
-		openURL = hostPortWebProxyURL(r, value.ListenPort)
+		access, accessErr := a.webProxies.issueHostPortAccess(user.ID, value.ID, currentAuthTokenHash(r))
+		if accessErr != nil {
+			writeError(w, http.StatusInternalServerError, "web_service_access_failed", "无法创建内网 Web 访问票据")
+			return
+		}
+		openURL = hostPortWebProxyURL(r, value.ListenPort) + "?" + url.Values{hostPortAccessQuery: []string{access}}.Encode()
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"url": openURL,
@@ -1136,6 +1198,38 @@ func (a *API) markedWebServiceProxy(next http.Handler) http.Handler {
 
 func (a *API) hostPortWebServiceHandler(userID, serviceID string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieName := hostPortAccessCookie + security.TokenHash(serviceID)[:12]
+		accessToken := strings.TrimSpace(r.URL.Query().Get(hostPortAccessQuery))
+		activate := accessToken != ""
+		if !activate {
+			if cookie, cookieErr := r.Cookie(cookieName); cookieErr == nil {
+				accessToken = cookie.Value
+			}
+		}
+		authTokenHash, authorized := a.webProxies.hostPortAuthorization(accessToken, userID, serviceID, activate)
+		user, locked, authErr := a.store.UserByTokenState(authTokenHash)
+		if !authorized || authErr != nil || user.Disabled || user.ID != userID {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "请先从 Velin 打开此内网 Web")
+			return
+		}
+		if locked {
+			writeError(w, http.StatusLocked, "session_locked", "当前工作区已锁定")
+			return
+		}
+		if user.ForcePasswordChange {
+			writeError(w, http.StatusForbidden, "password_change_required", "继续使用前必须修改初始密码")
+			return
+		}
+		if activate {
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			http.SetCookie(w, &http.Cookie{Name: cookieName, Value: accessToken, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 12 * 60 * 60})
+			query := r.URL.Query()
+			query.Del(hostPortAccessQuery)
+			target := *r.URL
+			target.RawQuery = query.Encode()
+			http.Redirect(w, r, target.String(), http.StatusSeeOther)
+			return
+		}
 		value, err := a.store.WebService(userID, serviceID)
 		if err != nil || value.ProxyMode != "host_port" {
 			http.NotFound(w, r)

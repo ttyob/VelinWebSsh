@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ type Config struct {
 	MasterKeyPath string
 	WebDist       string
 	CookieSecure  bool
+	HostPortAddr  string
 	SessionTTL    time.Duration
 	DeploymentID  string
 	AdminUser     string
@@ -32,6 +34,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	hostPortAddr := env("VELIN_HOST_PORT_ADDR", "127.0.0.1")
+	if parsed := net.ParseIP(hostPortAddr); parsed == nil || parsed.To4() == nil {
+		return Config{}, fmt.Errorf("VELIN_HOST_PORT_ADDR must be an IPv4 address")
+	}
 	return Config{
 		Addr:          env("VELIN_ADDR", "0.0.0.0:8377"),
 		DataDir:       dataDir,
@@ -39,6 +45,7 @@ func Load() (Config, error) {
 		MasterKeyPath: filepath.Join(dataDir, "master.key"),
 		WebDist:       env("VELIN_WEB_DIST", "web/dist"),
 		CookieSecure:  strings.EqualFold(env("VELIN_COOKIE_SECURE", "false"), "true"),
+		HostPortAddr:  hostPortAddr,
 		SessionTTL:    7 * 24 * time.Hour,
 		DeploymentID:  deploymentID,
 		AdminUser:     env("VELIN_ADMIN_USER", "admin"),

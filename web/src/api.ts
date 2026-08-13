@@ -4,10 +4,44 @@ export class ApiError extends Error {
   constructor(public status: number, public body: ApiErrorBody) { super(body.message) }
 }
 
+let csrfToken = ''
+let csrfRequest: Promise<string> | undefined
+
+async function getCSRFToken(refresh = false): Promise<string> {
+  if (refresh) {
+    csrfToken = ''
+    csrfRequest = undefined
+  }
+  if (csrfToken) return csrfToken
+  if (!csrfRequest) {
+    csrfRequest = fetch('/api/csrf', { credentials: 'same-origin' })
+      .then(async response => {
+        if (!response.ok) throw new Error('无法建立安全会话')
+        const body = await response.json() as { token: string }
+        csrfToken = body.token
+        return csrfToken
+      })
+      .finally(() => { csrfRequest = undefined })
+  }
+  return csrfRequest
+}
+
+function requiresCSRF(method = 'GET') {
+  return !['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())
+}
+
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
-  const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  if (requiresCSRF(init.method)) headers.set('X-CSRF-Token', await getCSRFToken())
+  let response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+  if (response.status === 403 && requiresCSRF(init.method)) {
+    const rejected = await response.clone().json().catch(() => ({})) as ApiErrorBody
+    if (rejected.code === 'csrf_rejected') {
+      headers.set('X-CSRF-Token', await getCSRFToken(true))
+      response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
+    }
+  }
   const body = await response.json().catch(() => ({}))
   if (!response.ok) {
     const errorBody = body as ApiErrorBody

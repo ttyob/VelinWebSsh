@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { ChevronRight, MoreHorizontal } from "@lucide/vue";
+import {
+  Apple,
+  ChevronRight,
+  Monitor,
+  MoreHorizontal,
+  Server,
+  SquareTerminal,
+} from "@lucide/vue";
 import type { Host } from "../types";
 
 defineOptions({ name: "HostGroupNode" });
@@ -32,6 +39,16 @@ const emit = defineEmits<{
 }>();
 
 const count = computed(() => countHosts(props.group));
+const platformIcons = {
+  linux: SquareTerminal,
+  windows: Monitor,
+  macos: Apple,
+  bsd: Server,
+  unix: SquareTerminal,
+};
+function hostInitial(name: string) {
+  return Array.from(name.trim())[0]?.toUpperCase() || "?";
+}
 function countHosts(group: HostTreeGroup): number {
   return (
     group.hosts.length +
@@ -72,19 +89,17 @@ function forwardSelection(id: string, value: boolean) {
           "
           @click.stop
         />
+        <span class="host-icon" :class="{ detected: Boolean(host.platform) }">
+          <component
+            :is="platformIcons[host.platform as keyof typeof platformIcons]"
+            v-if="host.platform && platformIcons[host.platform as keyof typeof platformIcons]"
+            :size="17"
+            :stroke-width="1.8"
+          />
+          <span v-else>{{ hostInitial(host.name) }}</span>
+        </span>
         <div class="host-copy">
-          <strong>{{ host.name }}</strong
-          ><small
-            >{{ host.username }}@{{ host.address }}:{{ host.port
-            }}<template v-if="host.lastStatus">
-              ·
-              {{
-                host.lastStatus === "online"
-                  ? `${host.lastLatencyMs || 0} ms`
-                  : "离线"
-              }}</template
-            ></small
-          >
+          <strong>{{ host.name }}</strong>
         </div>
         <span v-if="!selecting" class="host-row-actions"
           ><el-dropdown trigger="click" @click.stop

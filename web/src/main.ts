@@ -7,6 +7,7 @@ import App from "./App.vue";
 import router from "./router";
 import { applyAccent, applyInterfaceTheme } from "./themePresets";
 import "./styles.css";
+import "./styles-refresh.css";
 
 try {
   applyInterfaceTheme(localStorage.getItem("velin-interface-theme") || "dark");

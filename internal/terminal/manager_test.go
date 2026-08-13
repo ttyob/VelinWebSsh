@@ -60,3 +60,19 @@ func TestValidTerminalColor(t *testing.T) {
 		}
 	}
 }
+
+func TestPlatformFromName(t *testing.T) {
+	for input, expected := range map[string]string{
+		"Linux\n":       "linux",
+		"Darwin":        "macos",
+		"MINGW64_NT":    "windows",
+		"FreeBSD":       "bsd",
+		"SunOS":         "unix",
+		"  OpenBSD  \n": "bsd",
+		"":              "",
+	} {
+		if actual := platformFromName(input); actual != expected {
+			t.Errorf("platformFromName(%q)=%q, want %q", input, actual, expected)
+		}
+	}
+}

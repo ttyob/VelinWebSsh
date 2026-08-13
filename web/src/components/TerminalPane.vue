@@ -23,8 +23,10 @@ import {
 } from "@lucide/vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { ApiError, api, json } from "../api";
+import { terminalFontFamily } from "../types";
 import type { Preferences, TerminalSession } from "../types";
 import { terminalXtermTheme } from "../themePresets";
+import { reconnectDelay } from "../reconnect";
 
 const props = withDefaults(
   defineProps<{
@@ -61,6 +63,7 @@ let search: SearchAddon | undefined;
 let socket: WebSocket | undefined;
 let observer: ResizeObserver | undefined;
 let reconnectTimer: number | undefined;
+let reconnectAttempts = 0;
 let heartbeatTimer: number | undefined;
 let disposed = false;
 let clientID = "";
@@ -224,9 +227,18 @@ async function ensureAttached() {
           ? "auth_required"
           : "unreachable";
       statusMessage.value = message;
+	  scheduleReconnect();
     }
     emit("status", props.session.id, status.value, statusMessage.value);
   }
+}
+
+function scheduleReconnect() {
+  if (disposed || status.value === "ended" || status.value === "auth_required") return;
+  clearTimeout(reconnectTimer);
+  const delay = reconnectDelay(reconnectAttempts);
+  reconnectAttempts = Math.min(reconnectAttempts + 1, 5);
+  reconnectTimer = window.setTimeout(ensureAttached, delay);
 }
 async function restoreWith(extra: {
   secret?: string;
@@ -256,6 +268,7 @@ function connectSocket() {
     lastSentCols = 0;
     lastSentRows = 0;
     connected.value = true;
+	reconnectAttempts = 0;
     status.value = "attached";
     emit("status", props.session.id, "attached");
     heartbeatTimer = window.setInterval(() => {
@@ -348,7 +361,7 @@ function connectSocket() {
     connected.value = false;
     if (!disposed && status.value !== "ended") {
       status.value = "reconnecting";
-      reconnectTimer = window.setTimeout(ensureAttached, 1800);
+	  scheduleReconnect();
     }
   };
 }
@@ -465,6 +478,15 @@ function findNext() {
 function focus() {
   terminal?.focus();
 }
+function restoreTerminalFocus() {
+  nextTick(() => {
+    requestAnimationFrame(() => {
+      if (!disposed && props.visible && container.value?.isConnected) {
+        terminal?.focus();
+      }
+    });
+  });
+}
 async function sendInput(data: string) {
   if (!data) return;
   if (!controller.value) {
@@ -489,6 +511,8 @@ async function sendInput(data: string) {
       );
     } catch {
       return;
+    } finally {
+      restoreTerminalFocus();
     }
   }
   if (socket?.readyState === WebSocket.OPEN) {
@@ -515,26 +539,30 @@ async function copySelection() {
   ElMessage.success("已复制");
 }
 async function pasteClipboard() {
-  let text = "";
   try {
-    text = await navigator.clipboard.readText();
-  } catch {
+    let text = "";
     try {
-      const result = await ElMessageBox.prompt(
-        "浏览器无法直接读取剪贴板，请在此粘贴内容。",
-        "粘贴到终端",
-        {
-          confirmButtonText: "发送",
-          cancelButtonText: "取消",
-          inputType: "textarea",
-        },
-      );
-      text = result.value;
+      text = await navigator.clipboard.readText();
     } catch {
-      return;
+      try {
+        const result = await ElMessageBox.prompt(
+          "浏览器无法直接读取剪贴板，请在此粘贴内容。",
+          "粘贴到终端",
+          {
+            confirmButtonText: "发送",
+            cancelButtonText: "取消",
+            inputType: "textarea",
+          },
+        );
+        text = result.value;
+      } catch {
+        return;
+      }
     }
+    await sendInput(text);
+  } finally {
+    restoreTerminalFocus();
   }
-  await sendInput(text);
 }
 function selectAll() {
   terminal?.selectAll();
@@ -632,7 +660,7 @@ onMounted(() => {
     cursorStyle: props.preferences.cursorStyle,
     fontSize: props.preferences.fontSize,
     lineHeight: props.preferences.lineHeight,
-    fontFamily: props.preferences.fontFamily,
+    fontFamily: terminalFontFamily,
     fontWeight: props.preferences.fontWeight,
     letterSpacing: props.preferences.letterSpacing,
     theme: terminalXtermTheme(props.preferences.terminalTheme),
@@ -724,7 +752,6 @@ watch(
     if (terminal) {
       terminal.options.fontSize = value.fontSize;
       terminal.options.lineHeight = value.lineHeight;
-      terminal.options.fontFamily = value.fontFamily;
       terminal.options.fontWeight = value.fontWeight;
       terminal.options.letterSpacing = value.letterSpacing;
       terminal.options.cursorStyle = value.cursorStyle;

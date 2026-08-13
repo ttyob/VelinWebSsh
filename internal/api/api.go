@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -35,6 +36,7 @@ import (
 )
 
 const cookieName = "velin_session"
+const csrfCookieName = "velin_csrf"
 
 type API struct {
 	cfg        config.Config
@@ -46,6 +48,14 @@ type API struct {
 	started    time.Time
 	requests   atomic.Int64
 	websockets atomic.Int64
+	httpTotal  atomic.Uint64
+	httpErrors atomic.Uint64
+	httpNanos  atomic.Uint64
+	http2xx    atomic.Uint64
+	http3xx    atomic.Uint64
+	http4xx    atomic.Uint64
+	http5xx    atomic.Uint64
+	wsTotal    atomic.Uint64
 }
 
 type contextKey string
@@ -71,7 +81,7 @@ func (a *API) securityPolicy() securityPolicy {
 }
 
 func New(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Manager, forwards *forward.Manager) *API {
-	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, webProxies: newWebProxyManager(t), started: time.Now()}
+	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, webProxies: newWebProxyManager(t, cfg.HostPortAddr), started: time.Now()}
 	a.restoreHostPortWebServices()
 	return a
 }
@@ -80,7 +90,10 @@ func (a *API) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(a.requestID, a.recoverer, a.requestLog, a.securityHeaders, a.csrfProtection)
 	r.Use(a.markedWebServiceProxy)
-	r.Get("/api/health", a.health)
+	r.Get("/api/health", a.ready)
+	r.Get("/api/health/live", a.live)
+	r.Get("/api/health/ready", a.ready)
+	r.Get("/api/csrf", a.csrfToken)
 	r.Post("/api/auth/login", a.login)
 	r.Group(func(r chi.Router) {
 		r.Use(a.authenticate)
@@ -165,6 +178,7 @@ func (a *API) Router() http.Handler {
 			r.Get("/api/admin/security-policy", a.getSecurityPolicy)
 			r.Put("/api/admin/security-policy", a.saveSecurityPolicy)
 			r.Get("/api/admin/stats", a.stats)
+			r.Get("/api/admin/metrics", a.metrics)
 			r.Post("/api/admin/backup", a.backup)
 			r.Get("/api/admin/backups", a.backups)
 		})
@@ -212,15 +226,24 @@ func (a *API) requestID(next http.Handler) http.Handler {
 
 func (a *API) csrfProtection(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions {
-			origin := r.Header.Get("Origin")
-			if origin != "" && !sameOrigin(r, origin) {
-				writeError(w, http.StatusForbidden, "origin_rejected", "请求来源不允许")
-				return
-			}
+		if isSafeMethod(r.Method) || isWebProxyPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+			writeError(w, http.StatusForbidden, "cross_site_rejected", "不允许跨站写请求")
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isSafeMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
+}
+
+func isWebProxyPath(path string) bool {
+	return strings.HasPrefix(path, "/web-proxy/") || strings.HasPrefix(path, "/web-service-proxy/")
 }
 
 func (a *API) recoverer(next http.Handler) http.Handler {
@@ -237,10 +260,52 @@ func (a *API) recoverer(next http.Handler) http.Handler {
 func (a *API) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
+		tracked := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(tracked, r)
+		a.httpTotal.Add(1)
+		a.httpNanos.Add(uint64(time.Since(start)))
+		if tracked.status >= http.StatusBadRequest {
+			a.httpErrors.Add(1)
+		}
+		switch tracked.status / 100 {
+		case 2:
+			a.http2xx.Add(1)
+		case 3:
+			a.http3xx.Add(1)
+		case 4:
+			a.http4xx.Add(1)
+		case 5:
+			a.http5xx.Add(1)
+		}
 		slog.Info("request", "request_id", r.Context().Value(contextKey("request_id")), "method", r.Method, "path", logRequestPath(r.URL.Path), "duration", time.Since(start).String())
 	})
 }
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("hijacking not supported")
+	}
+	return hijacker.Hijack()
+}
+
+func (w *statusWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func logRequestPath(path string) string {
 	for _, prefix := range []string{"/web-proxy/", "/web-service-proxy/"} {
@@ -1669,12 +1734,52 @@ func (a *API) backups(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, out)
 }
-func (a *API) health(w http.ResponseWriter, r *http.Request) {
+func (a *API) live(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "uptime_seconds": int(time.Since(a.started).Seconds())})
+}
+
+func (a *API) ready(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.DB.PingContext(r.Context()); err != nil {
 		writeError(w, 503, "not_ready", "数据库不可用")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"status": "ok", "uptime_seconds": int(time.Since(a.started).Seconds())})
+}
+
+func (a *API) csrfToken(w http.ResponseWriter, r *http.Request) {
+	token := ""
+	if cookie, err := r.Cookie(csrfCookieName); err == nil && len(cookie.Value) >= 32 {
+		token = cookie.Value
+	}
+	if token == "" {
+		var err error
+		token, err = security.RandomToken(24)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "csrf_failed", "无法建立安全会话")
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: token, Path: "/", Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
+}
+
+func (a *API) metrics(w http.ResponseWriter, _ *http.Request) {
+	total, nanos := a.httpTotal.Load(), a.httpNanos.Load()
+	average := float64(0)
+	if total > 0 {
+		average = float64(nanos) / float64(total) / float64(time.Second)
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# TYPE velin_uptime_seconds gauge\nvelin_uptime_seconds %d\n", int(time.Since(a.started).Seconds()))
+	fmt.Fprintf(w, "# TYPE velin_http_requests_total counter\nvelin_http_requests_total %d\n", total)
+	fmt.Fprintf(w, "# TYPE velin_http_errors_total counter\nvelin_http_errors_total %d\n", a.httpErrors.Load())
+	fmt.Fprintf(w, "# TYPE velin_http_responses_total counter\nvelin_http_responses_total{class=\"2xx\"} %d\nvelin_http_responses_total{class=\"3xx\"} %d\nvelin_http_responses_total{class=\"4xx\"} %d\nvelin_http_responses_total{class=\"5xx\"} %d\n", a.http2xx.Load(), a.http3xx.Load(), a.http4xx.Load(), a.http5xx.Load())
+	fmt.Fprintf(w, "# TYPE velin_http_request_duration_seconds_average gauge\nvelin_http_request_duration_seconds_average %.6f\n", average)
+	fmt.Fprintf(w, "# TYPE velin_websockets gauge\nvelin_websockets %d\n", a.websockets.Load())
+	fmt.Fprintf(w, "# TYPE velin_websocket_connections_total counter\nvelin_websocket_connections_total %d\n", a.wsTotal.Load())
+	fmt.Fprintf(w, "# TYPE velin_terminal_sessions gauge\nvelin_terminal_sessions %d\n", a.terminals.ActiveCount())
+	fmt.Fprintf(w, "# TYPE velin_port_forwards gauge\nvelin_port_forwards %d\n", a.forwards.ActiveCount())
+	fmt.Fprintf(w, "# TYPE velin_web_proxy_sessions gauge\nvelin_web_proxy_sessions %d\n", a.webProxies.activeCount())
 }
 
 func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
@@ -1685,11 +1790,6 @@ func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 	if u.SessionLocked {
 		writeError(w, http.StatusLocked, "session_locked", "当前工作区已锁定")
-		return
-	}
-	origin := r.Header.Get("Origin")
-	if origin != "" && !sameOrigin(r, origin) {
-		writeError(w, 403, "origin_rejected", "来源不允许")
 		return
 	}
 	id := chi.URLParam(r, "id")
@@ -1704,6 +1804,7 @@ func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.websockets.Add(1)
+	a.wsTotal.Add(1)
 	defer a.websockets.Add(-1)
 	defer conn.Close()
 	clientID := uuid.NewString()
@@ -1779,10 +1880,6 @@ func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func sameOrigin(r *http.Request, origin string) bool {
-	host := strings.TrimPrefix(strings.TrimPrefix(origin, "https://"), "http://")
-	return strings.TrimSuffix(host, "/") == r.Host
-}
 func (a *API) staticHandler() http.Handler {
 	dist := a.cfg.WebDist
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -222,7 +222,7 @@ func TestHostMigrationAndConnectionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if host.ConnectTimeout != 12 || host.KeepaliveInterval != 30 || host.MaxRetries != 5 || host.TerminalType != "xterm-256color" {
+	if host.ConnectTimeout != 12 || host.KeepaliveInterval != 30 || host.MaxRetries != 5 || host.TerminalType != "xterm-256color" || host.Platform != "" {
 		t.Fatalf("unexpected migrated defaults: %+v", host)
 	}
 	if err = s.UpdateHostConnection("u1", "h1", "online", 37); err != nil {
@@ -235,8 +235,15 @@ func TestHostMigrationAndConnectionMetadata(t *testing.T) {
 	if host.LastStatus != "online" || host.LastLatency != 37 || host.LastConnectedAt == nil {
 		t.Fatalf("connection metadata was not saved: %+v", host)
 	}
+	if err = s.UpdateHostPlatform("u1", "h1", "linux"); err != nil {
+		t.Fatal(err)
+	}
+	host, err = s.Host("u1", "h1")
+	if err != nil || host.Platform != "linux" {
+		t.Fatalf("platform=%q err=%v", host.Platform, err)
+	}
 	var version int
-	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 8 {
+	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 9 {
 		t.Fatalf("user_version=%d err=%v", version, err)
 	}
 }

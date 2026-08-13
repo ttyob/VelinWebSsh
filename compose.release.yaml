@@ -1,12 +1,11 @@
 services:
   velin:
-    build:
-      context: .
-      network: host
+    image: ${VELIN_IMAGE:-ghcr.io/ttyob/velinwebssh:latest}
+    container_name: velin
     network_mode: host
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8377/api/health/ready"]
+      test: ["CMD-SHELL", "port=$${VELIN_ADDR##*:}; wget -q -O - \"http://127.0.0.1:$${port}/api/health/ready\""]
       interval: 30s
       timeout: 5s
       retries: 3

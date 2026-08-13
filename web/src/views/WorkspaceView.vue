@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   computed,
+  defineAsyncComponent,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -46,22 +47,26 @@ import type {
   WebService,
   WorkspaceLayout,
 } from "../types";
-import {
-  legacyTerminalFontFamily,
-  systemUIFontFamily,
-} from "../types";
 import SplitPaneNode from "../components/SplitPaneNode.vue";
 import HostDialog from "../components/HostDialog.vue";
-import SettingsDrawer from "../components/SettingsDrawer.vue";
 import HostResourceList from "../components/HostResourceList.vue";
-import FileManagerDialog from "../components/FileManagerDialog.vue";
-import WebProxyDialog from "../components/WebProxyDialog.vue";
 import WebServiceList from "../components/WebServiceList.vue";
+import { useWorkspaceLock } from "../composables/useWorkspaceLock";
 import {
   applyAccent,
   applyInterfaceTheme,
   findInterfaceTheme,
 } from "../themePresets";
+
+const SettingsDrawer = defineAsyncComponent(
+  () => import("../components/SettingsDrawer.vue"),
+);
+const FileManagerDialog = defineAsyncComponent(
+  () => import("../components/FileManagerDialog.vue"),
+);
+const WebProxyDialog = defineAsyncComponent(
+  () => import("../components/WebProxyDialog.vue"),
+);
 
 const router = useRouter(),
   auth = useAuthStore();
@@ -113,7 +118,6 @@ const preferences = reactive<Preferences>({
   terminalTheme: "velin",
   fontSize: 14,
   lineHeight: 1.25,
-  fontFamily: legacyTerminalFontFamily,
   fontWeight: 400,
   letterSpacing: 0,
   foreground: "#d8ded9",
@@ -144,18 +148,6 @@ const watchedSessionIDs = ref<string[]>([]);
 const pinnedSessionIDs = ref<string[]>([]);
 const mobileCtrl = ref(false),
   mobileAlt = ref(false);
-const lockStorageKey = "velin-workspace-locked";
-const lockSignalKey = "velin-workspace-lock-signal";
-const locked = ref(Boolean(auth.user?.sessionLocked));
-const lockPIN = ref("");
-const unlocking = ref(false);
-const lockError = ref("");
-const lockPINInput = ref<any>();
-let idleLockTimer: number | undefined;
-let locking = false;
-try {
-  locked.value ||= sessionStorage.getItem(lockStorageKey) === "1";
-} catch {}
 const contextMenu = reactive({ open: false, x: 0, y: 0, leafID: "" });
 const splitDialog = reactive({
   open: false,
@@ -477,9 +469,7 @@ async function load() {
     delete (preferences as Preferences & { lockOnHidden?: boolean })
       .lockOnHidden;
     preferences.lockEnabled &&= lockPINStatus.configured;
-    if (preferences.fontFamily === systemUIFontFamily) {
-      preferences.fontFamily = legacyTerminalFontFamily;
-    }
+    delete (preferences as Preferences & { fontFamily?: string }).fontFamily;
     const valid = new Set(s.map((item) => item.id)),
       saved = (w.layout || {}) as unknown;
     const isDocument = (
@@ -556,6 +546,7 @@ async function connect(
       body: json(body),
     });
     sessions.value.unshift(session);
+    void refreshHosts();
     if (placement)
       addSplitSession(
         placement.tabID,
@@ -1118,7 +1109,11 @@ async function testHost(
 ) {
   testing.value = host.id;
   try {
-    const result = await api<{ latencyMs: number; tmuxVersion: string }>(
+    const result = await api<{
+      latencyMs: number;
+      tmuxVersion: string;
+      platform?: Host["platform"];
+    }>(
       `/api/hosts/${host.id}/test`,
       {
         method: "POST",
@@ -1133,6 +1128,7 @@ async function testHost(
     host.lastStatus = "online";
     host.lastLatencyMs = result.latencyMs;
     host.lastConnectedAt = new Date().toISOString();
+    if (result.platform) host.platform = result.platform;
     ElMessage.success(
       `连接正常 · ${result.latencyMs} ms · ${result.tmuxVersion}`,
     );
@@ -1367,9 +1363,7 @@ async function logout() {
   try {
     await auth.logout();
   } finally {
-    try {
-      sessionStorage.removeItem(lockStorageKey);
-    } catch {}
+    clearStoredLock();
     router.replace("/login");
   }
 }
@@ -1383,124 +1377,25 @@ function closeWorkspaceOverlays() {
   contextMenu.open = false;
   splitDialog.open = false;
   mobileSidebar.value = false;
-}
-function showLockScreen() {
-  locked.value = true;
-  lockPIN.value = "";
-  lockError.value = "";
   mobileCtrl.value = false;
   mobileAlt.value = false;
-  closeWorkspaceOverlays();
-  (document.activeElement as HTMLElement | null)?.blur?.();
-  clearTimeout(idleLockTimer);
-  try {
-    sessionStorage.setItem(lockStorageKey, "1");
-  } catch {}
-  nextTick(() => lockPINInput.value?.focus?.());
 }
-function broadcastLockState(value: "locked" | "unlocked") {
-  try {
-    localStorage.setItem(
-      lockSignalKey,
-      JSON.stringify({ value, at: Date.now() }),
-    );
-  } catch {}
-}
-function handleLockSignal(event: StorageEvent) {
-  if (event.key !== lockSignalKey || !event.newValue) return;
-  try {
-    const signal = JSON.parse(event.newValue);
-    if (signal.value === "locked") showLockScreen();
-    else if (signal.value === "unlocked") {
-      locked.value = false;
-      lockPIN.value = "";
-      lockError.value = "";
-      if (auth.user) auth.user.sessionLocked = false;
-      sessionStorage.removeItem(lockStorageKey);
-      void load();
-      resetIdleLockTimer();
-    }
-  } catch {}
-}
-async function lockWorkspace(reason: "manual" | "idle" | "shortcut") {
-  if (!preferences.lockEnabled || locked.value || locking) return;
-  locking = true;
-  showLockScreen();
-  broadcastLockState("locked");
-  try {
-    await api("/api/auth/lock", {
-      method: "POST",
-      body: json({ reason }),
-    });
-    if (auth.user) auth.user.sessionLocked = true;
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 401) await logout();
-    else {
-      locked.value = false;
-      try {
-        sessionStorage.removeItem(lockStorageKey);
-      } catch {}
-      broadcastLockState("unlocked");
-      ElMessage.error(error instanceof Error ? error.message : "锁屏失败");
-      resetIdleLockTimer();
-    }
-  } finally {
-    locking = false;
-  }
-}
-async function unlockWorkspace() {
-  if (!/^\d{6}$/.test(lockPIN.value) || unlocking.value) return;
-  unlocking.value = true;
-  lockError.value = "";
-  try {
-    await api("/api/auth/unlock", {
-      method: "POST",
-      body: json({ pin: lockPIN.value }),
-    });
-    locked.value = false;
-    lockPIN.value = "";
-    if (auth.user) auth.user.sessionLocked = false;
-    try {
-      sessionStorage.removeItem(lockStorageKey);
-    } catch {}
-    broadcastLockState("unlocked");
-    await load();
-    resetIdleLockTimer();
-  } catch (error) {
-    lockError.value = error instanceof Error ? error.message : "解锁失败";
-    await nextTick();
-    lockPINInput.value?.focus?.();
-  } finally {
-    unlocking.value = false;
-  }
-}
-function resetIdleLockTimer() {
-  clearTimeout(idleLockTimer);
-  if (
-    locked.value ||
-    !preferences.lockEnabled ||
-    preferences.autoLockMinutes <= 0
-  )
-    return;
-  idleLockTimer = window.setTimeout(
-    () => void lockWorkspace("idle"),
-    preferences.autoLockMinutes * 60_000,
-  );
-}
-function recordWorkspaceActivity(event?: Event) {
-  if (locked.value) return;
-  if (event instanceof KeyboardEvent) {
-    if (
-      preferences.lockOnShortcut &&
-      (event.metaKey || event.getModifierState("Meta")) &&
-      event.code === "KeyL"
-    ) {
-      void lockWorkspace("shortcut");
-      return;
-    }
-  }
-  resetIdleLockTimer();
-}
+const {
+  locked,
+  lockPIN,
+  unlocking,
+  lockError,
+  lockPINInput,
+  lockWorkspace,
+  unlockWorkspace,
+  clearStoredLock,
+} = useWorkspaceLock({
+  preferences,
+  auth,
+  closeOverlays: closeWorkspaceOverlays,
+  reload: load,
+  logout,
+});
 async function confirmLogout() {
   try {
     await ElMessageBox.confirm("退出账号不会终止远程 tmux 任务。", "退出登录", {
@@ -1544,32 +1439,12 @@ onMounted(() => {
   } catch {}
   if (!locked.value) load();
   window.addEventListener("keydown", handleKeyboard, true);
-  window.addEventListener("keydown", recordWorkspaceActivity, true);
-  for (const name of ["pointerdown", "wheel", "touchstart"] as const)
-    window.addEventListener(name, recordWorkspaceActivity, {
-      capture: true,
-      passive: true,
-    });
-  window.addEventListener("storage", handleLockSignal);
-  window.addEventListener("velin:session-locked", showLockScreen);
-  resetIdleLockTimer();
-  if (locked.value) nextTick(() => lockPINInput.value?.focus?.());
 });
 onBeforeUnmount(() => {
   sidebarResizeCleanup?.();
   clearTimeout(saveTimer.value);
-  clearTimeout(idleLockTimer);
   window.removeEventListener("keydown", handleKeyboard, true);
-  window.removeEventListener("keydown", recordWorkspaceActivity, true);
-  for (const name of ["pointerdown", "wheel", "touchstart"] as const)
-    window.removeEventListener(name, recordWorkspaceActivity, true);
-  window.removeEventListener("storage", handleLockSignal);
-  window.removeEventListener("velin:session-locked", showLockScreen);
 });
-watch(
-  () => [preferences.lockEnabled, preferences.autoLockMinutes],
-  () => resetIdleLockTimer(),
-);
 </script>
 
 <template>

@@ -1,15 +1,12 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import LoginView from './views/LoginView.vue'
-import WorkspaceView from './views/WorkspaceView.vue'
-import ChangePasswordView from './views/ChangePasswordView.vue'
 import { useAuthStore } from './stores/auth'
 
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: '/login', component: LoginView, meta: { public: true } },
-    { path: '/change-password', component: ChangePasswordView },
-    { path: '/workspace', component: WorkspaceView },
+    { path: '/login', component: () => import('./views/LoginView.vue'), meta: { public: true } },
+    { path: '/change-password', component: () => import('./views/ChangePasswordView.vue') },
+    { path: '/workspace', component: () => import('./views/WorkspaceView.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/workspace' },
   ],
 })

@@ -33,7 +33,6 @@ import type {
   TerminalSession,
   User,
 } from "../types";
-import { legacyTerminalFontFamily } from "../types";
 import ToolsDrawer from "./ToolsDrawer.vue";
 import CredentialsPanel from "./CredentialsPanel.vue";
 import {
@@ -111,7 +110,6 @@ const terminalDefaults: Preferences = {
   terminalTheme: "velin",
   fontSize: 14,
   lineHeight: 1.25,
-  fontFamily: legacyTerminalFontFamily,
   fontWeight: 400,
   letterSpacing: 0,
   foreground: "#d8ded9",
@@ -783,9 +781,6 @@ function forwardBatch(text: string, sessionIDs: string[]) {
                     :size="14"
                   />
                 </button>
-              </div>
-              <div class="setting-row">
-                <span>字体</span><el-input v-model="preferences.fontFamily" />
               </div>
               <div class="setting-row">
                 <span>字号</span

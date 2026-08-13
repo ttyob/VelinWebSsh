@@ -126,7 +126,7 @@ async function save() {
         v-else
         type="warning"
         :closable="false"
-        title="主机端口会独立监听并直接暴露服务，不继承 Velin 登录保护。请用防火墙或反向代理限制访问。"
+        title="主机端口默认仅监听本机并验证 Velin 登录；如配置为局域网监听，仍应使用防火墙限制来源。"
       />
       <el-form-item label="名称">
         <el-input v-model="form.name" placeholder="例如：家庭路由器" />

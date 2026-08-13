@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -120,6 +121,36 @@ func TestEditableTextVersion(t *testing.T) {
 	}
 	if first == editableTextVersion([]byte("key=changed\n")) {
 		t.Fatal("different content produced the same version")
+	}
+}
+
+func TestCSRFProtectionRejectsExplicitCrossSiteRequest(t *testing.T) {
+	a := &API{}
+	handler := a.csrfProtection(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	request := httptest.NewRequest(http.MethodPut, "http://velin.example/api/preferences", strings.NewReader(`{}`))
+	request.Header.Set("Sec-Fetch-Site", "cross-site")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), "cross_site_rejected") {
+		t.Fatalf("cross-site status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPut, "http://velin.example/api/preferences", strings.NewReader(`{}`))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("valid CSRF status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestCSRFProtectionDoesNotConsumeProxiedApplicationRequests(t *testing.T) {
+	a := &API{}
+	handler := a.csrfProtection(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	request := httptest.NewRequest(http.MethodPost, "http://velin.example/web-proxy/token/api/save", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("proxy POST status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

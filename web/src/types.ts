@@ -84,6 +84,7 @@ export interface Host {
   keepaliveInterval: number;
   maxRetries: number;
   terminalType: string;
+  platform?: "linux" | "windows" | "macos" | "bsd" | "unix" | "";
   lastStatus?: string;
   lastLatencyMs?: number;
   lastConnectedAt?: string;
@@ -127,7 +128,6 @@ export interface Preferences {
   terminalTheme: string;
   fontSize: number;
   lineHeight: number;
-  fontFamily: string;
   fontWeight: number;
   letterSpacing: number;
   foreground: string;
@@ -144,10 +144,8 @@ export interface Preferences {
   lockOnShortcut: boolean;
 }
 
-export const systemUIFontFamily =
-  '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif';
-export const legacyTerminalFontFamily =
-  "JetBrains Mono, Cascadia Code, Menlo, Consolas, monospace";
+export const terminalFontFamily =
+  '"JetBrains Mono", "Cascadia Mono", "Cascadia Code", Menlo, Consolas, "Sarasa Mono SC", "Noto Sans Mono CJK SC", "Source Han Mono SC", "Microsoft YaHei", monospace';
 export interface PaneLeaf {
   type: "leaf";
   id: string;

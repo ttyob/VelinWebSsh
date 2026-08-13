@@ -39,6 +39,7 @@ type CreateRequest struct {
 type TestResult struct {
 	LatencyMS   int64  `json:"latencyMs"`
 	TmuxVersion string `json:"tmuxVersion"`
+	Platform    string `json:"platform"`
 	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
@@ -96,6 +97,12 @@ func NewManager(s *store.Store, vault *security.Vault, deploymentID string) *Man
 	return &Manager{store: s, vault: vault, deploymentID: deploymentID, sessions: make(map[string]*Session)}
 }
 
+func (m *Manager) ActiveCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessions)
+}
+
 func (m *Manager) Create(ctx context.Context, userID string, req CreateRequest) (store.TerminalSession, error) {
 	id := uuid.NewString()
 	meta := store.TerminalSession{ID: id, UserID: userID, HostID: req.Host.ID, CredentialID: req.Credential.ID, Name: req.Name, RemoteUser: req.Host.Username, TmuxSocket: "velin-webssh-" + m.deploymentID, TmuxName: "ws_" + strings.ReplaceAll(id, "-", ""), OwnerMarker: m.deploymentID + ":" + userID + ":" + id, Status: "creating"}
@@ -130,7 +137,11 @@ func (m *Manager) Test(ctx context.Context, userID string, host store.Host, cred
 	if err != nil {
 		return TestResult{}, fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
 	}
-	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out))}, nil
+	platform := detectPlatform(client)
+	if platform != "" {
+		_ = m.store.UpdateHostPlatform(userID, host.ID, platform)
+	}
+	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out)), Platform: platform}, nil
 }
 
 func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, trust string) (*Session, error) {
@@ -271,6 +282,9 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 	if out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V"); err != nil {
 		client.Close()
 		return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
+	}
+	if platform := detectPlatform(client); platform != "" {
+		_ = s.manager.store.UpdateHostPlatform(s.meta.UserID, host.ID, platform)
 	}
 	if create {
 		startDir := ""
@@ -450,6 +464,35 @@ func run(client *ssh.Client, cmd string) ([]byte, error) {
 	}
 	defer s.Close()
 	return s.CombinedOutput(cmd)
+}
+
+func detectPlatform(client *ssh.Client) string {
+	if strings.Contains(strings.ToLower(string(client.ServerVersion())), "windows") {
+		return "windows"
+	}
+	out, err := run(client, "uname -s 2>/dev/null || true")
+	if err != nil {
+		return ""
+	}
+	return platformFromName(string(out))
+}
+
+func platformFromName(value string) string {
+	name := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case strings.Contains(name, "darwin"):
+		return "macos"
+	case strings.Contains(name, "linux"):
+		return "linux"
+	case strings.Contains(name, "mingw"), strings.Contains(name, "msys"), strings.Contains(name, "cygwin"), strings.Contains(name, "windows"):
+		return "windows"
+	case strings.Contains(name, "freebsd"), strings.Contains(name, "openbsd"), strings.Contains(name, "netbsd"), strings.Contains(name, "dragonfly"):
+		return "bsd"
+	case name != "":
+		return "unix"
+	default:
+		return ""
+	}
 }
 func cleanOutput(out []byte, err error) string {
 	msg := strings.TrimSpace(string(out))

@@ -30,6 +30,11 @@ func NewManager(s *store.Store, terminals *terminal.Manager) *Manager {
 	_, _ = s.DB.Exec(`UPDATE port_forwards SET status='stopped',last_error='' WHERE status='running'`)
 	return &Manager{store: s, terminals: terminals, active: make(map[string]*running)}
 }
+func (m *Manager) ActiveCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.active)
+}
 func (m *Manager) List(userID string) ([]store.PortForward, error) {
 	return m.store.PortForwards(userID)
 }
