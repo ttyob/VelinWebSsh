@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -15,26 +16,35 @@ import (
 type Store struct{ DB *sql.DB }
 
 type User struct {
-	ID        string    `json:"id"`
-	Username  string    `json:"username"`
-	Role      string    `json:"role"`
-	Disabled  bool      `json:"disabled"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID                  string    `json:"id"`
+	Username            string    `json:"username"`
+	Role                string    `json:"role"`
+	Disabled            bool      `json:"disabled"`
+	ForcePasswordChange bool      `json:"forcePasswordChange"`
+	SessionLocked       bool      `json:"sessionLocked,omitempty"`
+	CreatedAt           time.Time `json:"createdAt"`
 }
 type Host struct {
-	ID           string    `json:"id"`
-	UserID       string    `json:"userID"`
-	Name         string    `json:"name"`
-	Address      string    `json:"address"`
-	Username     string    `json:"username"`
-	GroupName    string    `json:"groupName"`
-	Tags         string    `json:"tags"`
-	Notes        string    `json:"notes"`
-	CredentialID string    `json:"credentialID"`
-	Port         int       `json:"port"`
-	Favorite     bool      `json:"favorite"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	ID                string     `json:"id"`
+	UserID            string     `json:"userID"`
+	Name              string     `json:"name"`
+	Address           string     `json:"address"`
+	Username          string     `json:"username"`
+	GroupName         string     `json:"groupName"`
+	Tags              string     `json:"tags"`
+	Notes             string     `json:"notes"`
+	CredentialID      string     `json:"credentialID"`
+	Port              int        `json:"port"`
+	InitialDir        string     `json:"initialDirectory"`
+	ConnectTimeout    int        `json:"connectTimeout"`
+	KeepaliveInterval int        `json:"keepaliveInterval"`
+	MaxRetries        int        `json:"maxRetries"`
+	TerminalType      string     `json:"terminalType"`
+	LastStatus        string     `json:"lastStatus"`
+	LastLatency       int        `json:"lastLatencyMs"`
+	LastConnectedAt   *time.Time `json:"lastConnectedAt,omitempty"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	UpdatedAt         time.Time  `json:"updatedAt"`
 }
 type Credential struct {
 	ID         string    `json:"id"`
@@ -60,6 +70,56 @@ type TerminalSession struct {
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
+type Snippet struct {
+	ID          string    `json:"id"`
+	UserID      string    `json:"userID"`
+	Name        string    `json:"name"`
+	GroupName   string    `json:"groupName"`
+	Tags        string    `json:"tags"`
+	Command     string    `json:"command"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+type Notification struct {
+	ID        string    `json:"id"`
+	UserID    string    `json:"userID"`
+	SessionID string    `json:"sessionID"`
+	Title     string    `json:"title"`
+	Kind      string    `json:"kind"`
+	Read      bool      `json:"read"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+type PortForward struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"userID"`
+	HostID        string    `json:"hostID"`
+	Name          string    `json:"name"`
+	Kind          string    `json:"kind"`
+	ListenAddress string    `json:"listenAddress"`
+	ListenPort    int       `json:"listenPort"`
+	TargetHost    string    `json:"targetHost"`
+	TargetPort    int       `json:"targetPort"`
+	Status        string    `json:"status"`
+	LastError     string    `json:"lastError"`
+	BytesIn       int64     `json:"bytesIn"`
+	BytesOut      int64     `json:"bytesOut"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+type WebService struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"userID"`
+	HostID        string    `json:"hostID"`
+	Name          string    `json:"name"`
+	ProxyMode     string    `json:"proxyMode"`
+	ListenPort    int       `json:"listenPort"`
+	TargetURL     string    `json:"targetURL"`
+	UpstreamHost  string    `json:"upstreamHost"`
+	SkipTLSVerify bool      `json:"skipTLSVerify"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
 
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
@@ -80,15 +140,95 @@ CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UN
 CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_auth_token ON auth_sessions(token_hash);
 CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, secret_enc TEXT NOT NULL, passphrase_enc TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_hosts_user ON hosts(user_id, name);
 CREATE TABLE IF NOT EXISTS known_host_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, fingerprint TEXT NOT NULL, public_key TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,address,port));
 CREATE TABLE IF NOT EXISTS terminal_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, credential_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, remote_user TEXT NOT NULL, tmux_socket TEXT NOT NULL, tmux_name TEXT NOT NULL, owner_marker TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_terminal_user ON terminal_sessions(user_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS workspaces (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, layout_json TEXT NOT NULL DEFAULT '{}', version INTEGER NOT NULL DEFAULT 1, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, preferences_json TEXT NOT NULL DEFAULT '{}', updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, resource_type TEXT NOT NULL DEFAULT '', resource_id TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '{}', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, resource_type TEXT NOT NULL DEFAULT '', resource_id TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '{}', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE TABLE IF NOT EXISTS login_attempts (identity TEXT NOT NULL, ip TEXT NOT NULL, failures INTEGER NOT NULL DEFAULT 0, locked_until DATETIME, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(identity,ip));
+	CREATE TABLE IF NOT EXISTS system_settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE TABLE IF NOT EXISTS snippets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', command TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE INDEX IF NOT EXISTS idx_snippets_user ON snippets(user_id,group_name,name);
+	CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, session_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'info', read INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id,read,created_at DESC);
+	CREATE TABLE IF NOT EXISTS port_forwards (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, listen_address TEXT NOT NULL DEFAULT '127.0.0.1', listen_port INTEGER NOT NULL, target_host TEXT NOT NULL DEFAULT '', target_port INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'stopped', last_error TEXT NOT NULL DEFAULT '', bytes_in INTEGER NOT NULL DEFAULT 0, bytes_out INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE INDEX IF NOT EXISTS idx_forwards_user ON port_forwards(user_id,updated_at DESC);
+	CREATE TABLE IF NOT EXISTS user_totp (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret_enc TEXT NOT NULL, recovery_hashes TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE TABLE IF NOT EXISTS web_services (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE, name TEXT NOT NULL, proxy_mode TEXT NOT NULL DEFAULT 'path', listen_port INTEGER NOT NULL DEFAULT 0, target_url TEXT NOT NULL, upstream_host TEXT NOT NULL DEFAULT '', skip_tls_verify INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+	CREATE INDEX IF NOT EXISTS idx_web_services_user ON web_services(user_id,name);
+	CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 `)
+	if err != nil {
+		return err
+	}
+	columns := []struct{ name, definition string }{
+		{"initial_directory", "TEXT NOT NULL DEFAULT ''"}, {"connect_timeout", "INTEGER NOT NULL DEFAULT 12"},
+		{"keepalive_interval", "INTEGER NOT NULL DEFAULT 30"}, {"max_retries", "INTEGER NOT NULL DEFAULT 5"},
+		{"terminal_type", "TEXT NOT NULL DEFAULT 'xterm-256color'"}, {"last_status", "TEXT NOT NULL DEFAULT ''"},
+		{"last_latency_ms", "INTEGER NOT NULL DEFAULT 0"}, {"last_connected_at", "DATETIME"},
+	}
+	for _, column := range columns {
+		if err = s.ensureColumn("hosts", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if err = s.ensureColumn("users", "force_password_change", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err = s.ensureColumn("auth_sessions", "locked", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err = s.ensureColumn("auth_sessions", "unlock_failures", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err = s.ensureColumn("auth_sessions", "unlock_blocked_until", "DATETIME"); err != nil {
+		return err
+	}
+	if err = s.ensureColumn("users", "lock_pin_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err = s.DB.Exec(`UPDATE auth_sessions SET locked=0,unlock_failures=0,unlock_blocked_until=NULL WHERE locked=1 AND user_id IN (SELECT id FROM users WHERE lock_pin_hash='')`); err != nil {
+		return err
+	}
+	if err = s.ensureColumn("web_services", "proxy_mode", "TEXT NOT NULL DEFAULT 'path'"); err != nil {
+		return err
+	}
+	if err = s.ensureColumn("web_services", "listen_port", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8); PRAGMA user_version=8;`)
+	return err
+}
+
+func (s *Store) ensureColumn(table, name, definition string) error {
+	rows, err := s.DB.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var column, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err = rows.Scan(&cid, &column, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if column == name {
+			found = true
+		}
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = s.DB.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + name + ` ` + definition)
 	return err
 }
 
@@ -106,12 +246,12 @@ func (s *Store) UserCount() (int, error) {
 func (s *Store) UserByUsername(username string) (User, string, error) {
 	var u User
 	var hash string
-	err := s.DB.QueryRow(`SELECT id,username,password_hash,role,disabled,created_at FROM users WHERE username=?`, username).Scan(&u.ID, &u.Username, &hash, &u.Role, &u.Disabled, &u.CreatedAt)
+	err := s.DB.QueryRow(`SELECT id,username,password_hash,role,disabled,force_password_change,created_at FROM users WHERE username=?`, username).Scan(&u.ID, &u.Username, &hash, &u.Role, &u.Disabled, &u.ForcePasswordChange, &u.CreatedAt)
 	return u, hash, err
 }
 func (s *Store) UserByID(id string) (User, error) {
 	var u User
-	err := s.DB.QueryRow(`SELECT id,username,role,disabled,created_at FROM users WHERE id=?`, id).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.CreatedAt)
+	err := s.DB.QueryRow(`SELECT id,username,role,disabled,force_password_change,created_at FROM users WHERE id=?`, id).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.ForcePasswordChange, &u.CreatedAt)
 	return u, err
 }
 func (s *Store) CreateAuthSession(id, userID, tokenHash, agent, ip string, expires time.Time) error {
@@ -120,7 +260,7 @@ func (s *Store) CreateAuthSession(id, userID, tokenHash, agent, ip string, expir
 }
 func (s *Store) UserByToken(hash string) (User, error) {
 	var u User
-	err := s.DB.QueryRow(`SELECT u.id,u.username,u.role,u.disabled,u.created_at FROM auth_sessions a JOIN users u ON u.id=a.user_id WHERE a.token_hash=? AND a.expires_at>CURRENT_TIMESTAMP`, hash).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.CreatedAt)
+	err := s.DB.QueryRow(`SELECT u.id,u.username,u.role,u.disabled,u.force_password_change,u.created_at FROM auth_sessions a JOIN users u ON u.id=a.user_id WHERE a.token_hash=? AND a.expires_at>CURRENT_TIMESTAMP`, hash).Scan(&u.ID, &u.Username, &u.Role, &u.Disabled, &u.ForcePasswordChange, &u.CreatedAt)
 	if err == nil {
 		_, _ = s.DB.Exec(`UPDATE auth_sessions SET last_seen_at=CURRENT_TIMESTAMP WHERE token_hash=?`, hash)
 	}
@@ -128,6 +268,76 @@ func (s *Store) UserByToken(hash string) (User, error) {
 }
 func (s *Store) DeleteAuthSession(hash string) error {
 	_, err := s.DB.Exec(`DELETE FROM auth_sessions WHERE token_hash=?`, hash)
+	return err
+}
+func (s *Store) AuthSessionLocked(hash string) (bool, error) {
+	var locked bool
+	err := s.DB.QueryRow(`SELECT locked FROM auth_sessions WHERE token_hash=? AND expires_at>CURRENT_TIMESTAMP`, hash).Scan(&locked)
+	return locked, err
+}
+func (s *Store) SetAuthSessionLocked(hash string, locked bool) error {
+	result, err := s.DB.Exec(`UPDATE auth_sessions SET locked=?,unlock_failures=0,unlock_blocked_until=NULL WHERE token_hash=? AND expires_at>CURRENT_TIMESTAMP`, locked, hash)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) UserLockPINHash(userID string) (string, error) {
+	var hash string
+	err := s.DB.QueryRow(`SELECT lock_pin_hash FROM users WHERE id=?`, userID).Scan(&hash)
+	return hash, err
+}
+func (s *Store) SetUserLockPIN(userID, hash string) error {
+	result, err := s.DB.Exec(`UPDATE users SET lock_pin_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, hash, userID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) DisableUserLockPIN(userID string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec(`UPDATE users SET lock_pin_hash='',updated_at=CURRENT_TIMESTAMP WHERE id=?`, userID); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE auth_sessions SET locked=0,unlock_failures=0,unlock_blocked_until=NULL WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+func (s *Store) AuthSessionUnlockBlockedUntil(hash string) (time.Time, error) {
+	var blocked sql.NullTime
+	err := s.DB.QueryRow(`SELECT unlock_blocked_until FROM auth_sessions WHERE token_hash=? AND expires_at>CURRENT_TIMESTAMP`, hash).Scan(&blocked)
+	if err != nil || !blocked.Valid {
+		return time.Time{}, err
+	}
+	return blocked.Time, nil
+}
+func (s *Store) RecordAuthSessionUnlockFailure(hash string) error {
+	_, err := s.DB.Exec(`UPDATE auth_sessions SET
+		unlock_failures=CASE WHEN unlock_blocked_until IS NOT NULL AND unlock_blocked_until<CURRENT_TIMESTAMP THEN 1 ELSE unlock_failures+1 END,
+		unlock_blocked_until=CASE
+			WHEN unlock_blocked_until IS NOT NULL AND unlock_blocked_until<CURRENT_TIMESTAMP THEN NULL
+			WHEN unlock_failures+1>=5 THEN datetime('now','+30 seconds')
+			ELSE unlock_blocked_until END
+		WHERE token_hash=? AND expires_at>CURRENT_TIMESTAMP`, hash)
 	return err
 }
 func (s *Store) ChangePassword(userID, currentPassword, newPassword, currentTokenHash string) error {
@@ -147,7 +357,7 @@ func (s *Store) ChangePassword(userID, currentPassword, newPassword, currentToke
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`UPDATE users SET password_hash=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, newHash, userID); err != nil {
+	if _, err = tx.Exec(`UPDATE users SET password_hash=?,force_password_change=0,updated_at=CURRENT_TIMESTAMP WHERE id=?`, newHash, userID); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`DELETE FROM auth_sessions WHERE user_id=? AND token_hash<>?`, userID, currentTokenHash); err != nil {
@@ -157,16 +367,62 @@ func (s *Store) ChangePassword(userID, currentPassword, newPassword, currentToke
 	return err
 }
 
+func (s *Store) LoginLock(identity, ip string) (time.Time, error) {
+	var locked sql.NullTime
+	err := s.DB.QueryRow(`SELECT locked_until FROM login_attempts WHERE identity=? AND ip=?`, strings.ToLower(identity), ip).Scan(&locked)
+	if errors.Is(err, sql.ErrNoRows) || !locked.Valid {
+		return time.Time{}, nil
+	}
+	return locked.Time, err
+}
+func (s *Store) RecordLoginFailure(identity, ip string, threshold, lockMinutes int) error {
+	_, err := s.DB.Exec(`INSERT INTO login_attempts(identity,ip,failures,locked_until) VALUES(?,?,1,NULL)
+		ON CONFLICT(identity,ip) DO UPDATE SET failures=CASE WHEN locked_until IS NOT NULL AND locked_until<CURRENT_TIMESTAMP THEN 1 ELSE failures+1 END,
+		locked_until=CASE WHEN (CASE WHEN locked_until IS NOT NULL AND locked_until<CURRENT_TIMESTAMP THEN 1 ELSE failures+1 END)>=? THEN datetime('now',?) ELSE locked_until END,updated_at=CURRENT_TIMESTAMP`, strings.ToLower(identity), ip, threshold, fmt.Sprintf("+%d minutes", lockMinutes))
+	return err
+}
+func (s *Store) ClearLoginFailures(identity, ip string) error {
+	_, err := s.DB.Exec(`DELETE FROM login_attempts WHERE identity=? AND ip=?`, strings.ToLower(identity), ip)
+	return err
+}
+func (s *Store) SystemSetting(key string, dst any) error {
+	var raw string
+	err := s.DB.QueryRow(`SELECT value_json FROM system_settings WHERE key=?`, key).Scan(&raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(raw), dst)
+}
+func (s *Store) SaveSystemSetting(key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.Exec(`INSERT INTO system_settings(key,value_json) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=CURRENT_TIMESTAMP`, key, string(raw))
+	return err
+}
+
+const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
+
+func scanHost(row interface{ Scan(...any) error }) (Host, error) {
+	var h Host
+	var connected sql.NullTime
+	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
+	if connected.Valid {
+		h.LastConnectedAt = &connected.Time
+	}
+	return h, err
+}
 func (s *Store) Hosts(userID string) ([]Host, error) {
-	rows, err := s.DB.Query(`SELECT id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,favorite,created_at,updated_at FROM hosts WHERE user_id=? ORDER BY favorite DESC,name`, userID)
+	rows, err := s.DB.Query(`SELECT `+hostCols+` FROM hosts WHERE user_id=? ORDER BY COALESCE(last_connected_at,created_at) DESC,name`, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Host
 	for rows.Next() {
-		var h Host
-		if err := rows.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.Favorite, &h.CreatedAt, &h.UpdatedAt); err != nil {
+		h, err := scanHost(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -174,13 +430,31 @@ func (s *Store) Hosts(userID string) ([]Host, error) {
 	return out, rows.Err()
 }
 func (s *Store) Host(userID, id string) (Host, error) {
-	var h Host
-	err := s.DB.QueryRow(`SELECT id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,favorite,created_at,updated_at FROM hosts WHERE user_id=? AND id=?`, userID, id).Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.Favorite, &h.CreatedAt, &h.UpdatedAt)
-	return h, err
+	return scanHost(s.DB.QueryRow(`SELECT `+hostCols+` FROM hosts WHERE user_id=? AND id=?`, userID, id))
 }
 func (s *Store) SaveHost(h Host) error {
-	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,group_name,tags,notes,favorite) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,group_name=excluded.group_name,tags=excluded.tags,notes=excluded.notes,favorite=excluded.favorite,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.GroupName, h.Tags, h.Notes, h.Favorite)
+	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,group_name=excluded.group_name,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.GroupName, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType)
 	return err
+}
+func (s *Store) UpdateHostConnection(userID, id, status string, latency int) error {
+	_, err := s.DB.Exec(`UPDATE hosts SET last_status=?,last_latency_ms=?,last_connected_at=CASE WHEN ?='online' THEN CURRENT_TIMESTAMP ELSE last_connected_at END,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, status, latency, status, userID, id)
+	return err
+}
+func (s *Store) ActiveSessionsForHost(userID, id string) ([]TerminalSession, error) {
+	rows, err := s.DB.Query(`SELECT `+terminalCols+` FROM terminal_sessions WHERE user_id=? AND host_id=? AND status<>'ended' ORDER BY updated_at DESC`, userID, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TerminalSession
+	for rows.Next() {
+		item, e := scanTerminal(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 func (s *Store) DeleteHost(userID, id string) error {
 	var n int
@@ -192,6 +466,70 @@ func (s *Store) DeleteHost(userID, id string) error {
 	}
 	_, err := s.DB.Exec(`DELETE FROM hosts WHERE user_id=? AND id=?`, userID, id)
 	return err
+}
+func (s *Store) BatchHosts(userID string, ids []string, action, groupName, tags string) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	seen := make(map[string]struct{}, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return sql.ErrNoRows
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+		var owner string
+		if err = tx.QueryRow(`SELECT user_id FROM hosts WHERE id=?`, id).Scan(&owner); err != nil || owner != userID {
+			return sql.ErrNoRows
+		}
+	}
+	if action == "delete" {
+		for _, id := range unique {
+			var count int
+			if err = tx.QueryRow(`SELECT COUNT(*) FROM terminal_sessions WHERE user_id=? AND host_id=? AND status<>'ended'`, userID, id).Scan(&count); err != nil {
+				return err
+			}
+			if count > 0 {
+				return fmt.Errorf("host %s has %d active sessions", id, count)
+			}
+		}
+	}
+	for _, id := range unique {
+		switch action {
+		case "group":
+			_, err = tx.Exec(`UPDATE hosts SET group_name=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, groupName, userID, id)
+		case "tags":
+			var current string
+			if err = tx.QueryRow(`SELECT tags FROM hosts WHERE user_id=? AND id=?`, userID, id).Scan(&current); err == nil {
+				merged := make([]string, 0)
+				known := map[string]bool{}
+				for _, raw := range strings.Split(current+","+tags, ",") {
+					value := strings.TrimSpace(raw)
+					key := strings.ToLower(value)
+					if value != "" && !known[key] {
+						known[key] = true
+						merged = append(merged, value)
+					}
+				}
+				_, err = tx.Exec(`UPDATE hosts SET tags=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, strings.Join(merged, ","), userID, id)
+			}
+		case "delete":
+			_, err = tx.Exec(`DELETE FROM hosts WHERE user_id=? AND id=?`, userID, id)
+		default:
+			return errors.New("unsupported batch action")
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Credentials(userID string) ([]Credential, error) {
@@ -266,6 +604,17 @@ func (s *Store) UpdateTerminalStatus(userID, id, status, msg string) error {
 	_, err := s.DB.Exec(`UPDATE terminal_sessions SET status=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, status, msg, userID, id)
 	return err
 }
+func (s *Store) RenameTerminal(userID, id, name string) error {
+	result, err := s.DB.Exec(`UPDATE terminal_sessions SET name=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, name, userID, id)
+	if err != nil {
+		return err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
 func (s *Store) DeleteTerminal(userID, id string) error {
 	_, err := s.DB.Exec(`DELETE FROM terminal_sessions WHERE user_id=? AND id=?`, userID, id)
 	return err
@@ -309,6 +658,173 @@ func (s *Store) SavePreferences(userID string, raw json.RawMessage) error {
 	_, err := s.DB.Exec(`INSERT INTO user_preferences(user_id,preferences_json)VALUES(?,?) ON CONFLICT(user_id)DO UPDATE SET preferences_json=excluded.preferences_json,updated_at=CURRENT_TIMESTAMP`, userID, string(raw))
 	return err
 }
+func (s *Store) Snippets(userID string) ([]Snippet, error) {
+	rows, err := s.DB.Query(`SELECT id,user_id,name,group_name,tags,command,description,created_at,updated_at FROM snippets WHERE user_id=? ORDER BY group_name,name`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Snippet
+	for rows.Next() {
+		var value Snippet
+		if err = rows.Scan(&value.ID, &value.UserID, &value.Name, &value.GroupName, &value.Tags, &value.Command, &value.Description, &value.CreatedAt, &value.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
+}
+func (s *Store) SaveSnippet(value Snippet) error {
+	_, err := s.DB.Exec(`INSERT INTO snippets(id,user_id,name,group_name,tags,command,description)VALUES(?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET name=excluded.name,group_name=excluded.group_name,tags=excluded.tags,command=excluded.command,description=excluded.description,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, value.ID, value.UserID, value.Name, value.GroupName, value.Tags, value.Command, value.Description)
+	return err
+}
+func (s *Store) DeleteSnippet(userID, id string) error {
+	_, err := s.DB.Exec(`DELETE FROM snippets WHERE user_id=? AND id=?`, userID, id)
+	return err
+}
+func (s *Store) Notifications(userID string) ([]Notification, error) {
+	rows, err := s.DB.Query(`SELECT id,user_id,session_id,title,kind,read,created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 200`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Notification
+	for rows.Next() {
+		var value Notification
+		if err = rows.Scan(&value.ID, &value.UserID, &value.SessionID, &value.Title, &value.Kind, &value.Read, &value.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
+}
+func (s *Store) SaveNotification(value Notification) error {
+	_, err := s.DB.Exec(`INSERT INTO notifications(id,user_id,session_id,title,kind)VALUES(?,?,?,?,?)`, value.ID, value.UserID, value.SessionID, value.Title, value.Kind)
+	return err
+}
+func (s *Store) ReadNotifications(userID string) error {
+	_, err := s.DB.Exec(`UPDATE notifications SET read=1 WHERE user_id=?`, userID)
+	return err
+}
+
+const forwardCols = `id,user_id,host_id,name,kind,listen_address,listen_port,target_host,target_port,status,last_error,bytes_in,bytes_out,created_at,updated_at`
+
+func scanForward(row interface{ Scan(...any) error }) (PortForward, error) {
+	var value PortForward
+	err := row.Scan(&value.ID, &value.UserID, &value.HostID, &value.Name, &value.Kind, &value.ListenAddress, &value.ListenPort, &value.TargetHost, &value.TargetPort, &value.Status, &value.LastError, &value.BytesIn, &value.BytesOut, &value.CreatedAt, &value.UpdatedAt)
+	return value, err
+}
+func (s *Store) PortForwards(userID string) ([]PortForward, error) {
+	rows, err := s.DB.Query(`SELECT `+forwardCols+` FROM port_forwards WHERE user_id=? ORDER BY updated_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PortForward
+	for rows.Next() {
+		value, e := scanForward(rows)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
+}
+func (s *Store) PortForward(userID, id string) (PortForward, error) {
+	return scanForward(s.DB.QueryRow(`SELECT `+forwardCols+` FROM port_forwards WHERE user_id=? AND id=?`, userID, id))
+}
+func (s *Store) SavePortForward(value PortForward) error {
+	_, err := s.DB.Exec(`INSERT INTO port_forwards(id,user_id,host_id,name,kind,listen_address,listen_port,target_host,target_port,status,last_error)VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id)DO UPDATE SET name=excluded.name,kind=excluded.kind,listen_address=excluded.listen_address,listen_port=excluded.listen_port,target_host=excluded.target_host,target_port=excluded.target_port,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, value.ID, value.UserID, value.HostID, value.Name, value.Kind, value.ListenAddress, value.ListenPort, value.TargetHost, value.TargetPort, value.Status, value.LastError)
+	return err
+}
+func (s *Store) UpdatePortForward(userID, id, status, lastError string) error {
+	_, err := s.DB.Exec(`UPDATE port_forwards SET status=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, status, lastError, userID, id)
+	return err
+}
+func (s *Store) DeletePortForward(userID, id string) error {
+	_, err := s.DB.Exec(`DELETE FROM port_forwards WHERE user_id=? AND id=?`, userID, id)
+	return err
+}
+
+const webServiceCols = `id,user_id,host_id,name,proxy_mode,listen_port,target_url,upstream_host,skip_tls_verify,created_at,updated_at`
+
+func scanWebService(row interface{ Scan(...any) error }) (WebService, error) {
+	var value WebService
+	err := row.Scan(&value.ID, &value.UserID, &value.HostID, &value.Name, &value.ProxyMode, &value.ListenPort, &value.TargetURL, &value.UpstreamHost, &value.SkipTLSVerify, &value.CreatedAt, &value.UpdatedAt)
+	return value, err
+}
+func (s *Store) WebServices(userID string) ([]WebService, error) {
+	rows, err := s.DB.Query(`SELECT `+webServiceCols+` FROM web_services WHERE user_id=? ORDER BY name COLLATE NOCASE,updated_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WebService
+	for rows.Next() {
+		value, scanErr := scanWebService(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
+}
+func (s *Store) WebService(userID, id string) (WebService, error) {
+	return scanWebService(s.DB.QueryRow(`SELECT `+webServiceCols+` FROM web_services WHERE user_id=? AND id=?`, userID, id))
+}
+func (s *Store) SaveWebService(value WebService) error {
+	if value.ProxyMode == "" {
+		value.ProxyMode = "path"
+	}
+	_, err := s.DB.Exec(`INSERT INTO web_services(id,user_id,host_id,name,proxy_mode,listen_port,target_url,upstream_host,skip_tls_verify) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET host_id=excluded.host_id,name=excluded.name,proxy_mode=excluded.proxy_mode,listen_port=excluded.listen_port,target_url=excluded.target_url,upstream_host=excluded.upstream_host,skip_tls_verify=excluded.skip_tls_verify,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, value.ID, value.UserID, value.HostID, value.Name, value.ProxyMode, value.ListenPort, value.TargetURL, value.UpstreamHost, value.SkipTLSVerify)
+	return err
+}
+func (s *Store) HostPortWebServices() ([]WebService, error) {
+	rows, err := s.DB.Query(`SELECT ` + webServiceCols + ` FROM web_services WHERE proxy_mode='host_port' ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WebService
+	for rows.Next() {
+		value, scanErr := scanWebService(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, value)
+	}
+	return out, rows.Err()
+}
+func (s *Store) DeleteWebService(userID, id string) error {
+	result, err := s.DB.Exec(`DELETE FROM web_services WHERE user_id=? AND id=?`, userID, id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+func (s *Store) TOTP(userID string) (secret string, recovery []string, enabled bool, err error) {
+	var raw string
+	err = s.DB.QueryRow(`SELECT secret_enc,recovery_hashes,enabled FROM user_totp WHERE user_id=?`, userID).Scan(&secret, &raw, &enabled)
+	if err == nil {
+		err = json.Unmarshal([]byte(raw), &recovery)
+	}
+	return
+}
+func (s *Store) SaveTOTP(userID, secret string, recovery []string, enabled bool) error {
+	raw, err := json.Marshal(recovery)
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.Exec(`INSERT INTO user_totp(user_id,secret_enc,recovery_hashes,enabled)VALUES(?,?,?,?) ON CONFLICT(user_id)DO UPDATE SET secret_enc=excluded.secret_enc,recovery_hashes=excluded.recovery_hashes,enabled=excluded.enabled,updated_at=CURRENT_TIMESTAMP`, userID, secret, string(raw), enabled)
+	return err
+}
+func (s *Store) DeleteTOTP(userID string) error {
+	_, err := s.DB.Exec(`DELETE FROM user_totp WHERE user_id=?`, userID)
+	return err
+}
 func (s *Store) Audit(userID, event, resourceType, resourceID, ip string, details any) {
 	raw, _ := json.Marshal(details)
 	_, _ = s.DB.ExecContext(context.Background(), `INSERT INTO audit_events(user_id,event_type,resource_type,resource_id,ip,details)VALUES(?,?,?,?,?,?)`, userID, event, resourceType, resourceID, ip, string(raw))
@@ -325,4 +841,36 @@ func (s *Store) TrustHost(userID, address string, port int, fp, key string) erro
 func (s *Store) Backup(ctx context.Context, path string) error {
 	_, err := s.DB.ExecContext(ctx, `VACUUM INTO ?`, path)
 	return err
+}
+func VerifyBackup(path string) error {
+	db, err := sql.Open("sqlite", path+"?mode=ro")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var result string
+	if err = db.QueryRow(`PRAGMA integrity_check`).Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("integrity check failed: %s", result)
+	}
+	var version int
+	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return err
+	}
+	if version < 1 || version > 8 {
+		return fmt.Errorf("unsupported database version %d", version)
+	}
+	requiredTables := []string{"users", "hosts", "workspaces", "terminal_sessions"}
+	if version >= 7 {
+		requiredTables = append(requiredTables, "web_services")
+	}
+	for _, table := range requiredTables {
+		var found string
+		if err = db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&found); err != nil {
+			return fmt.Errorf("missing required table %s", table)
+		}
+	}
+	return nil
 }

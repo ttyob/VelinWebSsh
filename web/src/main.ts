@@ -1,10 +1,17 @@
-import { createApp } from 'vue'
-import { createPinia } from 'pinia'
-import ElementPlus from 'element-plus'
-import 'element-plus/dist/index.css'
-import '@xterm/xterm/css/xterm.css'
-import App from './App.vue'
-import router from './router'
-import './styles.css'
+import { createApp } from "vue";
+import { createPinia } from "pinia";
+import ElementPlus from "element-plus";
+import "element-plus/dist/index.css";
+import "@xterm/xterm/css/xterm.css";
+import App from "./App.vue";
+import router from "./router";
+import { applyAccent, applyInterfaceTheme } from "./themePresets";
+import "./styles.css";
 
-createApp(App).use(createPinia()).use(router).use(ElementPlus).mount('#app')
+try {
+  applyInterfaceTheme(localStorage.getItem("velin-interface-theme") || "dark");
+  const accent = localStorage.getItem("velin-accent-color");
+  if (accent) applyAccent(accent);
+} catch {}
+
+createApp(App).use(createPinia()).use(router).use(ElementPlus).mount("#app");

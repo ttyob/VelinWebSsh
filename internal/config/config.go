@@ -33,7 +33,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	return Config{
-		Addr:          env("VELIN_ADDR", ":8080"),
+		Addr:          env("VELIN_ADDR", "0.0.0.0:8377"),
 		DataDir:       dataDir,
 		DatabasePath:  filepath.Join(dataDir, "velin.db"),
 		MasterKeyPath: filepath.Join(dataDir, "master.key"),

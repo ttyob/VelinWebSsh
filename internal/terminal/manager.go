@@ -36,6 +36,11 @@ type CreateRequest struct {
 	TrustFingerprint   string
 	Name               string
 }
+type TestResult struct {
+	LatencyMS   int64  `json:"latencyMs"`
+	TmuxVersion string `json:"tmuxVersion"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+}
 
 type Manager struct {
 	store        *store.Store
@@ -43,6 +48,22 @@ type Manager struct {
 	deploymentID string
 	mu           sync.RWMutex
 	sessions     map[string]*Session
+}
+
+func (m *Manager) DialSaved(ctx context.Context, userID, hostID string) (*ssh.Client, store.Host, error) {
+	host, err := m.store.Host(userID, hostID)
+	if err != nil {
+		return nil, host, err
+	}
+	if host.CredentialID == "" {
+		return nil, host, errors.New("saved credential required")
+	}
+	credential, err := m.store.Credential(userID, host.CredentialID)
+	if err != nil {
+		return nil, host, err
+	}
+	client, err := m.dial(ctx, userID, host, credential, "", "", "")
+	return client, host, err
 }
 
 type Session struct {
@@ -55,6 +76,7 @@ type Session struct {
 	subs           map[string]chan Event
 	controller     string
 	controllerSeen time.Time
+	pendingControl string
 	buffer         *ringBuffer
 	closed         bool
 }
@@ -67,6 +89,7 @@ type Event struct {
 	ClientID   string `json:"clientID,omitempty"`
 	Controller string `json:"controller,omitempty"`
 	Truncated  bool   `json:"truncated,omitempty"`
+	Requester  string `json:"requester,omitempty"`
 }
 
 func NewManager(s *store.Store, vault *security.Vault, deploymentID string) *Manager {
@@ -94,6 +117,20 @@ func (m *Manager) Create(ctx context.Context, userID string, req CreateRequest) 
 		return meta, err
 	}
 	return sess.Meta(), nil
+}
+
+func (m *Manager) Test(ctx context.Context, userID string, host store.Host, credential store.Credential, secret, passphrase, trust string) (TestResult, error) {
+	started := time.Now()
+	client, err := m.dial(ctx, userID, host, credential, secret, passphrase, trust)
+	if err != nil {
+		return TestResult{}, err
+	}
+	defer client.Close()
+	out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V")
+	if err != nil {
+		return TestResult{}, fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
+	}
+	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out))}, nil
 }
 
 func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, trust string) (*Session, error) {
@@ -153,6 +190,21 @@ func (m *Manager) Get(userID, id string) (*Session, error) {
 	return s, nil
 }
 
+func (m *Manager) Rename(userID, id, name string) error {
+	if err := m.store.RenameTerminal(userID, id, name); err != nil {
+		return err
+	}
+	m.mu.RLock()
+	s := m.sessions[id]
+	m.mu.RUnlock()
+	if s != nil && s.meta.UserID == userID {
+		s.mu.Lock()
+		s.meta.Name = name
+		s.mu.Unlock()
+	}
+	return nil
+}
+
 func (m *Manager) Terminate(ctx context.Context, userID, id string, secret, passphrase string) error {
 	meta, err := m.store.Terminal(userID, id)
 	if err != nil {
@@ -191,6 +243,26 @@ func (m *Manager) Terminate(ctx context.Context, userID, id string, secret, pass
 
 func (s *Session) Meta() store.TerminalSession { s.mu.RLock(); defer s.mu.RUnlock(); return s.meta }
 
+func (s *Session) SSHClient() *ssh.Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sshClient
+}
+
+func (s *Session) CurrentDirectory() (string, error) {
+	s.mu.RLock()
+	client, meta := s.sshClient, s.meta
+	s.mu.RUnlock()
+	if client == nil {
+		return "", errors.New("terminal connection is not available")
+	}
+	out, err := run(client, fmt.Sprintf("tmux -L %s display-message -p -t %s '#{pane_current_path}'", meta.TmuxSocket, meta.TmuxName))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func (s *Session) connect(ctx context.Context, host store.Host, cred store.Credential, secret, passphrase, trust string, create bool) error {
 	client, err := s.manager.dial(ctx, s.meta.UserID, host, cred, secret, passphrase, trust)
 	if err != nil {
@@ -201,7 +273,11 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 		return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
 	}
 	if create {
-		cmd := fmt.Sprintf("tmux -L %s new-session -d -s %s \\; set-option -t %s @velin_owner %s \\; set-option -t %s history-limit 50000", s.meta.TmuxSocket, s.meta.TmuxName, s.meta.TmuxName, s.meta.OwnerMarker, s.meta.TmuxName)
+		startDir := ""
+		if strings.TrimSpace(host.InitialDir) != "" {
+			startDir = " -c " + shellQuote(strings.TrimSpace(host.InitialDir))
+		}
+		cmd := fmt.Sprintf("tmux -L %s new-session -d -s %s%s \\; set-option -t %s @velin_owner %s \\; set-option -t %s history-limit 50000 \\; set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName, startDir, s.meta.TmuxName, s.meta.OwnerMarker, s.meta.TmuxName, s.meta.TmuxName)
 		if out, err := run(client, cmd); err != nil {
 			client.Close()
 			return fmt.Errorf("create tmux session: %s", cleanOutput(out, err))
@@ -210,13 +286,27 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 		client.Close()
 		return err
 	}
+	if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName)); err != nil {
+		client.Close()
+		return fmt.Errorf("configure tmux session: %s", cleanOutput(out, err))
+	}
+	// Keep browser xterm.js on its normal buffer so scrollback and its viewport
+	// scrollbar remain available while tmux still manages alternate-screen apps.
+	if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -as terminal-overrides ',xterm-256color:smcup@:rmcup@'", s.meta.TmuxSocket)); err != nil {
+		client.Close()
+		return fmt.Errorf("configure tmux terminal: %s", cleanOutput(out, err))
+	}
 	sshSess, err := client.NewSession()
 	if err != nil {
 		client.Close()
 		return err
 	}
 	modes := ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 14400, ssh.TTY_OP_OSPEED: 14400}
-	if err = sshSess.RequestPty("xterm-256color", 30, 120, modes); err != nil {
+	terminalType := host.TerminalType
+	if terminalType == "" {
+		terminalType = "xterm-256color"
+	}
+	if err = sshSess.RequestPty(terminalType, 30, 120, modes); err != nil {
 		sshSess.Close()
 		client.Close()
 		return err
@@ -250,6 +340,9 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 	s.mu.Unlock()
 	_ = s.manager.store.UpdateTerminalStatus(s.meta.UserID, s.meta.ID, "attached", "")
 	go s.readLoop(stdout)
+	if host.KeepaliveInterval > 0 {
+		go keepalive(client, time.Duration(host.KeepaliveInterval)*time.Second)
+	}
 	return nil
 }
 
@@ -300,9 +393,13 @@ func (m *Manager) dial(ctx context.Context, userID string, host store.Host, cred
 		}
 		return nil
 	}
-	config := &ssh.ClientConfig{User: host.Username, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: callback, Timeout: 12 * time.Second}
+	timeout := time.Duration(host.ConnectTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
+	config := &ssh.ClientConfig{User: host.Username, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: callback, Timeout: timeout}
 	addr := net.JoinHostPort(host.Address, fmt.Sprint(host.Port))
-	dialer := net.Dialer{Timeout: 12 * time.Second}
+	dialer := net.Dialer{Timeout: timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
@@ -314,6 +411,18 @@ func (m *Manager) dial(ctx context.Context, userID string, host store.Host, cred
 	}
 	return ssh.NewClient(c, chs, reqs), nil
 }
+
+func keepalive(client *ssh.Client, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if _, _, err := client.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			return
+		}
+	}
+}
+
+func shellQuote(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'" }
 
 func parseKey(key, pass []byte) (ssh.Signer, error) {
 	if len(pass) > 0 {
@@ -398,18 +507,102 @@ func (s *Session) Unsubscribe(clientID string) {
 		delete(s.subs, clientID)
 		close(ch)
 	}
+	if s.pendingControl == clientID {
+		s.pendingControl = ""
+	}
+	grant := ""
 	if s.controller == clientID {
 		s.controller = ""
+		if _, waiting := s.subs[s.pendingControl]; waiting {
+			grant = s.pendingControl
+			s.pendingControl = ""
+			s.controller = grant
+			s.controllerSeen = time.Now()
+		}
 	}
 	s.mu.Unlock()
+	if grant != "" {
+		s.broadcast(Event{Type: "controller", Controller: grant})
+	}
 }
 func (s *Session) RequestControl(clientID string) bool {
 	s.mu.Lock()
-	s.controller = clientID
-	s.controllerSeen = time.Now()
+	if s.controller == clientID {
+		s.controllerSeen = time.Now()
+		s.mu.Unlock()
+		return true
+	}
+	if s.controller == "" || time.Since(s.controllerSeen) > 30*time.Second {
+		s.controller = clientID
+		s.controllerSeen = time.Now()
+		s.pendingControl = ""
+		s.mu.Unlock()
+		s.broadcast(Event{Type: "controller", Controller: clientID})
+		return true
+	}
+	controllerChannel := s.subs[s.controller]
+	s.pendingControl = clientID
+	if controllerChannel != nil {
+		select {
+		case controllerChannel <- Event{Type: "control_request", Requester: clientID}:
+		default:
+		}
+	}
 	s.mu.Unlock()
-	s.broadcast(Event{Type: "controller", Controller: clientID})
+	return false
+}
+func (s *Session) RespondControl(clientID, requester string, approved bool) bool {
+	s.mu.Lock()
+	if s.controller != clientID || s.pendingControl != requester {
+		s.mu.Unlock()
+		return false
+	}
+	s.pendingControl = ""
+	requesterChannel := s.subs[requester]
+	if approved && requesterChannel != nil {
+		s.controller = requester
+		s.controllerSeen = time.Now()
+	}
+	if approved && requesterChannel != nil {
+		s.mu.Unlock()
+		s.broadcast(Event{Type: "controller", Controller: requester})
+		return true
+	}
+	if requesterChannel != nil {
+		select {
+		case requesterChannel <- Event{Type: "control_denied"}:
+		default:
+		}
+	}
+	s.mu.Unlock()
+	return false
+}
+func (s *Session) ReleaseControl(clientID string) bool {
+	s.mu.Lock()
+	if s.controller != clientID {
+		s.mu.Unlock()
+		return false
+	}
+	s.controller = ""
+	grant := s.pendingControl
+	if _, exists := s.subs[grant]; !exists {
+		grant = ""
+	}
+	s.pendingControl = ""
+	if grant != "" {
+		s.controller = grant
+		s.controllerSeen = time.Now()
+	}
+	s.mu.Unlock()
+	s.broadcast(Event{Type: "controller", Controller: grant})
 	return true
+}
+func (s *Session) TouchControl(clientID string) {
+	s.mu.Lock()
+	if s.controller == clientID {
+		s.controllerSeen = time.Now()
+	}
+	s.mu.Unlock()
 }
 func (s *Session) IsController(clientID string) bool {
 	s.mu.Lock()
@@ -434,6 +627,43 @@ func (s *Session) Write(clientID string, data []byte) error {
 	_, err := w.Write(data)
 	return err
 }
+
+func validTerminalColor(value string) bool {
+	if len(value) != 7 || value[0] != '#' {
+		return false
+	}
+	for _, ch := range value[1:] {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Session) SetTerminalColors(clientID, foreground, background string) error {
+	if !s.IsController(clientID) {
+		return ErrNotController
+	}
+	if !validTerminalColor(foreground) || !validTerminalColor(background) {
+		return errors.New("invalid terminal colors")
+	}
+	s.mu.RLock()
+	client, meta, closed := s.sshClient, s.meta, s.closed
+	s.mu.RUnlock()
+	if closed || client == nil {
+		return errors.New("terminal not attached")
+	}
+	style := shellQuote("fg=" + foreground + ",bg=" + background)
+	cmd := fmt.Sprintf(
+		"tmux -L %s set-option -t %s window-style %s \\; set-option -t %s window-active-style %s",
+		meta.TmuxSocket, meta.TmuxName, style, meta.TmuxName, style,
+	)
+	if out, err := run(client, cmd); err != nil {
+		return fmt.Errorf("configure terminal colors: %s", cleanOutput(out, err))
+	}
+	return nil
+}
+
 func (s *Session) Resize(clientID string, rows, cols int) error {
 	if !s.IsController(clientID) {
 		return ErrNotController

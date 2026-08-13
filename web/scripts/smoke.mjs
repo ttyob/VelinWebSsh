@@ -1,7 +1,7 @@
 import { chromium } from 'playwright-core'
 import { mkdir } from 'node:fs/promises'
 
-const baseURL = process.env.VELIN_TEST_URL || 'http://127.0.0.1:8080'
+const baseURL = process.env.VELIN_TEST_URL || 'http://127.0.0.1:8377'
 const password = process.env.VELIN_TEST_PASSWORD
 if (!password) throw new Error('VELIN_TEST_PASSWORD is required')
 await mkdir('../artifacts', { recursive: true })

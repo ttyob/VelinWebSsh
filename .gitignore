@@ -8,3 +8,5 @@ artifacts/
 *.log
 .env
 .DS_Store
+velin
+.well-known/acme-challenge/

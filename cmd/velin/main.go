@@ -1,14 +1,20 @@
 package main
 
 import (
+	"context"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"velin-webssh/internal/api"
 	"velin-webssh/internal/config"
+	"velin-webssh/internal/forward"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
 	"velin-webssh/internal/terminal"
@@ -50,10 +56,24 @@ func main() {
 		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "change this password after login")
 	}
 	manager := terminal.NewManager(s, vault, cfg.DeploymentID)
-	handler := api.New(cfg, s, vault, manager).Router()
+	forwardManager := forward.NewManager(s, manager)
+	handler := api.New(cfg, s, vault, manager, forwardManager).Router()
 	server := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10_000_000_000, IdleTimeout: 60_000_000_000}
+	listener, err := net.Listen("tcp4", cfg.Addr)
+	if err != nil {
+		log.Fatal(err)
+	}
 	slog.Info("Velin Web SSH listening", "addr", cfg.Addr, "pid", os.Getpid())
-	if err = server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		slog.Info("Velin Web SSH shutting down")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+	if err = server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 }

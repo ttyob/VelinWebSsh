@@ -2,9 +2,16 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	_ "modernc.org/sqlite"
+	"velin-webssh/internal/security"
 )
 
 func testStore(t *testing.T) *Store {
@@ -33,6 +40,49 @@ func TestHostOwnership(t *testing.T) {
 	}
 }
 
+func TestBatchHostsIsAtomicAndOwned(t *testing.T) {
+	s := testStore(t)
+	for _, id := range []string{"u1", "u2"} {
+		if err := s.CreateUser(id, id, "hash", "user"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, host := range []Host{
+		{ID: "h1", UserID: "u1", Name: "one", Address: "127.0.0.1", Port: 22, Username: "root"},
+		{ID: "h2", UserID: "u1", Name: "two", Address: "127.0.0.2", Port: 22, Username: "root"},
+		{ID: "foreign", UserID: "u2", Name: "foreign", Address: "127.0.0.3", Port: 22, Username: "root"},
+	} {
+		if err := s.SaveHost(host); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.BatchHosts("u1", []string{"h1", "foreign"}, "group", "production", ""); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user batch error=%v", err)
+	}
+	host, _ := s.Host("u1", "h1")
+	if host.GroupName != "" {
+		t.Fatal("cross-user batch partially updated an owned host")
+	}
+	if err := s.BatchHosts("u1", []string{"h1", "h2"}, "tags", "", "linux, production,linux"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"h1", "h2"} {
+		host, _ = s.Host("u1", id)
+		if host.Tags != "linux,production" {
+			t.Fatalf("host %s tags=%q", id, host.Tags)
+		}
+	}
+	if err := s.SaveTerminal(TerminalSession{ID: "s1", UserID: "u1", HostID: "h2", Name: "active", RemoteUser: "root", TmuxSocket: "sock", TmuxName: "tmux", OwnerMarker: "owner", Status: "attached"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BatchHosts("u1", []string{"h1", "h2"}, "delete", "", ""); err == nil {
+		t.Fatal("batch delete with active session succeeded")
+	}
+	if _, err := s.Host("u1", "h1"); err != nil {
+		t.Fatal("batch delete was not atomic")
+	}
+}
+
 func TestWorkspaceVersionConflict(t *testing.T) {
 	s := testStore(t)
 	if err := s.CreateUser("u1", "user", "hash", "user"); err != nil {
@@ -46,6 +96,69 @@ func TestWorkspaceVersionConflict(t *testing.T) {
 	}
 	if err := s.SaveWorkspace("u1", json.RawMessage(`{"tabs":["one"]}`), 1); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuthSessionLockState(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser("u1", "user", "hash", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAuthSession("session", "u1", "token-hash", "test", "127.0.0.1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := s.AuthSessionLocked("token-hash")
+	if err != nil || locked {
+		t.Fatalf("initial locked=%v err=%v", locked, err)
+	}
+	if err = s.SetAuthSessionLocked("token-hash", true); err != nil {
+		t.Fatal(err)
+	}
+	locked, err = s.AuthSessionLocked("token-hash")
+	if err != nil || !locked {
+		t.Fatalf("locked=%v err=%v", locked, err)
+	}
+	if err = s.SetAuthSessionLocked("token-hash", false); err != nil {
+		t.Fatal(err)
+	}
+	locked, err = s.AuthSessionLocked("token-hash")
+	if err != nil || locked {
+		t.Fatalf("unlocked=%v err=%v", locked, err)
+	}
+}
+
+func TestUserLockPINLifecycle(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser("u1", "user", "hash", "user"); err != nil {
+		t.Fatal(err)
+	}
+	pinHash, err := security.HashPassword("123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetUserLockPIN("u1", pinHash); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.UserLockPINHash("u1")
+	if err != nil || stored == "" || !security.VerifyPassword(stored, "123456") {
+		t.Fatalf("stored PIN hash invalid err=%v", err)
+	}
+	if err = s.CreateAuthSession("session", "u1", "token-hash", "test", "127.0.0.1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetAuthSessionLocked("token-hash", true); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.DisableUserLockPIN("u1"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = s.UserLockPINHash("u1")
+	if err != nil || stored != "" {
+		t.Fatalf("PIN was not cleared: %q err=%v", stored, err)
+	}
+	locked, err := s.AuthSessionLocked("token-hash")
+	if err != nil || locked {
+		t.Fatalf("session remained locked=%v err=%v", locked, err)
 	}
 }
 
@@ -65,5 +178,124 @@ func TestBackup(t *testing.T) {
 	defer backup.Close()
 	if n, err := backup.UserCount(); err != nil || n != 1 {
 		t.Fatalf("backup user count=%d err=%v", n, err)
+	}
+	if err := VerifyBackup(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVerifyBackupRejectsInvalidFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invalid.db")
+	if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if VerifyBackup(path) == nil {
+		t.Fatal("invalid backup passed verification")
+	}
+}
+
+func TestHostMigrationAndConnectionMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', disabled INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+		CREATE TABLE hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+		INSERT INTO users(id,username,password_hash) VALUES('u1','user','hash');
+		INSERT INTO hosts(id,user_id,name,address,username) VALUES('h1','u1','legacy','127.0.0.1','root');
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	host, err := s.Host("u1", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.ConnectTimeout != 12 || host.KeepaliveInterval != 30 || host.MaxRetries != 5 || host.TerminalType != "xterm-256color" {
+		t.Fatalf("unexpected migrated defaults: %+v", host)
+	}
+	if err = s.UpdateHostConnection("u1", "h1", "online", 37); err != nil {
+		t.Fatal(err)
+	}
+	host, err = s.Host("u1", "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.LastStatus != "online" || host.LastLatency != 37 || host.LastConnectedAt == nil {
+		t.Fatalf("connection metadata was not saved: %+v", host)
+	}
+	var version int
+	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 8 {
+		t.Fatalf("user_version=%d err=%v", version, err)
+	}
+}
+
+func TestWebServiceOwnershipAndHostCascade(t *testing.T) {
+	s := testStore(t)
+	for _, id := range []string{"u1", "u2"} {
+		if err := s.CreateUser(id, id, "hash", "user"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	host := Host{ID: "h1", UserID: "u1", Name: "home", Address: "127.0.0.1", Port: 22, Username: "root"}
+	if err := s.SaveHost(host); err != nil {
+		t.Fatal(err)
+	}
+	service := WebService{ID: "w1", UserID: "u1", HostID: host.ID, Name: "Router", ProxyMode: "host_port", ListenPort: 18080, TargetURL: "http://192.168.1.1"}
+	if err := s.SaveWebService(service); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WebService("u2", service.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("foreign web service error=%v", err)
+	}
+	saved, err := s.WebService("u1", service.ID)
+	if err != nil || saved.ProxyMode != "host_port" || saved.ListenPort != 18080 {
+		t.Fatalf("host port mode was not saved: %+v err=%v", saved, err)
+	}
+	if err := s.DeleteHost("u1", host.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WebService("u1", service.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("web service survived host deletion: %v", err)
+	}
+}
+
+func TestLegacyWebServiceMigratesToPathMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-web.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', disabled INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+		CREATE TABLE hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+		CREATE TABLE web_services (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, host_id TEXT NOT NULL, name TEXT NOT NULL, target_url TEXT NOT NULL, upstream_host TEXT NOT NULL DEFAULT '', skip_tls_verify INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+		INSERT INTO users(id,username,password_hash) VALUES('u1','user','hash');
+		INSERT INTO hosts(id,user_id,name,address,username) VALUES('h1','u1','legacy','127.0.0.1','root');
+		INSERT INTO web_services(id,user_id,host_id,name,target_url) VALUES('w1','u1','h1','Router','http://192.168.1.1');
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	service, err := s.WebService("u1", "w1")
+	if err != nil || service.ProxyMode != "path" || service.ListenPort != 0 {
+		t.Fatalf("legacy web service mode=%q port=%d err=%v", service.ProxyMode, service.ListenPort, err)
 	}
 }

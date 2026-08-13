@@ -9,7 +9,13 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
   const response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
   const body = await response.json().catch(() => ({}))
-  if (!response.ok) throw new ApiError(response.status, body as ApiErrorBody)
+  if (!response.ok) {
+    const errorBody = body as ApiErrorBody
+    if (errorBody.code === 'session_locked' && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('velin:session-locked'))
+    }
+    throw new ApiError(response.status, errorBody)
+  }
   return body as T
 }
 

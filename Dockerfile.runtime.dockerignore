@@ -1,0 +1,7 @@
+.git
+.env
+data
+artifacts
+web/node_modules
+web/*.tsbuildinfo
+*.log
