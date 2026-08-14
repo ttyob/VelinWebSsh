@@ -288,6 +288,14 @@ button {
 .host-row .host-icon.detected {
   color: var(--accent-strong);
 }
+.host-row .host-icon.distribution {
+  color: var(--accent-strong);
+}
+.host-row .distribution-logo {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
 .host-copy small {
   font-size: 10px;
   color: #79837e;
@@ -721,12 +729,31 @@ button {
   margin-bottom: 18px;
 }
 .web-service-resource {
-  flex: 0 1 210px;
+  flex: 0 0 var(--web-service-height, 210px);
   min-height: 82px;
-  max-height: 32%;
+  max-height: calc(100% - 276px);
   display: flex;
   flex-direction: column;
-  border-top: 1px solid var(--line);
+}
+.web-service-resizer {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: 8px;
+  flex: 0 0 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+}
+.web-service-resizer span {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 3px;
+  height: 1px;
+  background: var(--line);
 }
 .web-service-heading {
   height: 35px;
@@ -810,6 +837,13 @@ button {
 .web-service-empty:hover {
   background: #202625;
   color: var(--accent-strong);
+}
+@media (max-width: 760px) {
+  .web-service-resource {
+    flex: 0 1 210px;
+    max-height: 32%;
+    border-top: 1px solid var(--line);
+  }
 }
 .settings-tabs {
   height: 100%;

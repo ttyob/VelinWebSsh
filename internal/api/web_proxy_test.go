@@ -75,15 +75,54 @@ func TestRewriteHTML(t *testing.T) {
 func TestRewriteStableWebServiceNavigation(t *testing.T) {
 	target, _ := url.Parse("http://router.internal")
 	prefix := "/web-service-proxy/service-id"
-	body := string(rewriteHTML([]byte(`<html><head></head><body><a href="/admin">Admin</a><img src="/logo.png"></body></html>`), prefix, target))
+	body := string(rewriteHTML([]byte(`<html><head><link rel="stylesheet" href="/web-service-proxy/assets/app.css"><script src="/web-service-proxy/assets/app.js"></script></head><body><a href="/admin">Admin</a><img src="/logo.png"></body></html>`), prefix, target))
 	if !strings.Contains(body, `href="/admin?__velin_web_service=service-id"`) {
 		t.Fatalf("navigation link did not use browser route: %s", body)
 	}
 	if !strings.Contains(body, `src="/web-service-proxy/service-id/logo.png"`) {
 		t.Fatalf("resource URL did not use proxy path: %s", body)
 	}
+	for _, expected := range []string{
+		`href="/web-service-proxy/service-id/web-service-proxy/assets/app.css"`,
+		`src="/web-service-proxy/service-id/web-service-proxy/assets/app.js"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("reserved proxy-like resource path missing %q: %s", expected, body)
+		}
+	}
 	if actual := rewriteBrowserRouteURL("/admin?tab=users", prefix, target); actual != "/admin?__velin_web_service=service-id&amp;tab=users" && actual != "/admin?__velin_web_service=service-id&tab=users" {
 		t.Fatalf("browser route=%q", actual)
+	}
+}
+
+func TestModifyResponseRewritesGenericHTMLByExtension(t *testing.T) {
+	target, _ := url.Parse("http://router.internal")
+	request, _ := http.NewRequest(http.MethodGet, "http://router.internal/api/plugin-pages/jackett.html", nil)
+	original := `<html><head><link rel="stylesheet" href="/web-service-proxy/assets/plugin.css"><script src="/web-service-proxy/assets/plugin.js"></script></head></html>`
+	session := &webProxySession{routePrefix: "/web-service-proxy/service-id", target: target}
+	response := &http.Response{
+		Header:        http.Header{"Content-Type": {"text/plain; charset=utf-8"}},
+		Body:          io.NopCloser(strings.NewReader(original)),
+		ContentLength: int64(len(original)),
+		Request:       request,
+	}
+	if err := session.modifyResponse(response); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		`href="/web-service-proxy/service-id/web-service-proxy/assets/plugin.css"`,
+		`src="/web-service-proxy/service-id/web-service-proxy/assets/plugin.js"`,
+	} {
+		if !strings.Contains(string(body), expected) {
+			t.Fatalf("generic HTML response missing %q: %s", expected, body)
+		}
+	}
+	if actual := response.Header.Get("Content-Type"); actual != "text/html; charset=utf-8" {
+		t.Fatalf("content type=%q", actual)
 	}
 }
 

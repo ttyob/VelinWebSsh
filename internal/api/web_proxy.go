@@ -604,8 +604,8 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	response.Header.Set("Cache-Control", "no-store")
 	response.Header.Del("ETag")
 	response.Header.Del("Last-Modified")
-	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if (mediaType != "text/html" && mediaType != "text/css") || response.Body == nil || response.ContentLength > maxRewriteBody {
+	mediaType, inferredMediaType := proxyRewriteMediaType(response)
+	if mediaType == "" || response.Body == nil || response.ContentLength > maxRewriteBody {
 		return nil
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxRewriteBody+1))
@@ -624,9 +624,34 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	}
 	response.Body = io.NopCloser(bytes.NewReader(body))
 	response.ContentLength = int64(len(body))
+	if inferredMediaType {
+		response.Header.Set("Content-Type", mediaType+"; charset=utf-8")
+	}
 	response.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	response.Header.Del("Content-Encoding")
 	return nil
+}
+
+func proxyRewriteMediaType(response *http.Response) (string, bool) {
+	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if mediaType == "text/html" || mediaType == "text/css" {
+		return mediaType, false
+	}
+	if mediaType != "" && mediaType != "text/plain" && mediaType != "application/octet-stream" {
+		return "", false
+	}
+	if response.Request == nil || response.Request.URL == nil {
+		return "", false
+	}
+	path := strings.ToLower(response.Request.URL.Path)
+	switch {
+	case strings.HasSuffix(path, ".html"), strings.HasSuffix(path, ".htm"):
+		return "text/html", true
+	case strings.HasSuffix(path, ".css"):
+		return "text/css", true
+	default:
+		return "", false
+	}
 }
 
 func upstreamCookies(request *http.Request) string {

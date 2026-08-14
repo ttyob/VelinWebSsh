@@ -9,6 +9,7 @@ import {
   SquareTerminal,
 } from "@lucide/vue";
 import type { Host } from "../types";
+import { distributionLogos } from "../distributionLogos";
 
 defineOptions({ name: "HostGroupNode" });
 
@@ -46,6 +47,54 @@ const platformIcons = {
   bsd: Server,
   unix: SquareTerminal,
 };
+const distributionBadges: Record<
+  string,
+  { label: string; color: string }
+> = {
+  ubuntu: { label: "Ubuntu", color: "#e95420" },
+  debian: { label: "Debian", color: "#d70a53" },
+  linuxmint: { label: "Linux Mint", color: "#87cf3e" },
+  pop: { label: "Pop!_OS", color: "#48b9c7" },
+  elementary: { label: "elementary OS", color: "#64baff" },
+  rhel: { label: "Red Hat Enterprise Linux", color: "#ee0000" },
+  centos: { label: "CentOS", color: "#a14f8c" },
+  rocky: { label: "Rocky Linux", color: "#10b981" },
+  almalinux: { label: "AlmaLinux", color: "#4f6bff" },
+  fedora: { label: "Fedora", color: "#51a2da" },
+  arch: { label: "Arch Linux", color: "#1793d1" },
+  manjaro: { label: "Manjaro", color: "#35bf5c" },
+  endeavouros: { label: "EndeavourOS", color: "#7f5af0" },
+  alpine: { label: "Alpine Linux", color: "#0d597f" },
+  opensuse: { label: "openSUSE", color: "#73ba25" },
+  gentoo: { label: "Gentoo", color: "#8b7bb5" },
+  kali: { label: "Kali Linux", color: "#557c94" },
+  raspbian: { label: "Raspberry Pi OS", color: "#c51a4a" },
+  nixos: { label: "NixOS", color: "#5277c3" },
+  void: { label: "Void Linux", color: "#478061" },
+  amazon: { label: "Amazon Linux", color: "#ff9900" },
+  oracle: { label: "Oracle Linux", color: "#c74634" },
+  proxmox: { label: "Proxmox VE", color: "#e57000" },
+};
+function distributionBadge(value?: string) {
+  const id = value?.trim().toLowerCase() || "";
+  return (
+    distributionBadges[id] || {
+      label: id || "Linux",
+      color: "#6fba82",
+    }
+  );
+}
+function systemLabel(host: Host) {
+  if (host.distribution) return distributionBadge(host.distribution).label;
+  const labels: Record<string, string> = {
+    linux: "Linux",
+    windows: "Windows",
+    macos: "macOS",
+    bsd: "BSD",
+    unix: "Unix",
+  };
+  return labels[host.platform || ""] || "尚未识别系统";
+}
 function hostInitial(name: string) {
   return Array.from(name.trim())[0]?.toUpperCase() || "?";
 }
@@ -89,10 +138,34 @@ function forwardSelection(id: string, value: boolean) {
           "
           @click.stop
         />
-        <span class="host-icon" :class="{ detected: Boolean(host.platform) }">
+        <span
+          class="host-icon"
+          :class="{
+            detected: Boolean(host.platform),
+            distribution: Boolean(host.distribution),
+          }"
+          :title="systemLabel(host)"
+          :style="
+            host.distribution
+              ? {
+                  color: distributionBadge(host.distribution).color,
+                  borderColor: `${distributionBadge(host.distribution).color}66`,
+                  backgroundColor: `${distributionBadge(host.distribution).color}18`,
+                }
+              : undefined
+          "
+        >
+          <svg
+            v-if="host.distribution && distributionLogos[host.distribution]"
+            class="distribution-logo"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+          >
+            <path :d="distributionLogos[host.distribution]" />
+          </svg>
           <component
             :is="platformIcons[host.platform as keyof typeof platformIcons]"
-            v-if="host.platform && platformIcons[host.platform as keyof typeof platformIcons]"
+            v-else-if="host.platform && platformIcons[host.platform as keyof typeof platformIcons]"
             :size="17"
             :stroke-width="1.8"
           />

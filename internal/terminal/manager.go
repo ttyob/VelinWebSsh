@@ -37,10 +37,11 @@ type CreateRequest struct {
 	Name               string
 }
 type TestResult struct {
-	LatencyMS   int64  `json:"latencyMs"`
-	TmuxVersion string `json:"tmuxVersion"`
-	Platform    string `json:"platform"`
-	Fingerprint string `json:"fingerprint,omitempty"`
+	LatencyMS    int64  `json:"latencyMs"`
+	TmuxVersion  string `json:"tmuxVersion"`
+	Platform     string `json:"platform"`
+	Distribution string `json:"distribution"`
+	Fingerprint  string `json:"fingerprint,omitempty"`
 }
 
 type Manager struct {
@@ -137,11 +138,11 @@ func (m *Manager) Test(ctx context.Context, userID string, host store.Host, cred
 	if err != nil {
 		return TestResult{}, fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
 	}
-	platform := detectPlatform(client)
+	platform, distribution := detectHostSystem(client)
 	if platform != "" {
-		_ = m.store.UpdateHostPlatform(userID, host.ID, platform)
+		_ = m.store.UpdateHostSystem(userID, host.ID, platform, distribution)
 	}
-	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out)), Platform: platform}, nil
+	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out)), Platform: platform, Distribution: distribution}, nil
 }
 
 func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, trust string) (*Session, error) {
@@ -283,8 +284,8 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 		client.Close()
 		return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
 	}
-	if platform := detectPlatform(client); platform != "" {
-		_ = s.manager.store.UpdateHostPlatform(s.meta.UserID, host.ID, platform)
+	if platform, distribution := detectHostSystem(client); platform != "" {
+		_ = s.manager.store.UpdateHostSystem(s.meta.UserID, host.ID, platform, distribution)
 	}
 	if create {
 		startDir := ""
@@ -466,15 +467,64 @@ func run(client *ssh.Client, cmd string) ([]byte, error) {
 	return s.CombinedOutput(cmd)
 }
 
-func detectPlatform(client *ssh.Client) string {
+func detectHostSystem(client *ssh.Client) (string, string) {
 	if strings.Contains(strings.ToLower(string(client.ServerVersion())), "windows") {
-		return "windows"
+		return "windows", ""
 	}
-	out, err := run(client, "uname -s 2>/dev/null || true")
+	out, err := run(client, `uname -s 2>/dev/null || true; if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\n%s\n' "$ID" "$ID_LIKE"; fi`)
 	if err != nil {
+		return "", ""
+	}
+	lines := strings.Split(strings.ReplaceAll(string(out), "\r\n", "\n"), "\n")
+	platform := platformFromName(valueAt(lines, 0))
+	if platform != "linux" {
+		return platform, ""
+	}
+	return platform, distributionFromRelease(valueAt(lines, 1), valueAt(lines, 2))
+}
+
+func valueAt(values []string, index int) string {
+	if index >= len(values) {
 		return ""
 	}
-	return platformFromName(string(out))
+	return strings.TrimSpace(values[index])
+}
+
+func distributionFromRelease(id, idLike string) string {
+	id = strings.ToLower(strings.Trim(strings.TrimSpace(id), `"'`))
+	idLike = strings.ToLower(strings.Trim(strings.TrimSpace(idLike), `"'`))
+	aliases := map[string]string{
+		"amzn": "amazon", "ol": "oracle", "opensuse-leap": "opensuse",
+		"opensuse-tumbleweed": "opensuse", "sles": "opensuse",
+		"rhel": "rhel", "redhat": "rhel", "redhatenterpriseserver": "rhel",
+	}
+	if canonical := aliases[id]; canonical != "" {
+		return canonical
+	}
+	known := map[string]bool{
+		"ubuntu": true, "debian": true, "linuxmint": true, "pop": true,
+		"elementary": true, "centos": true, "rocky": true, "almalinux": true,
+		"fedora": true, "arch": true, "manjaro": true, "endeavouros": true,
+		"alpine": true, "opensuse": true, "gentoo": true, "kali": true,
+		"raspbian": true, "nixos": true, "void": true, "amazon": true,
+		"oracle": true, "proxmox": true,
+	}
+	if known[id] {
+		return id
+	}
+	for _, family := range strings.Fields(idLike) {
+		family = strings.Trim(family, `"'`)
+		if canonical := aliases[family]; canonical != "" {
+			return canonical
+		}
+		if known[family] {
+			return family
+		}
+	}
+	if id != "" && len(id) <= 32 {
+		return id
+	}
+	return ""
 }
 
 func platformFromName(value string) string {

@@ -41,6 +41,7 @@ type Host struct {
 	MaxRetries        int        `json:"maxRetries"`
 	TerminalType      string     `json:"terminalType"`
 	Platform          string     `json:"platform"`
+	Distribution      string     `json:"distribution"`
 	LastStatus        string     `json:"lastStatus"`
 	LastLatency       int        `json:"lastLatencyMs"`
 	LastConnectedAt   *time.Time `json:"lastConnectedAt,omitempty"`
@@ -141,7 +142,7 @@ CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UN
 CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_auth_token ON auth_sessions(token_hash);
 CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, secret_enc TEXT NOT NULL, passphrase_enc TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', platform TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_hosts_user ON hosts(user_id, name);
 CREATE TABLE IF NOT EXISTS known_host_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, fingerprint TEXT NOT NULL, public_key TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,address,port));
 CREATE TABLE IF NOT EXISTS terminal_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, credential_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, remote_user TEXT NOT NULL, tmux_socket TEXT NOT NULL, tmux_name TEXT NOT NULL, owner_marker TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -170,6 +171,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 		{"keepalive_interval", "INTEGER NOT NULL DEFAULT 30"}, {"max_retries", "INTEGER NOT NULL DEFAULT 5"},
 		{"terminal_type", "TEXT NOT NULL DEFAULT 'xterm-256color'"}, {"last_status", "TEXT NOT NULL DEFAULT ''"},
 		{"platform", "TEXT NOT NULL DEFAULT ''"},
+		{"distribution", "TEXT NOT NULL DEFAULT ''"},
 		{"last_latency_ms", "INTEGER NOT NULL DEFAULT 0"}, {"last_connected_at", "DATETIME"},
 	}
 	for _, column := range columns {
@@ -201,7 +203,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 	if err = s.ensureColumn("web_services", "listen_port", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9); PRAGMA user_version=9;`)
+	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10); PRAGMA user_version=10;`)
 	return err
 }
 
@@ -410,12 +412,12 @@ func (s *Store) SaveSystemSetting(key string, value any) error {
 	return err
 }
 
-const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,platform,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
+const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
 
 func scanHost(row interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var connected sql.NullTime
-	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.Platform, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
+	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
 	if connected.Valid {
 		h.LastConnectedAt = &connected.Time
 	}
@@ -448,8 +450,8 @@ func (s *Store) UpdateHostConnection(userID, id, status string, latency int) err
 	_, err := s.DB.Exec(`UPDATE hosts SET last_status=?,last_latency_ms=?,last_connected_at=CASE WHEN ?='online' THEN CURRENT_TIMESTAMP ELSE last_connected_at END,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, status, latency, status, userID, id)
 	return err
 }
-func (s *Store) UpdateHostPlatform(userID, id, platform string) error {
-	_, err := s.DB.Exec(`UPDATE hosts SET platform=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, platform, userID, id)
+func (s *Store) UpdateHostSystem(userID, id, platform, distribution string) error {
+	_, err := s.DB.Exec(`UPDATE hosts SET platform=?,distribution=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, platform, distribution, userID, id)
 	return err
 }
 func (s *Store) ActiveSessionsForHost(userID, id string) ([]TerminalSession, error) {
@@ -871,7 +873,7 @@ func VerifyBackup(path string) error {
 	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version < 1 || version > 9 {
+	if version < 1 || version > 10 {
 		return fmt.Errorf("unsupported database version %d", version)
 	}
 	requiredTables := []string{"users", "hosts", "workspaces", "terminal_sessions"}

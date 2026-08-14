@@ -660,12 +660,50 @@ body {
   background: var(--sidebar-header-bg);
 }
 
+.web-service-resizer span {
+  background: var(--line-strong);
+  transition:
+    height 0.16s var(--ease-ui),
+    top 0.16s var(--ease-ui),
+    background-color 0.16s var(--ease-ui);
+}
+
+.web-service-resizer:hover span,
+.web-service-resizer:focus-visible span,
+.is-resizing-web-service .web-service-resizer span {
+  top: 2px;
+  height: 2px;
+  background: var(--accent);
+}
+
+.is-resizing-web-service,
+.is-resizing-web-service * {
+  cursor: row-resize !important;
+  user-select: none !important;
+}
+
+.is-resizing-web-service .web-service-resource {
+  transition: none !important;
+}
+
 .tabbar {
   height: 43px;
   flex-basis: 43px;
   border-color: var(--line);
   background: var(--tabbar-bg);
   box-shadow: 0 3px 14px var(--theme-shadow);
+}
+
+.workspace-lock-button {
+  border: 1px solid transparent;
+  color: var(--text-muted);
+}
+
+.workspace-lock-button:hover,
+.workspace-lock-button:focus-visible {
+  border-color: var(--accent-border);
+  background: var(--accent-surface);
+  color: var(--accent-strong);
 }
 
 .terminal-tab {

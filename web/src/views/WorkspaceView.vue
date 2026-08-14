@@ -81,6 +81,9 @@ const search = ref(""),
 const defaultSidebarWidth = 274;
 const sidebarWidth = ref(defaultSidebarWidth);
 let sidebarResizeCleanup: (() => void) | undefined;
+const defaultWebServiceHeight = 210;
+const webServiceHeight = ref(defaultWebServiceHeight);
+let webServiceResizeCleanup: (() => void) | undefined;
 const sessionStatusFilter = ref(""),
   sessionHostFilter = ref(""),
   restoringBackground = ref(false);
@@ -137,6 +140,7 @@ watch(() => preferences.accentColor, applyAccent, { immediate: true });
 watch(() => preferences.theme, applyInterfaceTheme, { immediate: true });
 const sidebarStyle = computed(() => ({
   "--sidebar-width": `${sidebarWidth.value}px`,
+  "--web-service-height": `${webServiceHeight.value}px`,
 }));
 const layout = reactive<WorkspaceLayout>({
   tabs: [],
@@ -420,6 +424,7 @@ function setSidebarWidth(value: number, persist = false) {
 function startSidebarResize(event: PointerEvent) {
   if (!sidebarOpen.value || window.innerWidth <= 760) return;
   event.preventDefault();
+  webServiceResizeCleanup?.();
   document.body.classList.add("is-resizing-sidebar");
   const move = (next: PointerEvent) => setSidebarWidth(next.clientX);
   const stop = () => {
@@ -448,6 +453,59 @@ function resizeSidebarByKeyboard(event: KeyboardEvent) {
 }
 function resetSidebarWidth() {
   setSidebarWidth(defaultSidebarWidth, true);
+}
+function setWebServiceHeight(value: number, persist = false) {
+  const sidebar = document.querySelector<HTMLElement>(".sidebar");
+  const availableHeight = sidebar?.clientHeight || window.innerHeight;
+  const max = Math.max(82, availableHeight - 276);
+  webServiceHeight.value = Math.round(Math.min(max, Math.max(82, value)));
+  if (persist) {
+    try {
+      localStorage.setItem(
+        "velin-web-service-height",
+        String(webServiceHeight.value),
+      );
+    } catch {}
+  }
+}
+function startWebServiceResize(event: PointerEvent) {
+  if (!sidebarOpen.value || window.innerWidth <= 760) return;
+  event.preventDefault();
+  event.stopPropagation();
+  sidebarResizeCleanup?.();
+  webServiceResizeCleanup?.();
+  document.body.classList.add("is-resizing-web-service");
+  const sidebar = (event.currentTarget as HTMLElement).closest(".sidebar");
+  const panelBottom =
+    sidebar?.querySelector<HTMLElement>(".sidebar-footer")?.getBoundingClientRect()
+      .top || window.innerHeight - 50;
+  const move = (next: PointerEvent) =>
+    setWebServiceHeight(panelBottom - next.clientY);
+  const stop = () => {
+    setWebServiceHeight(webServiceHeight.value, true);
+    document.body.classList.remove("is-resizing-web-service");
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
+    window.removeEventListener("blur", stop);
+    webServiceResizeCleanup = undefined;
+  };
+  webServiceResizeCleanup = stop;
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", stop);
+  window.addEventListener("pointercancel", stop);
+  window.addEventListener("blur", stop);
+}
+function resizeWebServiceByKeyboard(event: KeyboardEvent) {
+  if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+  event.preventDefault();
+  setWebServiceHeight(
+    webServiceHeight.value + (event.key === "ArrowUp" ? 12 : -12),
+    true,
+  );
+}
+function resetWebServiceHeight() {
+  setWebServiceHeight(defaultWebServiceHeight, true);
 }
 async function load() {
   try {
@@ -1113,6 +1171,7 @@ async function testHost(
       latencyMs: number;
       tmuxVersion: string;
       platform?: Host["platform"];
+      distribution?: string;
     }>(
       `/api/hosts/${host.id}/test`,
       {
@@ -1129,6 +1188,7 @@ async function testHost(
     host.lastLatencyMs = result.latencyMs;
     host.lastConnectedAt = new Date().toISOString();
     if (result.platform) host.platform = result.platform;
+    if (result.distribution) host.distribution = result.distribution;
     ElMessage.success(
       `连接正常 · ${result.latencyMs} ms · ${result.tmuxVersion}`,
     );
@@ -1436,12 +1496,18 @@ onMounted(() => {
     const savedWidth = Number(localStorage.getItem("velin-sidebar-width"));
     if (Number.isFinite(savedWidth) && savedWidth > 0)
       setSidebarWidth(savedWidth);
+    const savedWebServiceHeight = Number(
+      localStorage.getItem("velin-web-service-height"),
+    );
+    if (Number.isFinite(savedWebServiceHeight) && savedWebServiceHeight > 0)
+      setWebServiceHeight(savedWebServiceHeight);
   } catch {}
   if (!locked.value) load();
   window.addEventListener("keydown", handleKeyboard, true);
 });
 onBeforeUnmount(() => {
   sidebarResizeCleanup?.();
+  webServiceResizeCleanup?.();
   clearTimeout(saveTimer.value);
   window.removeEventListener("keydown", handleKeyboard, true);
 });
@@ -1496,6 +1562,16 @@ onBeforeUnmount(() => {
           @add="editHost()"
           @refresh="refreshHosts"
         />
+        <button
+          class="web-service-resizer desktop-only"
+          title="拖动调整内网 Web 高度，双击恢复默认"
+          aria-label="调整内网 Web 区域高度"
+          @pointerdown="startWebServiceResize"
+          @dblclick="resetWebServiceHeight"
+          @keydown="resizeWebServiceByKeyboard"
+        >
+          <span></span>
+        </button>
         <WebServiceList
           :services="webServices"
           :hosts="hosts"
@@ -1598,6 +1674,15 @@ onBeforeUnmount(() => {
           <span v-if="currentPaneCount > 1" class="pane-count"
             ><Columns2 :size="14" />{{ currentPaneCount }}</span
           >
+          <button
+            v-if="preferences.lockEnabled"
+            class="icon-btn workspace-lock-button"
+            title="手动锁屏"
+            aria-label="手动锁屏"
+            @click="lockWorkspace('manual')"
+          >
+            <LockKeyhole :size="16" />
+          </button>
         </div>
       </header>
       <template v-if="!locked && layout.tabs.length"

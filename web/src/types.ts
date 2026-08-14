@@ -85,6 +85,7 @@ export interface Host {
   maxRetries: number;
   terminalType: string;
   platform?: "linux" | "windows" | "macos" | "bsd" | "unix" | "";
+  distribution?: string;
   lastStatus?: string;
   lastLatencyMs?: number;
   lastConnectedAt?: string;

@@ -76,3 +76,23 @@ func TestPlatformFromName(t *testing.T) {
 		}
 	}
 }
+
+func TestDistributionFromRelease(t *testing.T) {
+	for name, test := range map[string]struct {
+		id, like, expected string
+	}{
+		"ubuntu":       {"ubuntu", "debian", "ubuntu"},
+		"rocky":        {"rocky", "rhel centos fedora", "rocky"},
+		"oracle alias": {"ol", "fedora", "oracle"},
+		"suse alias":   {"opensuse-leap", "suse", "opensuse"},
+		"family":       {"custom", "rhel fedora", "rhel"},
+		"unknown":      {"my-distro", "", "my-distro"},
+		"empty":        {"", "", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if actual := distributionFromRelease(test.id, test.like); actual != test.expected {
+				t.Fatalf("distribution=%q, want %q", actual, test.expected)
+			}
+		})
+	}
+}
