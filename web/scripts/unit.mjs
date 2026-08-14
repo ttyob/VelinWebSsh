@@ -15,4 +15,11 @@ assert.equal(reconnectDelay(5, 0.5), 30000)
 assert.equal(reconnectDelay(20, 1), 36000)
 assert.equal(reconnectDelay(0, 0), 800)
 
+const { tmuxInstallGuide } = await loadModule(new URL('../src/tmuxInstall.ts', import.meta.url))
+assert.equal(tmuxInstallGuide('linux', 'debian').command, 'sudo apt-get update && sudo apt-get install -y tmux')
+assert.equal(tmuxInstallGuide('linux', 'rocky').command, 'sudo dnf install -y tmux')
+assert.equal(tmuxInstallGuide('linux', 'alpine').command, 'sudo apk add tmux')
+assert.equal(tmuxInstallGuide('windows', '').supported, false)
+assert.match(tmuxInstallGuide('linux', 'unknown').command, /command -v apt-get/)
+
 console.log('frontend unit checks passed')

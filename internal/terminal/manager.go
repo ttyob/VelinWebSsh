@@ -20,12 +20,13 @@ import (
 )
 
 var (
-	ErrHostKeyUnknown = errors.New("host key is not trusted")
-	ErrHostKeyChanged = errors.New("host key changed")
-	ErrNotController  = errors.New("terminal is controlled by another client")
+	ErrHostKeyUnknown     = errors.New("host key is not trusted")
+	ErrHostKeyChanged     = errors.New("host key changed")
+	ErrNotController      = errors.New("terminal is controlled by another client")
+	ErrNormalSessionEnded = errors.New("normal SSH sessions cannot be restored after the Velin service restarts")
 )
 
-type HostKeyError struct{ Kind, Fingerprint, PublicKey string }
+type HostKeyError struct{ Kind, Fingerprint, PublicKey, HostName, Address string }
 
 func (e *HostKeyError) Error() string { return e.Kind + ": " + e.Fingerprint }
 
@@ -35,10 +36,12 @@ type CreateRequest struct {
 	Secret, Passphrase string
 	TrustFingerprint   string
 	Name               string
+	SessionMode        string
 }
 type TestResult struct {
 	LatencyMS    int64  `json:"latencyMs"`
 	TmuxVersion  string `json:"tmuxVersion"`
+	SessionMode  string `json:"sessionMode"`
 	Platform     string `json:"platform"`
 	Distribution string `json:"distribution"`
 	Fingerprint  string `json:"fingerprint,omitempty"`
@@ -95,7 +98,15 @@ type Event struct {
 }
 
 func NewManager(s *store.Store, vault *security.Vault, deploymentID string) *Manager {
+	_ = s.EndStaleNormalSessions(ErrNormalSessionEnded.Error())
 	return &Manager{store: s, vault: vault, deploymentID: deploymentID, sessions: make(map[string]*Session)}
+}
+
+func normalizeSessionMode(preferred, fallback string) string {
+	if preferred == "normal" || (preferred == "" && fallback == "normal") {
+		return "normal"
+	}
+	return "tmux"
 }
 
 func (m *Manager) ActiveCount() int {
@@ -106,7 +117,8 @@ func (m *Manager) ActiveCount() int {
 
 func (m *Manager) Create(ctx context.Context, userID string, req CreateRequest) (store.TerminalSession, error) {
 	id := uuid.NewString()
-	meta := store.TerminalSession{ID: id, UserID: userID, HostID: req.Host.ID, CredentialID: req.Credential.ID, Name: req.Name, RemoteUser: req.Host.Username, TmuxSocket: "velin-webssh-" + m.deploymentID, TmuxName: "ws_" + strings.ReplaceAll(id, "-", ""), OwnerMarker: m.deploymentID + ":" + userID + ":" + id, Status: "creating"}
+	mode := normalizeSessionMode(req.SessionMode, req.Host.SessionMode)
+	meta := store.TerminalSession{ID: id, UserID: userID, HostID: req.Host.ID, CredentialID: req.Credential.ID, Name: req.Name, RemoteUser: req.Host.Username, SessionMode: mode, TmuxSocket: "velin-webssh-" + m.deploymentID, TmuxName: "ws_" + strings.ReplaceAll(id, "-", ""), OwnerMarker: m.deploymentID + ":" + userID + ":" + id, Status: "creating"}
 	if meta.Name == "" {
 		meta.Name = req.Host.Name
 	}
@@ -134,15 +146,19 @@ func (m *Manager) Test(ctx context.Context, userID string, host store.Host, cred
 		return TestResult{}, err
 	}
 	defer client.Close()
-	out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V")
-	if err != nil {
-		return TestResult{}, fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
-	}
 	platform, distribution := detectHostSystem(client)
 	if platform != "" {
 		_ = m.store.UpdateHostSystem(userID, host.ID, platform, distribution)
 	}
-	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out)), Platform: platform, Distribution: distribution}, nil
+	mode := normalizeSessionMode("", host.SessionMode)
+	if mode == "normal" {
+		return TestResult{LatencyMS: time.Since(started).Milliseconds(), SessionMode: mode, Platform: platform, Distribution: distribution}, nil
+	}
+	out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V")
+	if err != nil {
+		return TestResult{}, fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
+	}
+	return TestResult{LatencyMS: time.Since(started).Milliseconds(), TmuxVersion: strings.TrimSpace(string(out)), SessionMode: mode, Platform: platform, Distribution: distribution}, nil
 }
 
 func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, trust string) (*Session, error) {
@@ -158,6 +174,10 @@ func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, t
 	}
 	if meta.Status == "ended" {
 		return nil, errors.New("terminal session has ended")
+	}
+	if meta.SessionMode == "normal" {
+		_ = m.store.UpdateTerminalStatus(userID, id, "ended", ErrNormalSessionEnded.Error())
+		return nil, ErrNormalSessionEnded
 	}
 	host, err := m.store.Host(userID, meta.HostID)
 	if err != nil {
@@ -230,6 +250,9 @@ func (m *Manager) Terminate(ctx context.Context, userID, id string, secret, pass
 		s.close("ended", "Terminated by user")
 		return nil
 	}
+	if meta.SessionMode == "normal" {
+		return m.store.UpdateTerminalStatus(userID, id, "ended", "Terminated by user")
+	}
 	host, err := m.store.Host(userID, meta.HostID)
 	if err != nil {
 		return err
@@ -268,6 +291,9 @@ func (s *Session) CurrentDirectory() (string, error) {
 	if client == nil {
 		return "", errors.New("terminal connection is not available")
 	}
+	if meta.SessionMode == "normal" {
+		return "", errors.New("current directory is unavailable in normal SSH mode")
+	}
 	out, err := run(client, fmt.Sprintf("tmux -L %s display-message -p -t %s '#{pane_current_path}'", meta.TmuxSocket, meta.TmuxName))
 	if err != nil {
 		return "", err
@@ -280,36 +306,40 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 	if err != nil {
 		return err
 	}
-	if out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V"); err != nil {
-		client.Close()
-		return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
-	}
-	if platform, distribution := detectHostSystem(client); platform != "" {
+	platform, distribution := detectHostSystem(client)
+	if platform != "" {
 		_ = s.manager.store.UpdateHostSystem(s.meta.UserID, host.ID, platform, distribution)
 	}
-	if create {
-		startDir := ""
-		if strings.TrimSpace(host.InitialDir) != "" {
-			startDir = " -c " + shellQuote(strings.TrimSpace(host.InitialDir))
-		}
-		cmd := fmt.Sprintf("tmux -L %s new-session -d -s %s%s \\; set-option -t %s @velin_owner %s \\; set-option -t %s history-limit 50000 \\; set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName, startDir, s.meta.TmuxName, s.meta.OwnerMarker, s.meta.TmuxName, s.meta.TmuxName)
-		if out, err := run(client, cmd); err != nil {
+	tmuxMode := s.meta.SessionMode != "normal"
+	if tmuxMode {
+		if out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V"); err != nil {
 			client.Close()
-			return fmt.Errorf("create tmux session: %s", cleanOutput(out, err))
+			return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
 		}
-	} else if err := validateOwnership(client, s.meta); err != nil {
-		client.Close()
-		return err
-	}
-	if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName)); err != nil {
-		client.Close()
-		return fmt.Errorf("configure tmux session: %s", cleanOutput(out, err))
-	}
-	// Keep browser xterm.js on its normal buffer so scrollback and its viewport
-	// scrollbar remain available while tmux still manages alternate-screen apps.
-	if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -as terminal-overrides ',xterm-256color:smcup@:rmcup@'", s.meta.TmuxSocket)); err != nil {
-		client.Close()
-		return fmt.Errorf("configure tmux terminal: %s", cleanOutput(out, err))
+		if create {
+			startDir := ""
+			if strings.TrimSpace(host.InitialDir) != "" {
+				startDir = " -c " + shellQuote(strings.TrimSpace(host.InitialDir))
+			}
+			cmd := fmt.Sprintf("tmux -L %s new-session -d -s %s%s \\; set-option -t %s @velin_owner %s \\; set-option -t %s history-limit 50000 \\; set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName, startDir, s.meta.TmuxName, s.meta.OwnerMarker, s.meta.TmuxName, s.meta.TmuxName)
+			if out, err := run(client, cmd); err != nil {
+				client.Close()
+				return fmt.Errorf("create tmux session: %s", cleanOutput(out, err))
+			}
+		} else if err := validateOwnership(client, s.meta); err != nil {
+			client.Close()
+			return err
+		}
+		if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName)); err != nil {
+			client.Close()
+			return fmt.Errorf("configure tmux session: %s", cleanOutput(out, err))
+		}
+		// Keep browser xterm.js on its normal buffer so scrollback and its viewport
+		// scrollbar remain available while tmux still manages alternate-screen apps.
+		if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -as terminal-overrides ',xterm-256color:smcup@:rmcup@'", s.meta.TmuxSocket)); err != nil {
+			client.Close()
+			return fmt.Errorf("configure tmux terminal: %s", cleanOutput(out, err))
+		}
 	}
 	sshSess, err := client.NewSession()
 	if err != nil {
@@ -339,8 +369,16 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 		return err
 	}
 	sshSess.Stderr = sshSess.Stdout
-	attach := fmt.Sprintf("exec tmux -L %s attach-session -t %s", s.meta.TmuxSocket, s.meta.TmuxName)
-	if err = sshSess.Start(attach); err != nil {
+	if tmuxMode {
+		attach := fmt.Sprintf("exec tmux -L %s attach-session -t %s", s.meta.TmuxSocket, s.meta.TmuxName)
+		err = sshSess.Start(attach)
+	} else if strings.TrimSpace(host.InitialDir) != "" && platform != "windows" {
+		start := fmt.Sprintf("cd %s && exec ${SHELL:-/bin/sh} -l", shellQuote(strings.TrimSpace(host.InitialDir)))
+		err = sshSess.Start(start)
+	} else {
+		err = sshSess.Shell()
+	}
+	if err != nil {
 		sshSess.Close()
 		client.Close()
 		return err
@@ -362,6 +400,23 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 }
 
 func (m *Manager) dial(ctx context.Context, userID string, host store.Host, cred store.Credential, secret, passphrase, trust string) (*ssh.Client, error) {
+	return m.dialHost(ctx, userID, host, cred, secret, passphrase, trust, make(map[string]bool), 0)
+}
+
+func (m *Manager) dialHost(ctx context.Context, userID string, host store.Host, cred store.Credential, secret, passphrase, trust string, visited map[string]bool, depth int) (*ssh.Client, error) {
+	if depth > 8 {
+		return nil, errors.New("跳板机链路不能超过 8 层")
+	}
+	hostKey := host.ID
+	if hostKey == "" {
+		hostKey = net.JoinHostPort(host.Address, fmt.Sprint(host.Port))
+	}
+	if visited[hostKey] {
+		return nil, errors.New("检测到跳板机循环引用")
+	}
+	visited[hostKey] = true
+	defer delete(visited, hostKey)
+
 	if cred.ID != "" {
 		var err error
 		secret, err = m.vault.Decrypt(cred.Secret)
@@ -393,7 +448,7 @@ func (m *Manager) dial(ctx context.Context, userID string, host store.Host, cred
 		_, stored, err := m.store.KnownHost(userID, host.Address, host.Port)
 		if errors.Is(err, sql.ErrNoRows) {
 			if trust != fp {
-				return &HostKeyError{Kind: "unknown_host_key", Fingerprint: fp, PublicKey: base64.StdEncoding.EncodeToString(key.Marshal())}
+				return &HostKeyError{Kind: "unknown_host_key", Fingerprint: fp, PublicKey: base64.StdEncoding.EncodeToString(key.Marshal()), HostName: host.Name, Address: net.JoinHostPort(host.Address, fmt.Sprint(host.Port))}
 			}
 			return m.store.TrustHost(userID, host.Address, host.Port, fp, base64.StdEncoding.EncodeToString(key.Marshal()))
 		}
@@ -404,7 +459,7 @@ func (m *Manager) dial(ctx context.Context, userID string, host store.Host, cred
 			if trust == fp {
 				return m.store.TrustHost(userID, host.Address, host.Port, fp, base64.StdEncoding.EncodeToString(key.Marshal()))
 			}
-			return &HostKeyError{Kind: "host_key_changed", Fingerprint: fp, PublicKey: base64.StdEncoding.EncodeToString(key.Marshal())}
+			return &HostKeyError{Kind: "host_key_changed", Fingerprint: fp, PublicKey: base64.StdEncoding.EncodeToString(key.Marshal()), HostName: host.Name, Address: net.JoinHostPort(host.Address, fmt.Sprint(host.Port))}
 		}
 		return nil
 	}
@@ -412,19 +467,81 @@ func (m *Manager) dial(ctx context.Context, userID string, host store.Host, cred
 	if timeout <= 0 {
 		timeout = 12 * time.Second
 	}
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	config := &ssh.ClientConfig{User: host.Username, Auth: []ssh.AuthMethod{auth}, HostKeyCallback: callback, Timeout: timeout}
 	addr := net.JoinHostPort(host.Address, fmt.Sprint(host.Port))
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	var (
+		conn       net.Conn
+		jumpClient *ssh.Client
+		err        error
+	)
+	if host.JumpHostID != "" {
+		jumpHost, loadErr := m.store.Host(userID, host.JumpHostID)
+		if loadErr != nil {
+			return nil, errors.New("跳板机不存在或无权访问")
+		}
+		if jumpHost.CredentialID == "" {
+			return nil, fmt.Errorf("跳板机“%s”需要绑定已保存的凭据", jumpHost.Name)
+		}
+		jumpCredential, loadErr := m.store.Credential(userID, jumpHost.CredentialID)
+		if loadErr != nil {
+			return nil, fmt.Errorf("读取跳板机“%s”的凭据失败: %w", jumpHost.Name, loadErr)
+		}
+		jumpClient, err = m.dialHost(dialCtx, userID, jumpHost, jumpCredential, "", "", trust, visited, depth+1)
+		if err != nil {
+			return nil, fmt.Errorf("连接跳板机“%s”失败: %w", jumpHost.Name, err)
+		}
+		conn, err = dialThroughJump(dialCtx, jumpClient, addr)
+	} else {
+		dialer := net.Dialer{Timeout: timeout}
+		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
+	}
 	if err != nil {
+		if jumpClient != nil {
+			_ = jumpClient.Close()
+		}
 		return nil, err
+	}
+	if deadline, ok := dialCtx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
 	}
 	c, chs, reqs, err := ssh.NewClientConn(conn, addr, config)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
+		if jumpClient != nil {
+			_ = jumpClient.Close()
+		}
 		return nil, err
 	}
-	return ssh.NewClient(c, chs, reqs), nil
+	_ = conn.SetDeadline(time.Time{})
+	client := ssh.NewClient(c, chs, reqs)
+	if jumpClient != nil {
+		go func() {
+			_ = client.Wait()
+			_ = jumpClient.Close()
+		}()
+	}
+	return client, nil
+}
+
+func dialThroughJump(ctx context.Context, client *ssh.Client, address string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ready := make(chan result, 1)
+	go func() {
+		conn, err := client.Dial("tcp", address)
+		ready <- result{conn: conn, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		_ = client.Close()
+		return nil, ctx.Err()
+	case value := <-ready:
+		return value.conn, value.err
+	}
 }
 
 func keepalive(client *ssh.Client, interval time.Duration) {
@@ -563,7 +680,11 @@ func (s *Session) readLoop(r io.Reader) {
 			s.broadcast(Event{Type: "output", Data: base64.StdEncoding.EncodeToString(buf[:n])})
 		}
 		if err != nil {
-			s.close("background", err.Error())
+			status := "background"
+			if s.Meta().SessionMode == "normal" {
+				status = "ended"
+			}
+			s.close(status, err.Error())
 			return
 		}
 	}
@@ -746,6 +867,9 @@ func (s *Session) SetTerminalColors(clientID, foreground, background string) err
 	if closed || client == nil {
 		return errors.New("terminal not attached")
 	}
+	if meta.SessionMode == "normal" {
+		return nil
+	}
 	style := shellQuote("fg=" + foreground + ",bg=" + background)
 	cmd := fmt.Sprintf(
 		"tmux -L %s set-option -t %s window-style %s \\; set-option -t %s window-active-style %s",
@@ -779,6 +903,9 @@ func (s *Session) killRemote(ctx context.Context) error {
 	s.mu.RUnlock()
 	if client == nil {
 		return errors.New("SSH connection unavailable")
+	}
+	if meta.SessionMode == "normal" {
+		return nil
 	}
 	if err := validateOwnership(client, meta); err != nil {
 		return err

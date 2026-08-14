@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,14 +73,25 @@ func TestBatchHostsIsAtomicAndOwned(t *testing.T) {
 			t.Fatalf("host %s tags=%q", id, host.Tags)
 		}
 	}
-	if err := s.SaveTerminal(TerminalSession{ID: "s1", UserID: "u1", HostID: "h2", Name: "active", RemoteUser: "root", TmuxSocket: "sock", TmuxName: "tmux", OwnerMarker: "owner", Status: "attached"}); err != nil {
+	if err := s.SaveTerminal(TerminalSession{ID: "s1", UserID: "u1", HostID: "h2", Name: "active", RemoteUser: "root", SessionMode: "normal", TmuxSocket: "sock", TmuxName: "tmux", OwnerMarker: "owner", Status: "attached"}); err != nil {
 		t.Fatal(err)
+	}
+	session, err := s.Terminal("u1", "s1")
+	if err != nil || session.SessionMode != "normal" {
+		t.Fatalf("session mode=%q err=%v", session.SessionMode, err)
 	}
 	if err := s.BatchHosts("u1", []string{"h1", "h2"}, "delete", "", ""); err == nil {
 		t.Fatal("batch delete with active session succeeded")
 	}
 	if _, err := s.Host("u1", "h1"); err != nil {
 		t.Fatal("batch delete was not atomic")
+	}
+	if err = s.EndStaleNormalSessions("service restarted"); err != nil {
+		t.Fatal(err)
+	}
+	session, err = s.Terminal("u1", "s1")
+	if err != nil || session.Status != "ended" || session.LastError != "service restarted" {
+		t.Fatalf("stale normal session=%+v err=%v", session, err)
 	}
 }
 
@@ -222,7 +234,7 @@ func TestHostMigrationAndConnectionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if host.ConnectTimeout != 12 || host.KeepaliveInterval != 30 || host.MaxRetries != 5 || host.TerminalType != "xterm-256color" || host.Platform != "" || host.Distribution != "" {
+	if host.ConnectTimeout != 12 || host.KeepaliveInterval != 30 || host.MaxRetries != 5 || host.TerminalType != "xterm-256color" || host.SessionMode != "tmux" || host.JumpHostID != "" || host.Platform != "" || host.Distribution != "" {
 		t.Fatalf("unexpected migrated defaults: %+v", host)
 	}
 	if err = s.UpdateHostConnection("u1", "h1", "online", 37); err != nil {
@@ -242,9 +254,42 @@ func TestHostMigrationAndConnectionMetadata(t *testing.T) {
 	if err != nil || host.Platform != "linux" || host.Distribution != "ubuntu" {
 		t.Fatalf("platform=%q distribution=%q err=%v", host.Platform, host.Distribution, err)
 	}
+	host.SessionMode = "normal"
+	if err = s.SaveHost(host); err != nil {
+		t.Fatal(err)
+	}
+	host, err = s.Host("u1", "h1")
+	if err != nil || host.SessionMode != "normal" {
+		t.Fatalf("session mode=%q err=%v", host.SessionMode, err)
+	}
 	var version int
-	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 10 {
+	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 12 {
 		t.Fatalf("user_version=%d err=%v", version, err)
+	}
+}
+
+func TestJumpHostPersistenceAndDeleteProtection(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser("u1", "user", "hash", "user"); err != nil {
+		t.Fatal(err)
+	}
+	jump := Host{ID: "jump", UserID: "u1", Name: "bastion", Address: "192.0.2.1", Port: 22, Username: "root"}
+	target := Host{ID: "target", UserID: "u1", Name: "private", Address: "10.0.0.2", Port: 22, Username: "root", JumpHostID: jump.ID}
+	if err := s.SaveHost(jump); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveHost(target); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := s.Host("u1", target.ID)
+	if err != nil || saved.JumpHostID != jump.ID {
+		t.Fatalf("jumpHostID=%q err=%v", saved.JumpHostID, err)
+	}
+	if err = s.DeleteHost("u1", jump.ID); err == nil || !strings.Contains(err.Error(), "jump host") {
+		t.Fatalf("referenced jump host deletion error=%v", err)
+	}
+	if err = s.BatchHosts("u1", []string{jump.ID, target.ID}, "delete", "", ""); err != nil {
+		t.Fatal(err)
 	}
 }
 

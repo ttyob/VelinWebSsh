@@ -50,6 +50,7 @@ import type {
 import SplitPaneNode from "../components/SplitPaneNode.vue";
 import HostDialog from "../components/HostDialog.vue";
 import HostResourceList from "../components/HostResourceList.vue";
+import TmuxInstallDialog from "../components/TmuxInstallDialog.vue";
 import WebServiceList from "../components/WebServiceList.vue";
 import { useWorkspaceLock } from "../composables/useWorkspaceLock";
 import {
@@ -99,8 +100,12 @@ const hostDialog = ref(false),
   fileManagerPath = ref("."),
   webProxyOpen = ref(false),
   webProxyHost = ref<Host>(),
+  tmuxInstallOpen = ref(false),
+  tmuxInstallHost = ref<Host>(),
   editingWebService = ref<WebService>(),
   editingHost = ref<Host>();
+let tmuxInstallRetry: (() => Promise<void>) | undefined;
+let tmuxNormalFallback: (() => Promise<void>) | undefined;
 const sessionDirectories = reactive<Record<string, string>>({});
 const connecting = ref<string>(),
   testing = ref<string>(),
@@ -579,6 +584,48 @@ async function refreshHosts() {
   }
 }
 
+function isTmuxMissing(error: unknown) {
+  return (
+    (error instanceof ApiError && error.body.code === "tmux_missing") ||
+    (error instanceof Error &&
+      error.message.toLowerCase().includes("tmux is required"))
+  );
+}
+
+async function showTmuxInstallGuide(
+  host: Host,
+  retry: () => Promise<void>,
+  fallback: () => Promise<void>,
+) {
+  await refreshHosts();
+  tmuxInstallHost.value =
+    hosts.value.find((item) => item.id === host.id) || host;
+  tmuxInstallRetry = retry;
+  tmuxNormalFallback = fallback;
+  tmuxInstallOpen.value = true;
+}
+
+function setTmuxInstallOpen(value: boolean) {
+  tmuxInstallOpen.value = value;
+  if (!value) {
+    tmuxInstallHost.value = undefined;
+    tmuxInstallRetry = undefined;
+    tmuxNormalFallback = undefined;
+  }
+}
+
+async function retryAfterTmuxInstall() {
+  const retry = tmuxInstallRetry;
+  setTmuxInstallOpen(false);
+  await retry?.();
+}
+
+async function fallbackToNormalSession() {
+  const fallback = tmuxNormalFallback;
+  setTmuxInstallOpen(false);
+  await fallback?.();
+}
+
 async function connect(
   host: Host,
   trustFingerprint = "",
@@ -588,6 +635,7 @@ async function connect(
     leafID: string;
     direction: "horizontal" | "vertical";
   },
+  sessionMode?: Host["sessionMode"],
 ) {
   connecting.value = host.id;
   try {
@@ -598,6 +646,7 @@ async function connect(
       passphrase: temporary?.passphrase || "",
       trustFingerprint,
       name: host.name,
+      sessionMode: sessionMode || "",
     };
     const session = await api<TerminalSession>("/api/sessions", {
       method: "POST",
@@ -620,7 +669,7 @@ async function connect(
     ) {
       try {
         await ElMessageBox.confirm(
-          `${e.body.code === "host_key_changed" ? "主机指纹发生变化" : "首次连接需要信任主机指纹"}：\n${e.body.fingerprint}`,
+          `${e.body.code === "host_key_changed" ? "主机指纹发生变化" : "首次连接需要信任主机指纹"}${e.body.hostName ? `\n主机：${e.body.hostName}${e.body.hostAddress ? `（${e.body.hostAddress}）` : ""}` : ""}\n指纹：${e.body.fingerprint}`,
           "确认主机指纹",
           {
             confirmButtonText: "信任并连接",
@@ -628,8 +677,20 @@ async function connect(
             type: "warning",
           },
         );
-        await connect(host, e.body.fingerprint || "", temporary, placement);
+        await connect(
+          host,
+          e.body.fingerprint || "",
+          temporary,
+          placement,
+          sessionMode,
+        );
       } catch {}
+    } else if (isTmuxMissing(e)) {
+      await showTmuxInstallGuide(
+        host,
+        () => connect(host, trustFingerprint, temporary, placement, "tmux"),
+        () => connect(host, trustFingerprint, temporary, placement, "normal"),
+      );
     } else if (e instanceof Error && e.message.includes("credential required"))
       await promptTemporary(host, placement);
     else ElMessage.error(e instanceof Error ? e.message : "连接失败");
@@ -788,7 +849,7 @@ async function terminateSession(session: TerminalSession) {
     ) {
       try {
         const { value } = await ElMessageBox.prompt(
-          "请输入创建该 tmux 会话时使用的 SSH 密码。",
+          "请输入创建该远程会话时使用的 SSH 密码。",
           "认证后终止",
           {
             confirmButtonText: "终止并关闭",
@@ -829,7 +890,7 @@ async function terminatePane(leafID: string) {
   }
   try {
     await ElMessageBox.confirm(
-      `终止将结束 ${session.name} 的远程 tmux 会话及其中任务。`,
+      `终止将结束 ${session.name} 的${session.sessionMode === "normal" ? "普通 SSH 会话" : "远程 tmux 会话"}及其中任务。`,
       "关闭分屏",
       {
         confirmButtonText: "终止并关闭",
@@ -939,8 +1000,8 @@ async function closeTab(tabID: string) {
   try {
     const detail =
       running.length === 1
-        ? `${running[0].name} 的远程 tmux 会话及其中任务`
-        : `该标签内 ${running.length} 个远程 tmux 会话及其中任务`;
+        ? `${running[0].name} 的${running[0].sessionMode === "normal" ? "普通 SSH 会话" : "远程 tmux 会话"}及其中任务`
+        : `该标签内 ${running.length} 个远程会话及其中任务`;
     await ElMessageBox.confirm(`终止将结束${detail}。`, "关闭终端标签", {
       confirmButtonText: "全部终止并关闭",
       cancelButtonText: "全部移到后台",
@@ -1170,6 +1231,7 @@ async function testHost(
     const result = await api<{
       latencyMs: number;
       tmuxVersion: string;
+      sessionMode: Host["sessionMode"];
       platform?: Host["platform"];
       distribution?: string;
     }>(
@@ -1190,7 +1252,7 @@ async function testHost(
     if (result.platform) host.platform = result.platform;
     if (result.distribution) host.distribution = result.distribution;
     ElMessage.success(
-      `连接正常 · ${result.latencyMs} ms · ${result.tmuxVersion}`,
+      `连接正常 · ${result.latencyMs} ms · ${result.sessionMode === "normal" ? "普通 SSH" : result.tmuxVersion}`,
     );
   } catch (e) {
     host.lastStatus = "offline";
@@ -1200,7 +1262,7 @@ async function testHost(
     ) {
       try {
         await ElMessageBox.confirm(
-          `${e.body.code === "host_key_changed" ? "主机指纹发生变化" : "首次连接需要信任主机指纹"}：\n${e.body.fingerprint}`,
+          `${e.body.code === "host_key_changed" ? "主机指纹发生变化" : "首次连接需要信任主机指纹"}${e.body.hostName ? `\n主机：${e.body.hostName}${e.body.hostAddress ? `（${e.body.hostAddress}）` : ""}` : ""}\n指纹：${e.body.fingerprint}`,
           "确认主机指纹",
           {
             confirmButtonText: "信任并测试",
@@ -1210,6 +1272,12 @@ async function testHost(
         );
         await testHost(host, e.body.fingerprint || "", temporary);
       } catch {}
+    } else if (isTmuxMissing(e)) {
+      await showTmuxInstallGuide(
+        host,
+        () => testHost(host, trustFingerprint, temporary),
+        () => connect(host, trustFingerprint, temporary, undefined, "normal"),
+      );
     } else if (
       e instanceof Error &&
       e.message.toLowerCase().includes("credential required")
@@ -1337,7 +1405,7 @@ async function renameSession(session: TerminalSession) {
 }
 async function duplicateSession(session: TerminalSession) {
   const host = sessionHost(session);
-  if (host) await connect(host, "", undefined);
+  if (host) await connect(host, "", undefined, undefined, session.sessionMode);
 }
 function toggleWatch(session: TerminalSession) {
   watchedSessionIDs.value = watchedSessionIDs.value.includes(session.id)
@@ -1434,6 +1502,7 @@ function closeWorkspaceOverlays() {
   hostDialog.value = false;
   fileManagerOpen.value = false;
   webProxyOpen.value = false;
+  setTmuxInstallOpen(false);
   contextMenu.open = false;
   splitDialog.open = false;
   mobileSidebar.value = false;
@@ -1458,7 +1527,7 @@ const {
 });
 async function confirmLogout() {
   try {
-    await ElMessageBox.confirm("退出账号不会终止远程 tmux 任务。", "退出登录", {
+    await ElMessageBox.confirm("退出账号不会终止正在运行的远程终端任务。", "退出登录", {
       confirmButtonText: "退出",
       cancelButtonText: "取消",
       type: "warning",
@@ -1958,7 +2027,8 @@ onBeforeUnmount(() => {
           <div class="host-copy">
             <strong>{{ session.name }}</strong
             ><small
-              >{{ session.status
+              >{{ session.status }} ·
+              {{ session.sessionMode === "normal" ? "普通 SSH" : "tmux"
               }}<template v-if="sessionHost(session)">
                 · {{ sessionHost(session)?.name }} ·
                 {{ sessionHost(session)?.address }}</template
@@ -2017,8 +2087,16 @@ onBeforeUnmount(() => {
     <HostDialog
       v-model="hostDialog"
       :host="editingHost"
+      :hosts="hosts"
       :credentials="credentials"
       @saved="hostSaved"
+    />
+    <TmuxInstallDialog
+      :model-value="tmuxInstallOpen"
+      :host="tmuxInstallHost"
+      @update:model-value="setTmuxInstallOpen"
+      @retry="retryAfterTmuxInstall"
+      @fallback="fallbackToNormalSession"
     />
     <SettingsDrawer
       v-if="!locked"

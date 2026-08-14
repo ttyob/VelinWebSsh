@@ -61,6 +61,23 @@ func TestValidTerminalColor(t *testing.T) {
 	}
 }
 
+func TestNormalizeSessionMode(t *testing.T) {
+	for name, test := range map[string]struct {
+		preferred, fallback, expected string
+	}{
+		"default":       {"", "", "tmux"},
+		"host normal":   {"", "normal", "normal"},
+		"override tmux": {"tmux", "normal", "tmux"},
+		"fallback once": {"normal", "tmux", "normal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if actual := normalizeSessionMode(test.preferred, test.fallback); actual != test.expected {
+				t.Fatalf("mode=%q, want %q", actual, test.expected)
+			}
+		})
+	}
+}
+
 func TestPlatformFromName(t *testing.T) {
 	for input, expected := range map[string]string{
 		"Linux\n":       "linux",

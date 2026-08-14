@@ -760,6 +760,32 @@ func normalizeHostGroup(value string) string {
 	}
 	return strings.Join(clean, "/")
 }
+
+func (a *API) validateJumpHost(userID, targetID, jumpHostID string) error {
+	visited := map[string]bool{targetID: true}
+	for depth := 0; jumpHostID != ""; depth++ {
+		if depth >= 8 {
+			return errors.New("跳板机链路不能超过 8 层")
+		}
+		if visited[jumpHostID] {
+			return errors.New("跳板机不能循环引用")
+		}
+		visited[jumpHostID] = true
+		jumpHost, err := a.store.Host(userID, jumpHostID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("所选跳板机不存在或无权访问")
+		}
+		if err != nil {
+			return err
+		}
+		if jumpHost.CredentialID == "" {
+			return fmt.Errorf("跳板机“%s”需要绑定已保存的凭据", jumpHost.Name)
+		}
+		jumpHostID = jumpHost.JumpHostID
+	}
+	return nil
+}
+
 func (a *API) batchHosts(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	var in struct {
@@ -832,6 +858,7 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 	h.Address = strings.TrimSpace(h.Address)
 	h.Username = strings.TrimSpace(h.Username)
 	h.GroupName = normalizeHostGroup(h.GroupName)
+	h.JumpHostID = strings.TrimSpace(h.JumpHostID)
 	if len([]rune(h.GroupName)) > 1024 {
 		writeError(w, 400, "invalid_host_group", "分组路径不能超过 1024 个字符")
 		return
@@ -851,12 +878,19 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 	if h.TerminalType == "" {
 		h.TerminalType = "xterm-256color"
 	}
-	if h.ConnectTimeout < 3 || h.ConnectTimeout > 120 || h.KeepaliveInterval < 0 || h.KeepaliveInterval > 300 || h.MaxRetries < 0 || h.MaxRetries > 20 || (h.TerminalType != "xterm-256color" && h.TerminalType != "xterm" && h.TerminalType != "screen-256color") {
+	if h.SessionMode == "" {
+		h.SessionMode = "tmux"
+	}
+	if h.ConnectTimeout < 3 || h.ConnectTimeout > 120 || h.KeepaliveInterval < 0 || h.KeepaliveInterval > 300 || h.MaxRetries < 0 || h.MaxRetries > 20 || (h.TerminalType != "xterm-256color" && h.TerminalType != "xterm" && h.TerminalType != "screen-256color") || (h.SessionMode != "tmux" && h.SessionMode != "normal") {
 		writeError(w, 400, "invalid_host_options", "连接参数超出允许范围")
 		return
 	}
 	if h.Name == "" || h.Address == "" || h.Username == "" || h.Port < 1 || h.Port > 65535 {
 		writeError(w, 400, "invalid_host", "请完整填写主机名称、地址、端口和用户名")
+		return
+	}
+	if err := a.validateJumpHost(u.ID, h.ID, h.JumpHostID); err != nil {
+		writeError(w, 400, "invalid_jump_host", err.Error())
 		return
 	}
 	createdCredentialID := ""
@@ -930,7 +964,7 @@ func (a *API) testHost(w http.ResponseWriter, r *http.Request) {
 		_ = a.store.UpdateHostConnection(u.ID, host.ID, "offline", 0)
 		var hk *terminal.HostKeyError
 		if errors.As(err, &hk) {
-			writeJSONStatus(w, 409, map[string]any{"code": hk.Kind, "message": "请确认远程主机指纹", "fingerprint": hk.Fingerprint})
+			writeJSONStatus(w, 409, hostKeyErrorBody(hk))
 			return
 		}
 		writeError(w, 502, connectionErrorCode(err), err.Error())
@@ -955,6 +989,12 @@ func connectionErrorCode(err error) string {
 		return "connection_refused"
 	default:
 		return "connection_failed"
+	}
+}
+func hostKeyErrorBody(err *terminal.HostKeyError) map[string]any {
+	return map[string]any{
+		"code": err.Kind, "message": "请确认远程主机指纹", "fingerprint": err.Fingerprint,
+		"hostName": err.HostName, "hostAddress": err.Address,
 	}
 }
 func (a *API) deleteHost(w http.ResponseWriter, r *http.Request) {
@@ -1031,7 +1071,7 @@ func (a *API) deleteCredential(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
-type sessionInput struct{ HostID, CredentialID, Secret, Passphrase, TrustFingerprint, Name string }
+type sessionInput struct{ HostID, CredentialID, Secret, Passphrase, TrustFingerprint, Name, SessionMode string }
 
 func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
@@ -1055,14 +1095,18 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	meta, err := a.terminals.Create(r.Context(), u.ID, terminal.CreateRequest{Host: host, Credential: cred, Secret: in.Secret, Passphrase: in.Passphrase, TrustFingerprint: in.TrustFingerprint, Name: in.Name})
+	if in.SessionMode != "" && in.SessionMode != "tmux" && in.SessionMode != "normal" {
+		writeError(w, 400, "invalid_session_mode", "不支持的终端会话模式")
+		return
+	}
+	meta, err := a.terminals.Create(r.Context(), u.ID, terminal.CreateRequest{Host: host, Credential: cred, Secret: in.Secret, Passphrase: in.Passphrase, TrustFingerprint: in.TrustFingerprint, Name: in.Name, SessionMode: in.SessionMode})
 	if err != nil {
 		var hk *terminal.HostKeyError
 		if errors.As(err, &hk) {
-			writeJSONStatus(w, 409, map[string]any{"code": hk.Kind, "message": "请确认远程主机指纹", "fingerprint": hk.Fingerprint})
+			writeJSONStatus(w, 409, hostKeyErrorBody(hk))
 			return
 		}
-		writeError(w, 502, "connection_failed", err.Error())
+		writeError(w, 502, connectionErrorCode(err), err.Error())
 		return
 	}
 	a.store.Audit(u.ID, "session_created", "terminal", meta.ID, ipOf(r), map[string]string{"host_id": host.ID})
@@ -1117,9 +1161,13 @@ func (a *API) restoreSession(w http.ResponseWriter, r *http.Request) {
 	}
 	s, err := a.terminals.Restore(r.Context(), u.ID, chi.URLParam(r, "id"), in.Secret, in.Passphrase, in.TrustFingerprint)
 	if err != nil {
+		if errors.Is(err, terminal.ErrNormalSessionEnded) {
+			writeError(w, http.StatusGone, "normal_session_ended", "普通 SSH 会话已结束，无法在服务重启后恢复")
+			return
+		}
 		var hk *terminal.HostKeyError
 		if errors.As(err, &hk) {
-			writeJSONStatus(w, 409, map[string]any{"code": hk.Kind, "message": "请确认远程主机指纹", "fingerprint": hk.Fingerprint})
+			writeJSONStatus(w, 409, hostKeyErrorBody(hk))
 			return
 		}
 		writeError(w, 502, "restore_failed", err.Error())
@@ -1299,7 +1347,7 @@ func (a *API) importOpenSSH(w http.ResponseWriter, r *http.Request) {
 			warnings = append(warnings, "IdentityFile 仅记录路径提示，浏览器服务无法读取客户端本地私钥")
 		}
 		if item.ProxyJump != "" {
-			warnings = append(warnings, "ProxyJump 已识别，但当前版本不会静默启用跳板")
+			warnings = append(warnings, "ProxyJump 已识别，请导入后在主机编辑中选择对应跳板机并绑定凭据")
 		}
 		preview = append(preview, map[string]any{"name": item.Alias, "address": item.HostName, "port": item.Port, "username": item.User, "identityFile": item.IdentityFile, "proxyJump": item.ProxyJump, "warnings": warnings})
 		if !in.Commit {

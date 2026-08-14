@@ -334,7 +334,7 @@ async function revoke(id: string) {
 async function revokeAll() {
   try {
     await ElMessageBox.confirm(
-      "这会撤销当前账户在所有浏览器中的登录，远程 tmux 任务不会终止。",
+      "这会撤销当前账户在所有浏览器中的登录，正在运行的远程终端任务不会终止。",
       "退出全部设备",
       {
         confirmButtonText: "全部退出",

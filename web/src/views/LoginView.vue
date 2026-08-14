@@ -95,7 +95,7 @@ async function submit() {
           登录
         </el-button>
       </form>
-      <p class="login-foot">SSH 会话由远程 tmux 安全托管</p>
+      <p class="login-foot">支持普通 SSH 与远程 tmux 持久会话</p>
     </section>
   </main>
 </template>

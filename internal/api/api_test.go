@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -94,6 +95,40 @@ func TestNormalizeHostGroup(t *testing.T) {
 		if actual := normalizeHostGroup(input); actual != expected {
 			t.Fatalf("normalizeHostGroup(%q)=%q, want %q", input, actual, expected)
 		}
+	}
+}
+
+func TestValidateJumpHost(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "jump-host.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.CreateUser("u1", "user", "hash", "user"); err != nil {
+		t.Fatal(err)
+	}
+	credential := store.Credential{ID: "credential", UserID: "u1", Name: "jump", Kind: "password", Secret: "encrypted"}
+	if err = s.SaveCredential(credential); err != nil {
+		t.Fatal(err)
+	}
+	jump := store.Host{ID: "jump", UserID: "u1", Name: "bastion", Address: "192.0.2.1", Port: 22, Username: "root", CredentialID: credential.ID}
+	target := store.Host{ID: "target", UserID: "u1", Name: "private", Address: "10.0.0.2", Port: 22, Username: "root"}
+	if err = s.SaveHost(jump); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SaveHost(target); err != nil {
+		t.Fatal(err)
+	}
+	a := &API{store: s}
+	if err = a.validateJumpHost("u1", target.ID, jump.ID); err != nil {
+		t.Fatalf("valid jump host rejected: %v", err)
+	}
+	jump.JumpHostID = target.ID
+	if err = s.SaveHost(jump); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.validateJumpHost("u1", target.ID, jump.ID); err == nil || !strings.Contains(err.Error(), "循环") {
+		t.Fatalf("jump host cycle error=%v", err)
 	}
 }
 
@@ -208,5 +243,12 @@ func TestUpdateUserRejectsSelfDemotion(t *testing.T) {
 	a.updateUser(recorder, req.WithContext(ctx))
 	if recorder.Code != 400 || !strings.Contains(recorder.Body.String(), "cannot_demote_self") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestConnectionErrorCodeDetectsMissingTmux(t *testing.T) {
+	err := fmt.Errorf("tmux is required on the remote host: exit status 1")
+	if code := connectionErrorCode(err); code != "tmux_missing" {
+		t.Fatalf("code=%q", code)
 	}
 }

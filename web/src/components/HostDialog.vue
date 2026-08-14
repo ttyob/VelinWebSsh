@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
 import { api, json } from "../api";
 import type { Credential, Host } from "../types";
@@ -7,6 +7,7 @@ import type { Credential, Host } from "../types";
 const props = defineProps<{
   modelValue: boolean;
   host?: Host;
+  hosts: Host[];
   credentials: Credential[];
 }>();
 const emit = defineEmits<{
@@ -28,8 +29,13 @@ const defaults = (): Host => ({
   keepaliveInterval: 30,
   maxRetries: 5,
   terminalType: "xterm-256color",
+  sessionMode: "tmux",
+  jumpHostID: "",
 });
 const form = reactive<Host>(defaults());
+const availableJumpHosts = computed(() =>
+  props.hosts.filter((host) => host.id !== form.id),
+);
 const advancedOpen = ref<string[]>([]),
   authMode = ref<"password" | "credential" | "prompt">("password"),
   password = ref("");
@@ -139,6 +145,15 @@ async function save() {
                 :label="credential.name"
                 :value="credential.id" /></el-select
           ></el-form-item>
+          <el-form-item label="终端会话" class="span-2">
+            <el-segmented
+              v-model="form.sessionMode"
+              :options="[
+                { label: 'tmux 持久模式', value: 'tmux' },
+                { label: '普通 SSH', value: 'normal' },
+              ]"
+            />
+          </el-form-item>
           <el-form-item label="标签" class="span-2"
             ><el-input v-model="form.tags" placeholder="逗号分隔"
           /></el-form-item>
@@ -150,6 +165,23 @@ async function save() {
       <el-collapse v-model="advancedOpen" class="host-advanced">
         <el-collapse-item title="高级设置" name="advanced">
           <div class="form-grid">
+            <el-form-item label="跳板机" class="span-2">
+              <el-select
+                v-model="form.jumpHostID"
+                filterable
+                placeholder="直连（不使用跳板机）"
+                clearable
+              >
+                <el-option label="直连（不使用跳板机）" value="" />
+                <el-option
+                  v-for="jumpHost in availableJumpHosts"
+                  :key="jumpHost.id"
+                  :value="jumpHost.id"
+                  :disabled="!jumpHost.credentialID"
+                  :label="`${jumpHost.name} · ${jumpHost.username}@${jumpHost.address}:${jumpHost.port}${jumpHost.credentialID ? '' : '（需先绑定凭据）'}`"
+                />
+              </el-select>
+            </el-form-item>
             <el-form-item label="启动目录" class="span-2"
               ><el-input
                 v-model="form.initialDirectory"

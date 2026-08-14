@@ -184,7 +184,15 @@ async function ensureAttached() {
     connectSocket();
   } catch (error) {
     const message = error instanceof Error ? error.message : "恢复失败";
-    if (message.toLowerCase().includes("credential required")) {
+    if (
+      error instanceof ApiError &&
+      error.body.code === "normal_session_ended"
+    ) {
+      status.value = "ended";
+      statusMessage.value = message;
+      emit("status", props.session.id, status.value, statusMessage.value);
+      return;
+    } else if (message.toLowerCase().includes("credential required")) {
       status.value = "auth_required";
       statusMessage.value = "需要重新输入 SSH 凭据";
       try {
@@ -209,7 +217,7 @@ async function ensureAttached() {
     ) {
       try {
         await ElMessageBox.confirm(
-          `远程主机指纹：\n${error.body.fingerprint}`,
+          `远程主机${error.body.hostName ? `“${error.body.hostName}”` : ""}${error.body.hostAddress ? `（${error.body.hostAddress}）` : ""}指纹：\n${error.body.fingerprint}`,
           "确认主机指纹",
           {
             confirmButtonText: "信任并恢复",

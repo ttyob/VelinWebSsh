@@ -40,6 +40,8 @@ type Host struct {
 	KeepaliveInterval int        `json:"keepaliveInterval"`
 	MaxRetries        int        `json:"maxRetries"`
 	TerminalType      string     `json:"terminalType"`
+	SessionMode       string     `json:"sessionMode"`
+	JumpHostID        string     `json:"jumpHostID"`
 	Platform          string     `json:"platform"`
 	Distribution      string     `json:"distribution"`
 	LastStatus        string     `json:"lastStatus"`
@@ -64,6 +66,7 @@ type TerminalSession struct {
 	CredentialID string    `json:"credentialID"`
 	Name         string    `json:"name"`
 	RemoteUser   string    `json:"remoteUser"`
+	SessionMode  string    `json:"sessionMode"`
 	TmuxSocket   string    `json:"tmuxSocket"`
 	TmuxName     string    `json:"tmuxName"`
 	OwnerMarker  string    `json:"-"`
@@ -142,10 +145,10 @@ CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UN
 CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_auth_token ON auth_sessions(token_hash);
 CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, secret_enc TEXT NOT NULL, passphrase_enc TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', session_mode TEXT NOT NULL DEFAULT 'tmux', jump_host_id TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_hosts_user ON hosts(user_id, name);
 CREATE TABLE IF NOT EXISTS known_host_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, fingerprint TEXT NOT NULL, public_key TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,address,port));
-CREATE TABLE IF NOT EXISTS terminal_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, credential_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, remote_user TEXT NOT NULL, tmux_socket TEXT NOT NULL, tmux_name TEXT NOT NULL, owner_marker TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS terminal_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, credential_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, remote_user TEXT NOT NULL, session_mode TEXT NOT NULL DEFAULT 'tmux', tmux_socket TEXT NOT NULL, tmux_name TEXT NOT NULL, owner_marker TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_terminal_user ON terminal_sessions(user_id, updated_at DESC);
 CREATE TABLE IF NOT EXISTS workspaces (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, layout_json TEXT NOT NULL DEFAULT '{}', version INTEGER NOT NULL DEFAULT 1, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, preferences_json TEXT NOT NULL DEFAULT '{}', updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -170,6 +173,8 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 		{"initial_directory", "TEXT NOT NULL DEFAULT ''"}, {"connect_timeout", "INTEGER NOT NULL DEFAULT 12"},
 		{"keepalive_interval", "INTEGER NOT NULL DEFAULT 30"}, {"max_retries", "INTEGER NOT NULL DEFAULT 5"},
 		{"terminal_type", "TEXT NOT NULL DEFAULT 'xterm-256color'"}, {"last_status", "TEXT NOT NULL DEFAULT ''"},
+		{"session_mode", "TEXT NOT NULL DEFAULT 'tmux'"},
+		{"jump_host_id", "TEXT NOT NULL DEFAULT ''"},
 		{"platform", "TEXT NOT NULL DEFAULT ''"},
 		{"distribution", "TEXT NOT NULL DEFAULT ''"},
 		{"last_latency_ms", "INTEGER NOT NULL DEFAULT 0"}, {"last_connected_at", "DATETIME"},
@@ -203,7 +208,10 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 	if err = s.ensureColumn("web_services", "listen_port", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
-	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10); PRAGMA user_version=10;`)
+	if err = s.ensureColumn("terminal_sessions", "session_mode", "TEXT NOT NULL DEFAULT 'tmux'"); err != nil {
+		return err
+	}
+	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12); PRAGMA user_version=12;`)
 	return err
 }
 
@@ -412,12 +420,12 @@ func (s *Store) SaveSystemSetting(key string, value any) error {
 	return err
 }
 
-const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
+const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id,platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
 
 func scanHost(row interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var connected sql.NullTime
-	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
+	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.SessionMode, &h.JumpHostID, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
 	if connected.Valid {
 		h.LastConnectedAt = &connected.Time
 	}
@@ -443,7 +451,10 @@ func (s *Store) Host(userID, id string) (Host, error) {
 	return scanHost(s.DB.QueryRow(`SELECT `+hostCols+` FROM hosts WHERE user_id=? AND id=?`, userID, id))
 }
 func (s *Store) SaveHost(h Host) error {
-	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,group_name=excluded.group_name,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.GroupName, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType)
+	if h.SessionMode == "" {
+		h.SessionMode = "tmux"
+	}
+	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,group_name=excluded.group_name,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,session_mode=excluded.session_mode,jump_host_id=excluded.jump_host_id,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.GroupName, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType, h.SessionMode, h.JumpHostID)
 	return err
 }
 func (s *Store) UpdateHostConnection(userID, id, status string, latency int) error {
@@ -477,6 +488,12 @@ func (s *Store) DeleteHost(userID, id string) error {
 	}
 	if n > 0 {
 		return fmt.Errorf("host has %d active sessions", n)
+	}
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM hosts WHERE user_id=? AND jump_host_id=?`, userID, id).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("host is used as a jump host by %d hosts", n)
 	}
 	_, err := s.DB.Exec(`DELETE FROM hosts WHERE user_id=? AND id=?`, userID, id)
 	return err
@@ -512,6 +529,24 @@ func (s *Store) BatchHosts(userID string, ids []string, action, groupName, tags 
 			}
 			if count > 0 {
 				return fmt.Errorf("host %s has %d active sessions", id, count)
+			}
+			rows, queryErr := tx.Query(`SELECT id FROM hosts WHERE user_id=? AND jump_host_id=?`, userID, id)
+			if queryErr != nil {
+				return queryErr
+			}
+			for rows.Next() {
+				var dependentID string
+				if err = rows.Scan(&dependentID); err != nil {
+					rows.Close()
+					return err
+				}
+				if _, deleting := seen[dependentID]; !deleting {
+					rows.Close()
+					return fmt.Errorf("host %s is used as a jump host", id)
+				}
+			}
+			if err = rows.Close(); err != nil {
+				return err
 			}
 		}
 	}
@@ -584,16 +619,19 @@ func (s *Store) DeleteCredential(userID, id string) error {
 }
 
 func (s *Store) SaveTerminal(t TerminalSession) error {
-	_, err := s.DB.Exec(`INSERT INTO terminal_sessions(id,user_id,host_id,credential_id,name,remote_user,tmux_socket,tmux_name,owner_marker,status,last_error) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,last_error=excluded.last_error,updated_at=CURRENT_TIMESTAMP`, t.ID, t.UserID, t.HostID, t.CredentialID, t.Name, t.RemoteUser, t.TmuxSocket, t.TmuxName, t.OwnerMarker, t.Status, t.LastError)
+	if t.SessionMode == "" {
+		t.SessionMode = "tmux"
+	}
+	_, err := s.DB.Exec(`INSERT INTO terminal_sessions(id,user_id,host_id,credential_id,name,remote_user,session_mode,tmux_socket,tmux_name,owner_marker,status,last_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,last_error=excluded.last_error,updated_at=CURRENT_TIMESTAMP`, t.ID, t.UserID, t.HostID, t.CredentialID, t.Name, t.RemoteUser, t.SessionMode, t.TmuxSocket, t.TmuxName, t.OwnerMarker, t.Status, t.LastError)
 	return err
 }
 func scanTerminal(row interface{ Scan(...any) error }) (TerminalSession, error) {
 	var t TerminalSession
-	err := row.Scan(&t.ID, &t.UserID, &t.HostID, &t.CredentialID, &t.Name, &t.RemoteUser, &t.TmuxSocket, &t.TmuxName, &t.OwnerMarker, &t.Status, &t.LastError, &t.CreatedAt, &t.UpdatedAt)
+	err := row.Scan(&t.ID, &t.UserID, &t.HostID, &t.CredentialID, &t.Name, &t.RemoteUser, &t.SessionMode, &t.TmuxSocket, &t.TmuxName, &t.OwnerMarker, &t.Status, &t.LastError, &t.CreatedAt, &t.UpdatedAt)
 	return t, err
 }
 
-const terminalCols = `id,user_id,host_id,credential_id,name,remote_user,tmux_socket,tmux_name,owner_marker,status,last_error,created_at,updated_at`
+const terminalCols = `id,user_id,host_id,credential_id,name,remote_user,session_mode,tmux_socket,tmux_name,owner_marker,status,last_error,created_at,updated_at`
 
 func (s *Store) Terminal(userID, id string) (TerminalSession, error) {
 	return scanTerminal(s.DB.QueryRow(`SELECT `+terminalCols+` FROM terminal_sessions WHERE user_id=? AND id=?`, userID, id))
@@ -616,6 +654,10 @@ func (s *Store) Terminals(userID string) ([]TerminalSession, error) {
 }
 func (s *Store) UpdateTerminalStatus(userID, id, status, msg string) error {
 	_, err := s.DB.Exec(`UPDATE terminal_sessions SET status=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, status, msg, userID, id)
+	return err
+}
+func (s *Store) EndStaleNormalSessions(message string) error {
+	_, err := s.DB.Exec(`UPDATE terminal_sessions SET status='ended',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE session_mode='normal' AND status<>'ended'`, message)
 	return err
 }
 func (s *Store) RenameTerminal(userID, id, name string) error {
@@ -873,7 +915,7 @@ func VerifyBackup(path string) error {
 	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version < 1 || version > 10 {
+	if version < 1 || version > 12 {
 		return fmt.Errorf("unsupported database version %d", version)
 	}
 	requiredTables := []string{"users", "hosts", "workspaces", "terminal_sessions"}

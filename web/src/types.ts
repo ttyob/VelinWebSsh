@@ -84,6 +84,8 @@ export interface Host {
   keepaliveInterval: number;
   maxRetries: number;
   terminalType: string;
+  sessionMode: "tmux" | "normal";
+  jumpHostID: string;
   platform?: "linux" | "windows" | "macos" | "bsd" | "unix" | "";
   distribution?: string;
   lastStatus?: string;
@@ -115,6 +117,7 @@ export interface TerminalSession {
   credentialID: string;
   name: string;
   remoteUser: string;
+  sessionMode: "tmux" | "normal";
   tmuxSocket: string;
   tmuxName: string;
   ownerMarker: string;
@@ -176,4 +179,6 @@ export interface ApiErrorBody {
   code: string;
   message: string;
   fingerprint?: string;
+  hostName?: string;
+  hostAddress?: string;
 }
