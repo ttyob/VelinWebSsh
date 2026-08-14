@@ -3,12 +3,15 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -26,6 +29,9 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return Config{}, fmt.Errorf("load .env: %w", err)
+	}
 	dataDir := env("VELIN_DATA_DIR", "data")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return Config{}, fmt.Errorf("create data directory: %w", err)
