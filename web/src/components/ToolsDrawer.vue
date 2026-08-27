@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import {
-  Bell,
   Download,
   Network,
   Play,
@@ -15,7 +14,6 @@ import {
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api, json } from "../api";
 import type {
-  AppNotification,
   Host,
   PortForward,
   Snippet,
@@ -31,10 +29,8 @@ const emit = defineEmits<{
   insert: [string];
   execute: [string];
   batchExecute: [string, string[]];
-  notificationOpen: [string];
 }>();
 const snippets = ref<Snippet[]>([]),
-  notifications = ref<AppNotification[]>([]),
   editing = ref<Snippet>(),
   snippetDialog = ref(false),
   importDialog = ref(false),
@@ -54,9 +50,8 @@ const blank = (): Snippet => ({
   description: "",
 });
 async function load() {
-  [snippets.value, notifications.value, forwards.value] = await Promise.all([
+  [snippets.value, forwards.value] = await Promise.all([
     api<Snippet[]>("/api/snippets"),
-    api<AppNotification[]>("/api/notifications"),
     api<PortForward[]>("/api/forwards"),
   ]);
 }
@@ -193,14 +188,6 @@ async function commitImport() {
   ElMessage.success(`已导入 ${result.created} 台主机`);
   importDialog.value = false;
   location.reload();
-}
-async function readAll() {
-  await api("/api/notifications/read", { method: "POST" });
-  notifications.value.forEach((item) => (item.read = true));
-}
-function openNotification(item: AppNotification) {
-  item.read = true;
-  emit("notificationOpen", item.sessionID);
 }
 const blankForward = (): PortForward => ({
   id: "",
@@ -375,29 +362,6 @@ async function deleteForward(value: PortForward) {
           <el-button :icon="Upload" @click="importDialog = true"
             >导入</el-button
           >
-        </div></el-tab-pane
-      >
-      <el-tab-pane label="通知" name="notifications"
-        ><div class="tool-heading">
-          <span>站内通知</span
-          ><el-button text @click="readAll">全部已读</el-button>
-        </div>
-        <div class="list-stack">
-          <div
-            v-for="item in notifications"
-            :key="item.id"
-            class="data-row"
-            :class="{ unread: !item.read }"
-            @click="openNotification(item)"
-          >
-            <div>
-              <strong><Bell :size="13" /> {{ item.title }}</strong
-              ><small
-                >{{ item.kind }} ·
-                {{ new Date(item.createdAt).toLocaleString() }}</small
-              >
-            </div>
-          </div>
         </div></el-tab-pane
       >
     </el-tabs>

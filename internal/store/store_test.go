@@ -39,6 +39,19 @@ func TestHostOwnership(t *testing.T) {
 	if _, err := s.Host("u2", "h1"); err == nil {
 		t.Fatal("other user accessed host")
 	}
+	if err := s.ReorderHosts("u1", []HostOrder{{ID: "h1", GroupName: "production", SortOrder: 3}}); err != nil {
+		t.Fatalf("reorder host: %v", err)
+	}
+	updated, err := s.Host("u1", "h1")
+	if err != nil || updated.GroupName != "production" || updated.SortOrder != 3 {
+		t.Fatalf("reordered host=%+v err=%v", updated, err)
+	}
+	if err := s.ReorderHosts("u1", []HostOrder{{ID: "h1", GroupName: "production", SortOrder: 4}}); err != nil {
+		t.Fatalf("owned reorder failed: %v", err)
+	}
+	if err := s.ReorderHosts("u2", []HostOrder{{ID: "h1", GroupName: "other", SortOrder: 1}}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("cross-user reorder error=%v", err)
+	}
 }
 
 func TestBatchHostsIsAtomicAndOwned(t *testing.T) {
@@ -196,6 +209,38 @@ func TestBackup(t *testing.T) {
 	}
 }
 
+func TestRestoreKeepsStoreConnectionAndClearsSessions(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser("u1", "first", "hash", "user"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "backup.db")
+	if err := s.Backup(context.Background(), path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUser("u2", "second", "hash", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAuthSession("session", "u2", "token-hash", "test", "127.0.0.1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Restore(context.Background(), path); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.UserCount(); err != nil || n != 1 {
+		t.Fatalf("restored user count=%d err=%v", n, err)
+	}
+	if _, _, err := s.UserByUsername("first"); err != nil {
+		t.Fatalf("restored user unavailable: %v", err)
+	}
+	if _, _, err := s.UserByUsername("second"); err == nil {
+		t.Fatal("user created after backup survived restore")
+	}
+	if _, err := s.UserByToken("token-hash"); err == nil {
+		t.Fatal("auth session survived restore")
+	}
+}
+
 func TestVerifyBackupRejectsInvalidFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "invalid.db")
 	if err := os.WriteFile(path, []byte("not a sqlite database"), 0o600); err != nil {
@@ -263,7 +308,7 @@ func TestHostMigrationAndConnectionMetadata(t *testing.T) {
 		t.Fatalf("session mode=%q err=%v", host.SessionMode, err)
 	}
 	var version int
-	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 12 {
+	if err = s.DB.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != 13 {
 		t.Fatalf("user_version=%d err=%v", version, err)
 	}
 }

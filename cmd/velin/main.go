@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"velin-webssh/internal/agent"
 	"velin-webssh/internal/api"
 	"velin-webssh/internal/config"
 	"velin-webssh/internal/forward"
@@ -55,9 +57,15 @@ func main() {
 		}
 		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "change this password after login")
 	}
-	manager := terminal.NewManager(s, vault, cfg.DeploymentID)
+	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary)
 	forwardManager := forward.NewManager(s, manager)
-	handler := api.New(cfg, s, vault, manager, forwardManager).Router()
+	agentManager := agent.NewManager(
+		manager,
+		agent.AIConfig{BaseURL: cfg.AIBaseURL, APIKey: cfg.AIAPIKey, Model: cfg.AIModel},
+		agent.CrushConfig{Binary: cfg.CrushBinary, DataDir: cfg.CrushDataDir},
+	)
+	defer agentManager.Close()
+	handler := api.New(cfg, s, vault, manager, forwardManager, agentManager).Router()
 	server := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp4", cfg.Addr)
 	if err != nil {

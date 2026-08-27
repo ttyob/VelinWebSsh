@@ -47,6 +47,8 @@ watch(
       authMode.value = props.host
         ? props.host.credentialID
           ? "credential"
+          : props.host.hasPassword
+            ? "password"
           : "prompt"
         : "password";
       password.value = "";
@@ -56,7 +58,11 @@ watch(
 );
 async function save() {
   try {
-    if (authMode.value === "password" && !password.value)
+    if (
+      authMode.value === "password" &&
+      !password.value &&
+      !form.hasPassword
+    )
       return ElMessage.warning("请输入 SSH 密码");
     if (authMode.value === "credential" && !form.credentialID)
       return ElMessage.warning("请选择凭据");
@@ -68,6 +74,7 @@ async function save() {
         ...form,
         credentialID: authMode.value === "credential" ? form.credentialID : "",
         password: authMode.value === "password" ? password.value : "",
+        authMode: authMode.value,
       }),
     });
     emit("saved", saved);
@@ -131,7 +138,7 @@ async function save() {
               type="password"
               show-password
               autocomplete="new-password"
-              placeholder="保存后将加密存储"
+              placeholder="保存后独立加密存储，留空保留当前密码"
             />
           </el-form-item>
           <el-form-item
@@ -177,8 +184,8 @@ async function save() {
                   v-for="jumpHost in availableJumpHosts"
                   :key="jumpHost.id"
                   :value="jumpHost.id"
-                  :disabled="!jumpHost.credentialID"
-                  :label="`${jumpHost.name} · ${jumpHost.username}@${jumpHost.address}:${jumpHost.port}${jumpHost.credentialID ? '' : '（需先绑定凭据）'}`"
+                  :disabled="!jumpHost.credentialID && !jumpHost.hasPassword"
+                  :label="`${jumpHost.name} · ${jumpHost.username}@${jumpHost.address}:${jumpHost.port}${jumpHost.credentialID || jumpHost.hasPassword ? '' : '（需先保存密码或凭据）'}`"
                 />
               </el-select>
             </el-form-item>

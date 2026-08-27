@@ -16,7 +16,38 @@ import (
 	"github.com/pquerna/otp/totp"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
+	"velin-webssh/internal/terminal"
 )
+
+func TestForwardTerminalEventDuringReplay(t *testing.T) {
+	var written []terminal.Event
+	writeJSON := func(value any) error {
+		written = append(written, value.(terminal.Event))
+		return nil
+	}
+	var pending []terminal.Event
+	output := terminal.Event{Type: "output", Data: "encoded", Offset: 42}
+	if err := forwardTerminalEventDuringReplay(writeJSON, output, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(written) != 1 || written[0].Type != "replay_live" || written[0].Data != output.Data || written[0].Offset != output.Offset {
+		t.Fatalf("preview event=%+v", written)
+	}
+	if len(pending) != 1 || pending[0] != output {
+		t.Fatalf("pending output=%+v", pending)
+	}
+
+	controller := terminal.Event{Type: "controller", Controller: "client"}
+	if err := forwardTerminalEventDuringReplay(writeJSON, controller, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(written) != 2 || written[1] != controller {
+		t.Fatalf("control event=%+v", written)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("control event was delayed: %+v", pending)
+	}
+}
 
 func TestParseOpenSSH(t *testing.T) {
 	config := `
@@ -123,6 +154,14 @@ func TestValidateJumpHost(t *testing.T) {
 	if err = a.validateJumpHost("u1", target.ID, jump.ID); err != nil {
 		t.Fatalf("valid jump host rejected: %v", err)
 	}
+	jump.CredentialID = ""
+	jump.PasswordEnc = "encrypted-password"
+	if err = s.SaveHost(jump); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.validateJumpHost("u1", target.ID, jump.ID); err != nil {
+		t.Fatalf("host password jump host rejected: %v", err)
+	}
 	jump.JumpHostID = target.ID
 	if err = s.SaveHost(jump); err != nil {
 		t.Fatal(err)
@@ -171,6 +210,8 @@ func TestCSRFProtectionRejectsExplicitCrossSiteRequest(t *testing.T) {
 	}
 
 	request = httptest.NewRequest(http.MethodPut, "http://velin.example/api/preferences", strings.NewReader(`{}`))
+	request.AddCookie(&http.Cookie{Name: csrfCookieName, Value: "csrf-test-token-123456789012345678901234567890"})
+	request.Header.Set("X-CSRF-Token", "csrf-test-token-123456789012345678901234567890")
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusNoContent {

@@ -13,9 +13,14 @@ import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   Archive,
+  BellRing,
+  Box,
+  Bot,
   BrushCleaning,
   ChevronRight,
   ClipboardPaste,
+  CircleCheck,
+  CircleStop,
   Columns2,
   Copy,
   FolderOpen,
@@ -34,6 +39,7 @@ import {
   TerminalSquare,
   TextSelect,
   Trash2,
+  TriangleAlert,
   X,
 } from "@lucide/vue";
 import { ApiError, api, json } from "../api";
@@ -50,14 +56,24 @@ import type {
 import SplitPaneNode from "../components/SplitPaneNode.vue";
 import HostDialog from "../components/HostDialog.vue";
 import HostResourceList from "../components/HostResourceList.vue";
+import type { HostDropTarget } from "../components/HostGroupNode.vue";
 import TmuxInstallDialog from "../components/TmuxInstallDialog.vue";
 import WebServiceList from "../components/WebServiceList.vue";
 import { useWorkspaceLock } from "../composables/useWorkspaceLock";
 import {
   applyAccent,
   applyInterfaceTheme,
+  findAccent,
   findInterfaceTheme,
+  findTerminalTheme,
 } from "../themePresets";
+import {
+  resolveTabAttention,
+  type TabAttention,
+  type TabAttentionKind,
+  type TerminalAttentionEvent,
+  type TerminalAttentionNotice,
+} from "../terminalAttention";
 
 const SettingsDrawer = defineAsyncComponent(
   () => import("../components/SettingsDrawer.vue"),
@@ -67,6 +83,12 @@ const FileManagerDialog = defineAsyncComponent(
 );
 const WebProxyDialog = defineAsyncComponent(
   () => import("../components/WebProxyDialog.vue"),
+);
+const AgentDialog = defineAsyncComponent(
+  () => import("../components/AgentDialog.vue"),
+);
+const DockerDialog = defineAsyncComponent(
+  () => import("../components/DockerDialog.vue"),
 );
 
 const router = useRouter(),
@@ -100,6 +122,12 @@ const hostDialog = ref(false),
   fileManagerPath = ref("."),
   webProxyOpen = ref(false),
   webProxyHost = ref<Host>(),
+  agentOpen = ref(false),
+  agentHost = ref<Host>(),
+  agentTabID = ref(""),
+  dockerOpen = ref(false),
+  dockerHost = ref<Host>(),
+  dockerSessionID = ref(""),
   tmuxInstallOpen = ref(false),
   tmuxInstallHost = ref<Host>(),
   editingWebService = ref<WebService>(),
@@ -107,6 +135,9 @@ const hostDialog = ref(false),
 let tmuxInstallRetry: (() => Promise<void>) | undefined;
 let tmuxNormalFallback: (() => Promise<void>) | undefined;
 const sessionDirectories = reactive<Record<string, string>>({});
+const conversationSessions = reactive<Record<string, boolean>>({});
+const sessionAttention = reactive<Record<string, TerminalAttentionNotice>>({});
+const pendingTerminalCommands = reactive<Record<string, string>>({});
 const connecting = ref<string>(),
   testing = ref<string>(),
   openingWebService = ref<string>(),
@@ -114,11 +145,11 @@ const connecting = ref<string>(),
   saveTimer = ref<number>();
 const paneTreeRefs = new Map<string, any>();
 let savedInterfaceTheme = "dark";
-let savedAccentColor = "#72c58f";
+let savedAccentColor = "#5b8cff";
 try {
   savedInterfaceTheme = localStorage.getItem("velin-interface-theme") || "dark";
   savedAccentColor =
-    localStorage.getItem("velin-accent-color") || savedAccentColor;
+    findAccent(localStorage.getItem("velin-accent-color") || savedAccentColor).value;
 } catch {}
 const preferences = reactive<Preferences>({
   theme: findInterfaceTheme(savedInterfaceTheme).id,
@@ -128,15 +159,14 @@ const preferences = reactive<Preferences>({
   lineHeight: 1.25,
   fontWeight: 400,
   letterSpacing: 0,
-  foreground: "#d8ded9",
-  background: "#111416",
-  cursorColor: "#8fd6a7",
+  foreground: "#d8deea",
+  background: "#111318",
+  cursorColor: "#8eafff",
   cursorStyle: "block",
   cursorBlink: true,
   pasteGuard: true,
   visualBell: true,
   soundBell: false,
-  browserNotifications: false,
   lockEnabled: false,
   autoLockMinutes: 15,
   lockOnShortcut: true,
@@ -153,11 +183,21 @@ const layout = reactive<WorkspaceLayout>({
   focused: {},
   maximized: {},
 });
-const watchedSessionIDs = ref<string[]>([]);
 const pinnedSessionIDs = ref<string[]>([]);
 const mobileCtrl = ref(false),
   mobileAlt = ref(false);
 const contextMenu = reactive({ open: false, x: 0, y: 0, leafID: "" });
+const dockerContext = reactive({
+  sessionID: "",
+  checking: false,
+  conversation: false,
+});
+let dockerContextRequest = 0;
+const dockerMenuDisabled = computed(
+  () =>
+    dockerContext.checking ||
+    dockerContext.conversation,
+);
 const splitDialog = reactive({
   open: false,
   direction: "horizontal" as "horizontal" | "vertical",
@@ -200,6 +240,13 @@ const visibleSessions = computed(() => {
 const activeTree = computed<PaneNode | undefined>(() =>
   layout.active ? layout.trees?.[layout.active] : undefined,
 );
+const activePaneSessions = computed(() => {
+  const tree = activeTree.value;
+  if (!tree) return [];
+  return collectSessionIDs(tree)
+    .map((id) => sessions.value.find((session) => session.id === id))
+    .filter((session): session is TerminalSession => Boolean(session));
+});
 const visibleSessionIDs = computed(() => {
   const ids = Object.values(layout.trees || {}).flatMap((tree) =>
     collectSessionIDs(tree),
@@ -228,6 +275,25 @@ const splitSessions = computed(() =>
 const currentPaneCount = computed(() =>
   activeTree.value ? collectSessionIDs(activeTree.value).length : 0,
 );
+const tabIndicators = computed<Record<string, TabAttention>>(() => {
+  const indicators: Record<string, TabAttention> = {};
+  for (const tabID of layout.tabs) {
+    const tree = layout.trees?.[tabID];
+    if (!tree) continue;
+    const indicator = resolveTabAttention(
+      collectSessionIDs(tree)
+        .map((id) => sessions.value.find((session) => session.id === id))
+        .filter(Boolean)
+        .map((session) => ({
+          name: session!.name,
+          status: session!.status,
+          notice: sessionAttention[session!.id],
+        })),
+    );
+    if (indicator) indicators[tabID] = indicator;
+  }
+  return indicators;
+});
 const activeWorkspaceSessions = computed(
   () =>
     [...new Set(Object.values(layout.trees || {}).flatMap(collectSessionIDs))]
@@ -377,7 +443,6 @@ function captureLayout(): WorkspaceLayout {
     trees: layout.trees,
     focused: layout.focused,
     maximized: {},
-    watchedSessionIDs: watchedSessionIDs.value,
     pinnedSessionIDs: pinnedSessionIDs.value,
   });
 }
@@ -529,6 +594,13 @@ async function load() {
     webServices.value = web;
     workspaceVersion.value = w.version;
     Object.assign(preferences, p);
+    preferences.accentColor = findAccent(preferences.accentColor).value;
+    if (preferences.terminalTheme === "velin") {
+      const terminalPreset = findTerminalTheme("velin");
+      preferences.background = terminalPreset.background;
+      preferences.foreground = terminalPreset.foreground;
+      preferences.cursorColor = terminalPreset.cursor;
+    }
     delete (preferences as Preferences & { lockOnHidden?: boolean })
       .lockOnHidden;
     preferences.lockEnabled &&= lockPINStatus.configured;
@@ -540,7 +612,6 @@ async function load() {
     ): value is {
       activeWorkspaceID: string;
       workspaces: Array<{ id: string; layout: WorkspaceLayout }>;
-      watchedSessionIDs?: string[];
       pinnedSessionIDs?: string[];
     } =>
       Boolean(
@@ -551,9 +622,6 @@ async function load() {
       );
     if (isDocument(saved)) {
       const document = saved;
-      watchedSessionIDs.value = (document.watchedSessionIDs || []).filter(
-        (id) => valid.has(id),
-      );
       pinnedSessionIDs.value = (document.pinnedSessionIDs || []).filter((id) =>
         valid.has(id),
       );
@@ -564,9 +632,6 @@ async function load() {
       applyLayout(normalizeLayout(selected?.layout || { tabs: [] }, valid));
     } else {
       const savedLayout = (saved || {}) as WorkspaceLayout;
-      watchedSessionIDs.value = (savedLayout.watchedSessionIDs || []).filter(
-        (id) => valid.has(id),
-      );
       pinnedSessionIDs.value = (savedLayout.pinnedSessionIDs || []).filter(
         (id) => valid.has(id),
       );
@@ -636,6 +701,8 @@ async function connect(
     direction: "horizontal" | "vertical";
   },
   sessionMode?: Host["sessionMode"],
+  initialCommand = "",
+  sessionName = "",
 ) {
   connecting.value = host.id;
   try {
@@ -645,13 +712,14 @@ async function connect(
       secret: temporary?.secret || "",
       passphrase: temporary?.passphrase || "",
       trustFingerprint,
-      name: host.name,
+      name: sessionName || host.name,
       sessionMode: sessionMode || "",
     };
     const session = await api<TerminalSession>("/api/sessions", {
       method: "POST",
       body: json(body),
     });
+    if (initialCommand) pendingTerminalCommands[session.id] = initialCommand;
     sessions.value.unshift(session);
     void refreshHosts();
     if (placement)
@@ -683,16 +751,18 @@ async function connect(
           temporary,
           placement,
           sessionMode,
+          initialCommand,
+          sessionName,
         );
       } catch {}
     } else if (isTmuxMissing(e)) {
       await showTmuxInstallGuide(
         host,
-        () => connect(host, trustFingerprint, temporary, placement, "tmux"),
-        () => connect(host, trustFingerprint, temporary, placement, "normal"),
+        () => connect(host, trustFingerprint, temporary, placement, "tmux", initialCommand, sessionName),
+        () => connect(host, trustFingerprint, temporary, placement, "normal", initialCommand, sessionName),
       );
     } else if (e instanceof Error && e.message.includes("credential required"))
-      await promptTemporary(host, placement);
+      await promptTemporary(host, placement, initialCommand, sessionName);
     else ElMessage.error(e instanceof Error ? e.message : "连接失败");
   } finally {
     connecting.value = undefined;
@@ -705,6 +775,8 @@ async function promptTemporary(
     leafID: string;
     direction: "horizontal" | "vertical";
   },
+  initialCommand = "",
+  sessionName = "",
 ) {
   try {
     const { value } = await ElMessageBox.prompt(
@@ -717,7 +789,7 @@ async function promptTemporary(
         inputValidator: (v) => Boolean(v) || "请输入密码",
       },
     );
-    await connect(host, "", { secret: value, passphrase: "" }, placement);
+    await connect(host, "", { secret: value, passphrase: "" }, placement, undefined, initialCommand, sessionName);
   } catch {}
 }
 function openSession(session: TerminalSession) {
@@ -742,6 +814,7 @@ function activePaneTree() {
 }
 function activate(id: string) {
   layout.active = id;
+  clearTabAttention(id);
   mobileSidebar.value = false;
   nextTick(() => {
     activePaneTree()?.resize();
@@ -770,6 +843,9 @@ function addSplitSession(
 function focusPane(leafID: string) {
   if (!layout.active) return;
   layout.focused![layout.active] = leafID;
+  const tree = layout.trees?.[layout.active];
+  const session = tree && sessionForLeaf(tree, leafID);
+  if (session) delete sessionAttention[session.id];
   nextTick(() => activePaneTree()?.focusLeaf(leafID));
   scheduleSave();
 }
@@ -777,11 +853,38 @@ function openContext(event: MouseEvent, leafID: string) {
   focusPane(leafID);
   contextMenu.open = true;
   contextMenu.leafID = leafID;
+  const tree = layout.active ? layout.trees?.[layout.active] : undefined;
+  const session = tree && sessionForLeaf(tree, leafID);
+  dockerContext.sessionID = session?.id || "";
+  dockerContext.conversation = Boolean(session && conversationSessions[session.id]);
+  dockerContext.checking = Boolean(session?.sessionMode === "tmux");
   contextMenu.x = Math.min(event.clientX, window.innerWidth - 188);
   contextMenu.y = Math.max(
     6,
-    Math.min(event.clientY, window.innerHeight - 360),
+    Math.min(event.clientY, window.innerHeight - 405),
   );
+  const request = ++dockerContextRequest;
+  if (session?.sessionMode === "tmux") {
+    void api<{ command: string }>(`/api/sessions/${session.id}/foreground`)
+      .then((result) => {
+        if (request !== dockerContextRequest || dockerContext.sessionID !== session.id) return;
+        dockerContext.conversation = isConversationCommand(result.command);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (request === dockerContextRequest) dockerContext.checking = false;
+      });
+  }
+}
+function isConversationCommand(command: string) {
+  return /(?:^|[\s/])(codex|claude|aider|gemini|opencode|goose|crush|cursor-agent)(?:$|\s)/i.test(
+    command.trim(),
+  );
+}
+function updateConversation(id: string, active: boolean) {
+  conversationSessions[id] = active;
+  if (dockerContext.sessionID === id && !dockerContext.checking)
+    dockerContext.conversation = active;
 }
 function requestSplit(direction: "horizontal" | "vertical") {
   splitDialog.direction = direction;
@@ -949,12 +1052,59 @@ async function openPaneFiles() {
   fileManagerPath.value = current || host.initialDirectory || ".";
   fileManagerOpen.value = true;
 }
+function openPaneAgent() {
+  if (!layout.active) return;
+  const tree = layout.trees?.[layout.active];
+  const session = tree && sessionForLeaf(tree, contextMenu.leafID);
+  const host =
+    session && hosts.value.find((item) => item.id === session.hostID);
+  contextMenu.open = false;
+  if (!session || !host)
+    return ElMessage.warning("当前终端没有可用的主机信息");
+  if (!host.credentialID)
+    return ElMessage.warning("请先为当前主机配置 SSH 凭据");
+  agentHost.value = host;
+  agentTabID.value = layout.active;
+  agentOpen.value = true;
+}
+function openPaneDocker() {
+  if (dockerMenuDisabled.value || !layout.active) return;
+  const tree = layout.trees?.[layout.active];
+  const session = tree && sessionForLeaf(tree, contextMenu.leafID);
+  const host =
+    session && hosts.value.find((item) => item.id === session.hostID);
+  contextMenu.open = false;
+  if (!session || !host)
+    return ElMessage.warning("当前终端没有可用的主机信息");
+  if (!host.credentialID)
+    return ElMessage.warning("请先为当前主机配置 SSH 凭据");
+  dockerHost.value = host;
+  dockerSessionID.value = session.id;
+  dockerOpen.value = true;
+}
 function sendSnippet(text: string, execute = false) {
   if (!layout.active) return;
   const target = layout.focused?.[layout.active];
   if (!target) return ElMessage.warning("请先选择一个终端分屏");
   activePaneTree()?.sendText?.(target, text + (execute ? "\r" : ""));
   settingsOpen.value = false;
+}
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+async function openDockerTerminal(target: { id: string; name: string }) {
+  const host = dockerHost.value;
+  if (!host) return ElMessage.warning("当前终端没有可用的主机信息");
+  dockerOpen.value = false;
+  await connect(
+    host,
+    "",
+    undefined,
+    undefined,
+    undefined,
+    `docker exec -it ${shellQuote(target.id)} sh\r`,
+    `${host.name} · ${target.name}`,
+  );
 }
 function sendBatchSnippet(text: string, sessionIDs: string[]) {
   let sent = 0;
@@ -979,6 +1129,12 @@ function updateRatio(nodeIDValue: string, ratio: number) {
   scheduleSave();
 }
 function moveBackground(id: string) {
+  if (agentTabID.value === id) {
+    agentOpen.value = false;
+    agentHost.value = undefined;
+    agentTabID.value = "";
+  }
+  clearTabAttention(id);
   layout.tabs = layout.tabs.filter((item) => item !== id);
   delete layout.trees?.[id];
   delete layout.focused?.[id];
@@ -1023,6 +1179,8 @@ async function closeTab(tabID: string) {
   }
 }
 function removeLocal(id: string) {
+  delete sessionAttention[id];
+  delete conversationSessions[id];
   for (const tab of [...layout.tabs]) {
     const next = removeSession(layout.trees![tab], id);
     if (next) {
@@ -1052,6 +1210,14 @@ function cyclePane(offset: number) {
   focusPane(next);
   nextTick(() => activePaneTree()?.focusLeaf(next));
 }
+function switchMobilePane(sessionID: string) {
+  const tree = activeTree.value;
+  if (!tree) return;
+  const leafID = leafForSession(tree, sessionID);
+  if (!leafID) return;
+  focusPane(leafID);
+  nextTick(() => activePaneTree()?.focusLeaf(leafID));
+}
 function clearMobileModifiers() {
   mobileCtrl.value = false;
   mobileAlt.value = false;
@@ -1066,6 +1232,38 @@ function updateStatus(id: string, status: string, message?: string) {
     session.status = status as any;
     session.lastError = message || "";
   }
+  const command = pendingTerminalCommands[id];
+  if (status === "attached" && command) {
+    void nextTick(() => {
+      for (const tabID of layout.tabs) {
+        const tree = layout.trees?.[tabID];
+        const leafID = tree && leafForSession(tree, id);
+        const paneTree = leafID ? paneTreeRefs.get(tabID) : undefined;
+        if (!leafID || !paneTree) continue;
+        delete pendingTerminalCommands[id];
+        paneTree.sendText?.(leafID, command);
+        paneTree.focusLeaf?.(leafID);
+        return;
+      }
+    });
+  }
+}
+function updateAttention(id: string, event: TerminalAttentionEvent) {
+  if (event === "clear") delete sessionAttention[id];
+  else sessionAttention[id] = event;
+}
+function clearTabAttention(tabID: string) {
+  const tree = layout.trees?.[tabID];
+  if (!tree) return;
+  for (const id of collectSessionIDs(tree)) delete sessionAttention[id];
+}
+function tabAttentionIcon(kind: TabAttentionKind) {
+  return {
+    required: TriangleAlert,
+    bell: BellRing,
+    ended: CircleStop,
+    settled: CircleCheck,
+  }[kind];
 }
 function updateTitle(id: string, title: string) {
   const session = sessions.value.find((item) => item.id === id);
@@ -1090,12 +1288,6 @@ async function saveWorkspace() {
       scheduleSave();
     } else ElMessage.error(e instanceof Error ? e.message : "保存工作区失败");
   }
-}
-function openNotificationSession(sessionID: string) {
-  const session = sessions.value.find((item) => item.id === sessionID);
-  if (session) openSession(session);
-  settingsOpen.value = false;
-  api("/api/notifications/read", { method: "POST" }).catch(() => {});
 }
 function editHost(host?: Host) {
   editingHost.value = host ? { ...host } : undefined;
@@ -1345,15 +1537,90 @@ function hostSaved(host: Host) {
   const i = hosts.value.findIndex((item) => item.id === host.id);
   if (i >= 0) hosts.value[i] = host;
   else hosts.value.push(host);
-  hosts.value.sort(
-    (a, b) =>
-      String(b.lastConnectedAt || b.createdAt || "").localeCompare(
-        String(a.lastConnectedAt || a.createdAt || ""),
-      ) || a.name.localeCompare(b.name),
-  );
   api<Credential[]>("/api/credentials")
     .then((items) => (credentials.value = items))
     .catch(() => {});
+}
+function normalizeHostGroup(value: string) {
+  return value
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join("/");
+}
+function compareHostOrder(a: Host, b: Host) {
+  return (
+    Number(a.sortOrder ?? 0) - Number(b.sortOrder ?? 0) ||
+    a.name.localeCompare(b.name)
+  );
+}
+async function reorderHost(payload: {
+  hostID: string;
+  target: HostDropTarget;
+}) {
+  const moved = hosts.value.find((host) => host.id === payload.hostID);
+  if (!moved) return;
+  if (payload.target.kind === "host" && payload.target.hostID === moved.id)
+    return;
+
+  const sourceGroup = normalizeHostGroup(moved.groupName);
+  const targetGroup = normalizeHostGroup(
+    payload.target.groupPath === "__ungrouped__"
+      ? ""
+      : payload.target.groupPath,
+  );
+  const sourceHosts = hosts.value
+    .filter((host) => normalizeHostGroup(host.groupName) === sourceGroup)
+    .sort(compareHostOrder)
+    .filter((host) => host.id !== moved.id);
+  const targetHosts =
+    sourceGroup === targetGroup
+      ? sourceHosts
+      : hosts.value
+          .filter((host) => normalizeHostGroup(host.groupName) === targetGroup)
+          .sort(compareHostOrder);
+  let insertAt = targetHosts.length;
+  const target = payload.target;
+  if (target.kind === "host") {
+    const targetIndex = targetHosts.findIndex(
+      (host) => host.id === target.hostID,
+    );
+    if (targetIndex >= 0)
+      insertAt = targetIndex + (target.after ? 1 : 0);
+  }
+  targetHosts.splice(insertAt, 0, moved);
+
+  const updates = new Map<string, { groupName: string; sortOrder: number }>();
+  for (const [index, host] of sourceHosts.entries())
+    updates.set(host.id, { groupName: sourceGroup, sortOrder: index + 1 });
+  for (const [index, host] of targetHosts.entries())
+    updates.set(host.id, { groupName: targetGroup, sortOrder: index + 1 });
+
+  const previous = new Map<string, { groupName: string; sortOrder?: number }>();
+  for (const [id, update] of updates) {
+    const host = hosts.value.find((item) => item.id === id);
+    if (!host) continue;
+    previous.set(id, { groupName: host.groupName, sortOrder: host.sortOrder });
+    host.groupName = update.groupName;
+    host.sortOrder = update.sortOrder;
+  }
+  try {
+    await api("/api/hosts/reorder", {
+      method: "POST",
+      body: json({
+        items: [...updates].map(([id, update]) => ({ id, ...update })),
+      }),
+    });
+    ElMessage.success(
+      sourceGroup === targetGroup ? "主机顺序已更新" : "主机已移动到目标分组",
+    );
+  } catch (e) {
+    for (const [id, value] of previous) {
+      const host = hosts.value.find((item) => item.id === id);
+      if (host) Object.assign(host, value);
+    }
+    ElMessage.error(e instanceof Error ? e.message : "主机移动失败");
+  }
 }
 function credentialSaved(credential: Credential) {
   const index = credentials.value.findIndex(
@@ -1406,17 +1673,6 @@ async function renameSession(session: TerminalSession) {
 async function duplicateSession(session: TerminalSession) {
   const host = sessionHost(session);
   if (host) await connect(host, "", undefined, undefined, session.sessionMode);
-}
-function toggleWatch(session: TerminalSession) {
-  watchedSessionIDs.value = watchedSessionIDs.value.includes(session.id)
-    ? watchedSessionIDs.value.filter((id) => id !== session.id)
-    : [...watchedSessionIDs.value, session.id];
-  scheduleSave();
-  ElMessage.info(
-    watchedSessionIDs.value.includes(session.id)
-      ? "已关注，持续输出静默 30 秒后通知"
-      : "已取消任务关注",
-  );
 }
 function togglePin(session: TerminalSession) {
   pinnedSessionIDs.value = pinnedSessionIDs.value.includes(session.id)
@@ -1502,6 +1758,12 @@ function closeWorkspaceOverlays() {
   hostDialog.value = false;
   fileManagerOpen.value = false;
   webProxyOpen.value = false;
+  agentOpen.value = false;
+  agentHost.value = undefined;
+  agentTabID.value = "";
+  dockerOpen.value = false;
+  dockerHost.value = undefined;
+  dockerSessionID.value = "";
   setTmuxInstallOpen(false);
   contextMenu.open = false;
   splitDialog.open = false;
@@ -1630,6 +1892,7 @@ onBeforeUnmount(() => {
           @delete="deleteHost"
           @add="editHost()"
           @refresh="refreshHosts"
+          @reorder="reorderHost"
         />
         <button
           class="web-service-resizer desktop-only"
@@ -1727,8 +1990,26 @@ onBeforeUnmount(() => {
                 class="status-dot"
                 :class="statusColor(tabSession(id)?.status || 'ended')"
               ></span
-              ><span>{{ tabSession(id)?.name || "已结束会话" }}</span
-              ><button
+              ><span class="tab-title">{{
+                tabSession(id)?.name || "已结束会话"
+              }}</span
+              ><el-tooltip
+                v-if="tabIndicators[id]"
+                :content="tabIndicators[id].label"
+                placement="bottom"
+              >
+                <span
+                  class="tab-attention"
+                  :class="tabIndicators[id].kind"
+                  :aria-label="tabIndicators[id].label"
+                >
+                  <component
+                    :is="tabAttentionIcon(tabIndicators[id].kind)"
+                    :size="14"
+                  />
+                </span>
+              </el-tooltip>
+              <button
                 class="tab-close danger"
                 title="关闭终端标签"
                 @click.stop="closeTab(id)"
@@ -1739,6 +2020,14 @@ onBeforeUnmount(() => {
             <Plus :size="16" />
           </button>
         </div>
+        <button
+          class="mobile-session-switch mobile-only"
+          title="切换终端会话"
+          aria-label="切换终端会话"
+          @click="sessionsDialog = true"
+        >
+          <Monitor :size="15" /><span>{{ layout.tabs.length }}</span>
+        </button>
         <div class="workspace-actions">
           <span v-if="currentPaneCount > 1" class="pane-count"
             ><Columns2 :size="14" />{{ currentPaneCount }}</span
@@ -1755,6 +2044,27 @@ onBeforeUnmount(() => {
         </div>
       </header>
       <template v-if="!locked && layout.tabs.length"
+        ><nav
+          v-if="activePaneSessions.length > 1"
+          class="mobile-pane-switcher"
+          aria-label="切换当前标签内的终端"
+        >
+          <button
+            v-for="session in activePaneSessions"
+            :key="session.id"
+            class="mobile-pane-tab"
+            :class="{
+              active:
+                layout.focused?.[layout.active || ''] ===
+                leafForSession(activeTree!, session.id),
+            }"
+            :title="session.name"
+            @click="switchMobilePane(session.id)"
+          >
+            <span class="status-dot" :class="statusColor(session.status)"></span>
+            <span>{{ session.name }}</span>
+          </button>
+        </nav
         ><div
           v-for="id in layout.tabs"
           v-show="layout.active === id"
@@ -1772,13 +2082,14 @@ onBeforeUnmount(() => {
             :maximized-leaf-id="layout.maximized?.[id]"
             :mobile-ctrl="mobileCtrl"
             :mobile-alt="mobileAlt"
-            :watched-session-ids="watchedSessionIDs"
             @focus="focusPane"
             @context="openContext"
             @close="terminatePane"
             @status="updateStatus"
             @title="updateTitle"
             @directory="updateSessionDirectory"
+            @conversation="updateConversation"
+            @attention="updateAttention"
             @ratio="updateRatio"
             @modifiers-used="clearMobileModifiers"
           /></div
@@ -1842,6 +2153,20 @@ onBeforeUnmount(() => {
           <BrushCleaning :size="16" /><span>清屏</span></button
         ><button @click="openPaneFiles">
           <FolderOpen :size="16" /><span>打开当前目录</span></button
+        ><button @click="openPaneAgent">
+          <Bot :size="16" /><span>打开 Agent</span></button
+        ><button
+          :disabled="dockerMenuDisabled"
+          :title="
+            dockerContext.checking
+              ? '正在确认当前终端状态'
+              : dockerContext.conversation
+                ? '对话式终端暂不支持 Docker 管理'
+                : 'Docker 管理'
+          "
+          @click="openPaneDocker"
+        >
+          <Box :size="16" /><span>Docker 管理</span></button
         ><span class="context-separator" /><button
           @click="requestSplit('horizontal')"
         >
@@ -2054,13 +2379,7 @@ onBeforeUnmount(() => {
                   >重命名</el-dropdown-item
                 ><el-dropdown-item @click="duplicateSession(session)"
                   >复制新开</el-dropdown-item
-                ><el-dropdown-item @click="toggleWatch(session)">
-                  {{
-                    watchedSessionIDs.includes(session.id)
-                      ? "取消关注"
-                      : "任务关注"
-                  }}
-                </el-dropdown-item>
+                >
                 <el-dropdown-item @click="togglePin(session)">
                   {{
                     pinnedSessionIDs.includes(session.id)
@@ -2110,7 +2429,6 @@ onBeforeUnmount(() => {
       @insert="sendSnippet($event, false)"
       @execute="sendSnippet($event, true)"
       @batch-execute="sendBatchSnippet"
-      @notification-open="openNotificationSession"
       @credential-saved="credentialSaved"
       @credential-deleted="credentialDeleted"
     />
@@ -2126,6 +2444,17 @@ onBeforeUnmount(() => {
       :host="webProxyHost"
       :service="editingWebService"
       @saved="webServiceSaved"
+    />
+    <AgentDialog
+      v-model="agentOpen"
+      :host="agentHost"
+      :suspended="Boolean(agentTabID && agentTabID !== layout.active)"
+    />
+    <DockerDialog
+      v-model="dockerOpen"
+      :host="dockerHost"
+      :session-id="dockerSessionID"
+      @terminal="openDockerTerminal"
     />
     <Transition name="workspace-lock">
       <section v-if="locked" class="workspace-lock" aria-modal="true" role="dialog">

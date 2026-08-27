@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref } from "vue";
 import TerminalPane from "./TerminalPane.vue";
 import type { PaneNode, Preferences, TerminalSession } from "../types";
+import type { TerminalAttentionEvent } from "../terminalAttention";
 
 defineOptions({ name: "SplitPaneNode" });
 const props = defineProps<{
@@ -14,7 +15,6 @@ const props = defineProps<{
   maximizedLeafId?: string;
   mobileCtrl?: boolean;
   mobileAlt?: boolean;
-  watchedSessionIds?: string[];
 }>();
 const emit = defineEmits<{
   focus: [leafID: string];
@@ -23,6 +23,8 @@ const emit = defineEmits<{
   status: [id: string, status: string, message?: string];
   title: [id: string, title: string];
   directory: [id: string, path: string];
+  conversation: [id: string, active: boolean];
+  attention: [id: string, event: TerminalAttentionEvent];
   ratio: [nodeID: string, ratio: number];
   modifiersUsed: [];
 }>();
@@ -79,24 +81,41 @@ function startResize(event: PointerEvent) {
   const split = props.node;
   const host = (event.currentTarget as HTMLElement).parentElement!;
   const rect = host.getBoundingClientRect();
+  const horizontal = split.direction === "horizontal";
+  const styleProperty = horizontal
+    ? "gridTemplateColumns"
+    : "gridTemplateRows";
+  let nextRatio = split.ratio;
   document.body.classList.add("is-resizing-panes");
   const move = (next: PointerEvent) => {
     const raw =
-      split.direction === "horizontal"
+      horizontal
         ? (next.clientX - rect.left) / rect.width
         : (next.clientY - rect.top) / rect.height;
-    emit("ratio", split.id, Math.min(0.82, Math.max(0.18, raw)));
-    scheduleResize();
+    nextRatio = Math.min(0.82, Math.max(0.18, raw));
+    const first = `${nextRatio}fr`;
+    const second = `${1 - nextRatio}fr`;
+    host.style[styleProperty] = horizontal
+      ? `minmax(280px, ${first}) 9px minmax(280px, ${second})`
+      : `minmax(180px, ${first}) 9px minmax(180px, ${second})`;
   };
   const stop = () => {
     document.body.classList.remove("is-resizing-panes");
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", stop);
+    window.removeEventListener("pointercancel", stop);
     if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
-    resizeFrame = requestAnimationFrame(resize);
+    emit("ratio", split.id, nextRatio);
+    // Keep the direct CSS value until Vue has committed the final ratio. This
+    // avoids one frame reverting to the old layout when the pointer is released.
+    void nextTick(() => {
+      host.style.removeProperty(styleProperty);
+      resizeFrame = requestAnimationFrame(resize);
+    });
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", stop);
+  window.addEventListener("pointercancel", stop);
 }
 function scheduleResize() {
   if (resizeFrame !== undefined) cancelAnimationFrame(resizeFrame);
@@ -220,13 +239,14 @@ defineExpose({
       :maximized-leaf-id="maximizedLeafId"
       :mobile-ctrl="mobileCtrl"
       :mobile-alt="mobileAlt"
-      :watched-session-ids="watchedSessionIds"
       @focus="(id) => emit('focus', id)"
       @context="(...args) => emit('context', ...args)"
       @close="(id) => emit('close', id)"
       @status="(...args) => emit('status', ...args)"
       @title="(...args) => emit('title', ...args)"
       @directory="(...args) => emit('directory', ...args)"
+      @conversation="(...args) => emit('conversation', ...args)"
+      @attention="(...args) => emit('attention', ...args)"
       @ratio="(...args) => emit('ratio', ...args)"
       @modifiers-used="emit('modifiersUsed')"
     />
@@ -250,13 +270,14 @@ defineExpose({
       :maximized-leaf-id="maximizedLeafId"
       :mobile-ctrl="mobileCtrl"
       :mobile-alt="mobileAlt"
-      :watched-session-ids="watchedSessionIds"
       @focus="(id) => emit('focus', id)"
       @context="(...args) => emit('context', ...args)"
       @close="(id) => emit('close', id)"
       @status="(...args) => emit('status', ...args)"
       @title="(...args) => emit('title', ...args)"
       @directory="(...args) => emit('directory', ...args)"
+      @conversation="(...args) => emit('conversation', ...args)"
+      @attention="(...args) => emit('attention', ...args)"
       @ratio="(...args) => emit('ratio', ...args)"
       @modifiers-used="emit('modifiersUsed')"
     />
@@ -266,6 +287,9 @@ defineExpose({
     class="split-leaf"
     :class="{
       focused: node.id === focusedLeafId,
+      'mobile-pane-hidden': Boolean(
+        focusedLeafId && node.id !== focusedLeafId,
+      ),
       'pane-maximized-away': hiddenByMaximize,
     }"
     @pointerdown="emit('focus', node.id)"
@@ -280,11 +304,12 @@ defineExpose({
       :closable="!root"
       :mobile-ctrl="mobileCtrl"
       :mobile-alt="mobileAlt"
-      :watched="watchedSessionIds?.includes(session.id)"
       @close="emit('close', node.id)"
       @status="(...args) => emit('status', ...args)"
       @title="(...args) => emit('title', ...args)"
       @directory="(...args) => emit('directory', ...args)"
+      @conversation="(...args) => emit('conversation', ...args)"
+      @attention="(...args) => emit('attention', ...args)"
       @modifiers-used="emit('modifiersUsed')"
     />
     <div v-else class="empty-pane"><span>终端会话已不可用</span></div>

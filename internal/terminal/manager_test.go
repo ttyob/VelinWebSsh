@@ -2,7 +2,11 @@ package terminal
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"testing"
+
+	"velin-webssh/internal/store"
 )
 
 func TestRingBufferTruncatesOldOutput(t *testing.T) {
@@ -18,10 +22,152 @@ func TestRingBufferTruncatesOldOutput(t *testing.T) {
 	}
 }
 
+func TestRingBufferSnapshotsRemainStableAfterEviction(t *testing.T) {
+	r := newRingBuffer(8)
+	r.Write([]byte("12345678"))
+	segments, _ := r.Segments()
+	r.Write([]byte("90"))
+	if got := string(bytes.Join(segments, nil)); got != "12345678" {
+		t.Fatalf("snapshot changed after eviction: %q", got)
+	}
+	if got, _ := r.Bytes(); string(got) != "34567890" {
+		t.Fatalf("unexpected retained bytes: %q", got)
+	}
+}
+
+func TestRingBufferTailLinesAcrossSegments(t *testing.T) {
+	r := newRingBuffer(1 << 20)
+	r.Write([]byte("one\r\ntwo\r\n"))
+	r.Write([]byte("three\r\nfour\r\n"))
+	if got := string(r.TailLines(2, 1<<20)); got != "three\r\nfour\r\n" {
+		t.Fatalf("unexpected tail: %q", got)
+	}
+}
+
+func TestRingBufferTailLinesLimitsBytes(t *testing.T) {
+	r := newRingBuffer(1 << 20)
+	r.Write(bytes.Repeat([]byte("x"), 1024))
+	if got := r.TailLines(200, 128); len(got) != 128 {
+		t.Fatalf("tail length=%d, want 128", len(got))
+	}
+}
+
+func TestBroadcastDoesNotDropOutputWhenSubscriberIsBusy(t *testing.T) {
+	s := &Session{subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(1 << 20)}
+	events, _, _ := s.Subscribe("client", "", 0)
+	const count = 300
+	done := make(chan struct{})
+	go func() {
+		for index := 0; index < count; index++ {
+			s.broadcast(Event{Type: "output", Data: fmt.Sprintf("output-%03d", index)})
+		}
+		close(done)
+	}()
+	for index := 0; index < count; index++ {
+		event := <-events
+		expected := fmt.Sprintf("output-%03d", index)
+		if event.Data != expected {
+			t.Fatalf("event %d=%q, want %q", index, event.Data, expected)
+		}
+	}
+	<-done
+}
+
+func TestSubscribeResumesFromOutputOffset(t *testing.T) {
+	s := &Session{streamID: "stream", subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(8)}
+	s.buffer.Write([]byte("one"))
+	_, _, initial := s.Subscribe("first", "", 0)
+	if string(bytes.Join(initial.Segments, nil)) != "one" || initial.Offset != 3 || initial.Truncated {
+		t.Fatalf("unexpected initial replay: %+v", initial)
+	}
+	s.Unsubscribe("first")
+	s.buffer.Write([]byte("two"))
+	_, _, resumed := s.Subscribe("second", "stream", initial.Offset)
+	if string(bytes.Join(resumed.Segments, nil)) != "two" || resumed.Offset != 6 || resumed.Truncated {
+		t.Fatalf("unexpected resumed replay: %+v", resumed)
+	}
+	s.Unsubscribe("second")
+	s.buffer.Write([]byte("34567890"))
+	_, _, truncated := s.Subscribe("third", "stream", initial.Offset)
+	if string(bytes.Join(truncated.Segments, nil)) != "34567890" || !truncated.Truncated {
+		t.Fatalf("unexpected truncated replay: %+v", truncated)
+	}
+}
+
+func TestNormalizeTerminalLines(t *testing.T) {
+	got := normalizeTerminalLines([]byte("one\ntwo\r\nthree"))
+	if want := "one\r\ntwo\r\nthree"; string(got) != want {
+		t.Fatalf("normalizeTerminalLines()=%q, want %q", got, want)
+	}
+}
+
+func TestPrepareTerminalSnapshotResetsAndNormalizes(t *testing.T) {
+	got := prepareTerminalSnapshot([]byte("\x1b[31mone\ntwo"))
+	want := "\x1b[0m\x1b[2J\x1b[H\x1b[31mone\r\ntwo\x1b[0m"
+	if string(got) != want {
+		t.Fatalf("prepareTerminalSnapshot()=%q, want %q", got, want)
+	}
+}
+
+func TestTailTerminalLines(t *testing.T) {
+	for _, input := range []string{"one\r\ntwo\r\nthree\r\nfour", "one\r\ntwo\r\nthree\r\nfour\r\n"} {
+		got := tailTerminalLines([]byte(input), 2)
+		want := "three\r\nfour"
+		if strings.HasSuffix(input, "\r\n") {
+			want += "\r\n"
+		}
+		if string(got) != want {
+			t.Fatalf("tailTerminalLines(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestTmuxCaptureSupportedRejectsDevelopmentBuild(t *testing.T) {
+	if tmuxCaptureSupported("tmux next-3.4") {
+		t.Fatal("development tmux build must not use capture-pane")
+	}
+	if !tmuxCaptureSupported("tmux 3.4") {
+		t.Fatal("stable tmux build should support capture-pane")
+	}
+	if tmuxCaptureSupported("") {
+		t.Fatal("unknown tmux version must use the safe fallback")
+	}
+}
+
+func TestSnapshotFallsBackToBufferedOutput(t *testing.T) {
+	s := &Session{meta: store.TerminalSession{SessionMode: "tmux"}, buffer: newRingBuffer(1024)}
+	s.buffer.Write([]byte("one\ntwo\nthree"))
+	got := s.Snapshot(2)
+	if !bytes.Contains(got, []byte("two\r\nthree")) {
+		t.Fatalf("buffered snapshot missing tail: %q", got)
+	}
+}
+
+func TestIsTmuxTargetMissing(t *testing.T) {
+	for _, message := range []string{
+		"tmux session not found: no server running on /tmp/tmux-0/velin",
+		"can't find session: ws_missing",
+		"tmux session not found: no such session: ws_missing",
+	} {
+		if !isTmuxTargetMissing(message) {
+			t.Fatalf("isTmuxTargetMissing(%q)=false", message)
+		}
+	}
+	for _, message := range []string{
+		"tmux ownership marker mismatch",
+		"permission denied",
+		"connection timed out",
+	} {
+		if isTmuxTargetMissing(message) {
+			t.Fatalf("isTmuxTargetMissing(%q)=true", message)
+		}
+	}
+}
+
 func TestControlTransferRequiresApproval(t *testing.T) {
-	s := &Session{subs: make(map[string]chan Event), buffer: newRingBuffer(8)}
-	firstEvents, _, _ := s.Subscribe("first")
-	s.Subscribe("second")
+	s := &Session{subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(8)}
+	firstEvents, _, _ := s.Subscribe("first", "", 0)
+	s.Subscribe("second", "", 0)
 	if s.RequestControl("second") {
 		t.Fatal("online controller was silently replaced")
 	}
@@ -38,10 +184,38 @@ func TestControlTransferRequiresApproval(t *testing.T) {
 	}
 }
 
+func TestSubscribeReclaimsControlWithMatchingReconnectKey(t *testing.T) {
+	s := &Session{subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(8)}
+	_, firstDone, _ := s.Subscribe("first", "", 0, "same-tab")
+	s.Subscribe("second", "", 0, "same-tab")
+	if !s.IsController("second") {
+		t.Fatal("matching reconnect key did not reclaim control")
+	}
+	select {
+	case <-firstDone:
+	default:
+		t.Fatal("replaced subscriber was not closed")
+	}
+}
+
+func TestSubscribeDoesNotReclaimControlWithDifferentReconnectKey(t *testing.T) {
+	s := &Session{subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(8)}
+	_, firstDone, _ := s.Subscribe("first", "", 0, "first-tab")
+	s.Subscribe("second", "", 0, "second-tab")
+	if !s.IsController("first") || s.IsController("second") {
+		t.Fatal("different reconnect key replaced the active controller")
+	}
+	select {
+	case <-firstDone:
+		t.Fatal("different reconnect key closed the active subscriber")
+	default:
+	}
+}
+
 func TestControlReleaseGrantsWaitingClient(t *testing.T) {
-	s := &Session{subs: make(map[string]chan Event), buffer: newRingBuffer(8)}
-	s.Subscribe("first")
-	s.Subscribe("second")
+	s := &Session{subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(8)}
+	s.Subscribe("first", "", 0)
+	s.Subscribe("second", "", 0)
 	s.RequestControl("second")
 	if !s.ReleaseControl("first") || !s.IsController("second") {
 		t.Fatal("releasing control did not grant waiting client")

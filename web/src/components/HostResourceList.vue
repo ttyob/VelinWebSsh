@@ -12,7 +12,10 @@ import {
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api, json } from "../api";
 import type { Host } from "../types";
-import HostGroupNode, { type HostTreeGroup } from "./HostGroupNode.vue";
+import HostGroupNode, {
+  type HostDropTarget,
+  type HostTreeGroup,
+} from "./HostGroupNode.vue";
 
 const props = defineProps<{
   hosts: Host[];
@@ -27,11 +30,14 @@ const emit = defineEmits<{
   delete: [Host];
   add: [];
   refresh: [];
+  reorder: [{ hostID: string; target: HostDropTarget }];
 }>();
 const selecting = ref(false),
   selected = ref(new Set<string>()),
   collapsed = ref(new Set<string>()),
-  busy = ref(false);
+  busy = ref(false),
+  draggingHostID = ref(""),
+  dropTarget = ref<HostDropTarget | null>(null);
 const groups = computed(() => buildGroups(props.hosts));
 
 function buildGroups(hosts: Host[]): HostTreeGroup[] {
@@ -67,7 +73,7 @@ function buildGroups(hosts: Host[]): HostTreeGroup[] {
     items
       .map((item) => ({
         ...item,
-        hosts: [...item.hosts].sort((a, b) => a.name.localeCompare(b.name)),
+        hosts: [...item.hosts].sort(compareHosts),
         children: sortGroups(item.children),
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -76,10 +82,16 @@ function buildGroups(hosts: Host[]): HostTreeGroup[] {
     result.push({
       name: "未分组",
       path: "__ungrouped__",
-      hosts: [...ungrouped].sort((a, b) => a.name.localeCompare(b.name)),
+      hosts: [...ungrouped].sort(compareHosts),
       children: [],
     });
   return result;
+}
+function compareHosts(a: Host, b: Host) {
+  return (
+    Number(a.sortOrder ?? 0) - Number(b.sortOrder ?? 0) ||
+    a.name.localeCompare(b.name)
+  );
 }
 function toggleGroup(path: string) {
   const next = new Set(collapsed.value);
@@ -102,6 +114,23 @@ function toggleAll() {
 function stopSelecting() {
   selecting.value = false;
   selected.value = new Set();
+}
+function beginDrag(host: Host) {
+  if (selecting.value) return;
+  draggingHostID.value = host.id;
+}
+function clearDrag() {
+  draggingHostID.value = "";
+  dropTarget.value = null;
+}
+function updateDropTarget(target: HostDropTarget) {
+  dropTarget.value = target;
+}
+function completeDrop(target: HostDropTarget) {
+  const hostID = draggingHostID.value;
+  if (!hostID) return clearDrag();
+  emit("reorder", { hostID, target });
+  clearDrag();
 }
 async function batch(action: "group" | "tags" | "delete") {
   if (!selected.value.size) return ElMessage.warning("请先选择主机");
@@ -201,6 +230,8 @@ async function batch(action: "group" | "tags" | "delete") {
       :selected="selected"
       :collapsed="collapsed"
       :testing="testing"
+      :dragging-host-id="draggingHostID"
+      :drop-target="dropTarget"
       @connect="emit('connect', $event)"
       @web="emit('web', $event)"
       @test="emit('test', $event)"
@@ -209,6 +240,10 @@ async function batch(action: "group" | "tags" | "delete") {
       @delete="emit('delete', $event)"
       @toggle-selection="toggle"
       @toggle-group="toggleGroup"
+      @drag-start="beginDrag"
+      @drag-end="clearDrag"
+      @drag-over="updateDropTarget"
+      @drop="completeDrop"
     />
   </div>
 </template>

@@ -47,6 +47,49 @@ func TestRewriteProxyURL(t *testing.T) {
 	}
 }
 
+func TestRewriteProxyURLAcceptsLoopbackTargetAlias(t *testing.T) {
+	target, _ := url.Parse("http://192.168.0.111:9117")
+	prefix := "/web-service-proxy/service-id"
+	for _, input := range []string{
+		"http://127.0.0.1:9117/UI/Login?ReturnUrl=%2FUI%2FDashboard",
+		"//localhost:9117/UI/Login",
+		"http://192.168.0.111/UI/Login",
+	} {
+		if actual := rewriteProxyURL(input, prefix, target); !strings.HasPrefix(actual, prefix+"/UI/Login") {
+			t.Errorf("rewriteProxyURL(%q)=%q, want proxied login URL", input, actual)
+		}
+	}
+	if actual := rewriteProxyURL("http://127.0.0.1:80/UI/Login", prefix, target); actual != "http://127.0.0.1:80/UI/Login" {
+		t.Fatalf("rewriteProxyURL rewrote a different port: %q", actual)
+	}
+}
+
+func TestModifyResponseRewritesTargetRedirect(t *testing.T) {
+	target, _ := url.Parse("http://192.168.0.111:9117")
+	session := &webProxySession{routePrefix: "/web-service-proxy/service-id", target: target}
+	request, _ := http.NewRequest(http.MethodGet, "https://velin.example/web-service-proxy/service-id/UI/Dashboard", nil)
+	request.Host = "velin.example"
+	request.Header.Set("X-Forwarded-Host", "velin.example")
+	response := &http.Response{
+		Header:  http.Header{"Location": {"http://192.168.0.111/UI/Login?ReturnUrl=%2FUI%2FDashboard"}},
+		Body:    io.NopCloser(strings.NewReader("")),
+		Request: request,
+	}
+	if err := session.modifyResponse(response); err != nil {
+		t.Fatal(err)
+	}
+	if actual := response.Header.Get("Location"); actual != "/web-service-proxy/service-id/UI/Login?ReturnUrl=%2FUI%2FDashboard" {
+		t.Fatalf("rewritten redirect=%q", actual)
+	}
+	response.Header.Set("Location", "http://velin.example/UI/Login?ReturnUrl=%2FUI%2FDashboard")
+	if err := session.modifyResponse(response); err != nil {
+		t.Fatal(err)
+	}
+	if actual := response.Header.Get("Location"); actual != "/web-service-proxy/service-id/UI/Login?ReturnUrl=%2FUI%2FDashboard" {
+		t.Fatalf("rewritten public-host redirect=%q", actual)
+	}
+}
+
 func TestRewriteHTML(t *testing.T) {
 	target, _ := url.Parse("http://router.internal")
 	body := rewriteHTML([]byte(`<html><head><script src="/dashboard.js"></script></head><body><a href="/login">Login</a><img src="/logo.png" srcset="/small.png 1x, /large.png 2x"><form action="/save"></form><script>if (1 < 2) console.log("ok")</script></body></html>`), "/web-proxy/token", target)
@@ -72,6 +115,17 @@ func TestRewriteHTML(t *testing.T) {
 	}
 }
 
+func TestRewriteHTMLUsesDocumentDirectoryForRelativeURLs(t *testing.T) {
+	target, _ := url.Parse("http://router.internal")
+	body := string(rewriteHTMLAtPath([]byte(`<html><head><script src="../libs/jquery.min.js"></script></head><body><img src="../jacket_medium.png"></body></html>`), "/web-service-proxy/service-id", target, "/UI/Login"))
+	if !strings.Contains(body, `<base href="/web-service-proxy/service-id/UI/" data-velin-web-proxy="base"/>`) {
+		t.Fatalf("relative URL base path missing: %s", body)
+	}
+	if !strings.Contains(body, `src="../libs/jquery.min.js"`) || !strings.Contains(body, `src="../jacket_medium.png"`) {
+		t.Fatalf("relative URLs should remain relative to the document directory: %s", body)
+	}
+}
+
 func TestRewriteStableWebServiceNavigation(t *testing.T) {
 	target, _ := url.Parse("http://router.internal")
 	prefix := "/web-service-proxy/service-id"
@@ -90,7 +144,7 @@ func TestRewriteStableWebServiceNavigation(t *testing.T) {
 			t.Fatalf("reserved proxy-like resource path missing %q: %s", expected, body)
 		}
 	}
-	if actual := rewriteBrowserRouteURL("/admin?tab=users", prefix, target); actual != "/admin?__velin_web_service=service-id&amp;tab=users" && actual != "/admin?__velin_web_service=service-id&tab=users" {
+	if actual := rewriteBrowserRouteURL("/admin?tab=users", prefix, target); actual != "/admin?__velin_web_service=service-id&tab=users" {
 		t.Fatalf("browser route=%q", actual)
 	}
 }
@@ -131,6 +185,7 @@ func TestWebProxyBootstrapIncludesTargetMapping(t *testing.T) {
 	script := webProxyBootstrap("/web-proxy/token", target)
 	for _, expected := range []string{
 		`const targetHost="192.168.1.1"`,
+		`const targetPort="80"`,
 		`const targetPath="/admin"`,
 		`const serviceID=""`,
 		`function browserRoute(value)`,
@@ -141,6 +196,7 @@ func TestWebProxyBootstrapIncludesTargetMapping(t *testing.T) {
 		`navigator.sendBeacon=function`,
 		`Element.prototype.setAttribute=function`,
 		`window.open=function(url)`,
+		`function targetHostMatches(value)`,
 	} {
 		if !strings.Contains(script, expected) {
 			t.Errorf("bootstrap missing %q", expected)
@@ -215,6 +271,20 @@ func TestProxyCookieIsolation(t *testing.T) {
 	}
 }
 
+func TestProxyCookieJarRestoresCookiesForRootNavigation(t *testing.T) {
+	target, _ := url.Parse("http://music.internal")
+	session := &webProxySession{routePrefix: "/web-service-proxy/service-id", target: target, cookies: make(map[string]*http.Cookie)}
+	session.captureUpstreamCookies([]string{"VELIN_SID=session-value; Path=/; HttpOnly"})
+	request, _ := http.NewRequest(http.MethodGet, "https://velin.example/?__velin_web_service=service-id", nil)
+	if actual := session.upstreamCookieHeader(request); actual != "VELIN_SID=session-value" {
+		t.Fatalf("restored upstream cookie=%q", actual)
+	}
+	request.Header.Set("Cookie", "VELIN_SID=new-value")
+	if actual := session.upstreamCookieHeader(request); actual != "VELIN_SID=new-value" {
+		t.Fatalf("browser cookie should override jar=%q", actual)
+	}
+}
+
 func TestRewriteRequestOrigin(t *testing.T) {
 	target, _ := url.Parse("http://router.internal/admin")
 	request, _ := http.NewRequest(http.MethodGet, "http://velin.example/web-proxy/token/socket", nil)
@@ -269,6 +339,23 @@ func TestStableWebProxyPrefix(t *testing.T) {
 	session.rootProxy = true
 	if actual := session.prefix(); actual != "" {
 		t.Fatalf("root proxy prefix=%q", actual)
+	}
+}
+
+func TestServiceIDFromReferer(t *testing.T) {
+	request, _ := http.NewRequest(http.MethodGet, "https://velin.example/UI/Login", nil)
+	request.Host = "velin.example"
+	request.Header.Set("Referer", "https://velin.example/web-service-proxy/service-id/UI/Dashboard")
+	if actual := serviceIDFromReferer(request); actual != "service-id" {
+		t.Fatalf("service id from proxy referer=%q", actual)
+	}
+	request.Header.Set("Referer", "https://velin.example/?__velin_web_service=service-id")
+	if actual := serviceIDFromReferer(request); actual != "service-id" {
+		t.Fatalf("service id from marked referer=%q", actual)
+	}
+	request.Header.Set("Referer", "https://other.example/web-service-proxy/service-id/UI/Dashboard")
+	if actual := serviceIDFromReferer(request); actual != "" {
+		t.Fatalf("cross-origin referer leaked service id=%q", actual)
 	}
 }
 

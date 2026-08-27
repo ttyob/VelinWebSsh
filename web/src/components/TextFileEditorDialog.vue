@@ -11,6 +11,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { defaultKeymap, historyKeymap } from "@codemirror/commands";
 import { searchKeymap } from "@codemirror/search";
+import { editorTheme } from "../editorTheme";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { ApiError, api } from "../api";
 import type { Host } from "../types";
@@ -83,6 +84,7 @@ async function loadFile() {
           basicSetup,
           keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
           languageFor(props.file.name),
+          editorTheme,
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {

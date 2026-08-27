@@ -26,6 +26,12 @@ type Config struct {
 	DeploymentID  string
 	AdminUser     string
 	AdminPassword string
+	AIBaseURL     string
+	AIAPIKey      string
+	AIModel       string
+	CrushBinary   string
+	CrushDataDir  string
+	FFmpegBinary  string
 }
 
 func Load() (Config, error) {
@@ -56,6 +62,12 @@ func Load() (Config, error) {
 		DeploymentID:  deploymentID,
 		AdminUser:     env("VELIN_ADMIN_USER", "admin"),
 		AdminPassword: os.Getenv("VELIN_ADMIN_PASSWORD"),
+		AIBaseURL:     strings.TrimRight(env("VELIN_AI_BASE_URL", ""), "/"),
+		AIAPIKey:      strings.TrimSpace(os.Getenv("VELIN_AI_API_KEY")),
+		AIModel:       strings.TrimSpace(os.Getenv("VELIN_AI_MODEL")),
+		CrushBinary:   env("VELIN_CRUSH_BINARY", "/usr/local/bin/crush"),
+		CrushDataDir:  env("VELIN_CRUSH_DATA_DIR", filepath.Join(dataDir, "crush")),
+		FFmpegBinary:  env("VELIN_FFMPEG_BINARY", "ffmpeg"),
 	}, nil
 }
 

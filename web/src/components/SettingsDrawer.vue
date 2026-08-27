@@ -2,11 +2,13 @@
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
-  Bell,
+  Bot,
   Check,
   Code2,
   Database,
+  Download,
   HardDriveDownload,
+  FlaskConical,
   KeyRound,
   LockKeyhole,
   LogOut,
@@ -14,7 +16,9 @@ import {
   Network,
   Pencil,
   Plus,
-  ScrollText,
+  ListTodo,
+  RefreshCw,
+  Save,
   ServerCog,
   Shield,
   ShieldCheck,
@@ -25,6 +29,7 @@ import {
 import { api, json } from "../api";
 import { useAuthStore } from "../stores/auth";
 import type {
+  AIModelConfig,
   Host,
   Credential,
   LoginDevice,
@@ -35,6 +40,7 @@ import type {
 } from "../types";
 import ToolsDrawer from "./ToolsDrawer.vue";
 import CredentialsPanel from "./CredentialsPanel.vue";
+import TaskPanel from "./TaskPanel.vue";
 import {
   accentPresets,
   findInterfaceTheme,
@@ -57,7 +63,6 @@ const emit = defineEmits<{
   insert: [string];
   execute: [string];
   batchExecute: [string, string[]];
-  notificationOpen: [string];
   credentialSaved: [Credential];
   credentialDeleted: [string];
 }>();
@@ -65,8 +70,8 @@ const auth = useAuthStore();
 const tab = ref("terminal"),
   users = ref<User[]>([]),
   devices = ref<LoginDevice[]>([]),
-  audits = ref<any[]>([]),
-  stats = ref<any>({});
+  stats = ref<any>({}),
+  backups = ref<any[]>([]);
 const userDialogOpen = ref(false),
   userPasswordDialogOpen = ref(false),
   savingUser = ref(false),
@@ -104,23 +109,36 @@ const policy = ref<SecurityPolicy>({
   rememberDays: 7,
   forceChangeOnCreate: true,
 });
+const aiModel = ref<AIModelConfig>({
+  baseURL: "",
+  model: "",
+  apiKeyConfigured: false,
+  configured: false,
+});
+const aiModelForm = ref({
+  baseURL: "",
+  model: "",
+  apiKey: "",
+  clearAPIKey: false,
+});
+const savingAIModel = ref(false),
+  testingAIModel = ref(false);
 const terminalDefaults: Preferences = {
   theme: "dark",
-  accentColor: "#72c58f",
+  accentColor: "#5b8cff",
   terminalTheme: "velin",
   fontSize: 14,
   lineHeight: 1.25,
   fontWeight: 400,
   letterSpacing: 0,
-  foreground: "#d8ded9",
-  background: "#111416",
-  cursorColor: "#8fd6a7",
+  foreground: "#d8deea",
+  background: "#111318",
+  cursorColor: "#8eafff",
   cursorStyle: "block",
   cursorBlink: true,
   pasteGuard: true,
   visualBell: true,
   soundBell: false,
-  browserNotifications: false,
   lockEnabled: false,
   autoLockMinutes: 15,
   lockOnShortcut: true,
@@ -158,23 +176,30 @@ function formatDuration(seconds: number) {
 }
 
 async function load() {
-  const [loadedDevices, loadedAudits, loadedTOTP, lockPIN] = await Promise.all([
+  const [loadedDevices, loadedTOTP, lockPIN] = await Promise.all([
     api<LoginDevice[]>("/api/auth/devices"),
-    api<any[]>("/api/audit"),
     api<{ enabled: boolean; recoveryCodesRemaining: number }>("/api/auth/totp"),
     api<{ configured: boolean }>("/api/auth/lock-pin"),
   ]);
   devices.value = loadedDevices;
-  audits.value = loadedAudits;
   totp.value = loadedTOTP;
   lockPINConfigured.value = lockPIN.configured;
   if (!lockPIN.configured) props.preferences.lockEnabled = false;
+	if (auth.user?.role === "admin")
+		[users.value, stats.value, policy.value, aiModel.value, backups.value] = await Promise.all([
+			api<User[]>("/api/admin/users"),
+			api<any>("/api/admin/stats"),
+			api<SecurityPolicy>("/api/admin/security-policy"),
+			api<AIModelConfig>("/api/admin/ai-model"),
+			api<any[]>("/api/admin/backups"),
+		]);
   if (auth.user?.role === "admin")
-    [users.value, stats.value, policy.value] = await Promise.all([
-      api<User[]>("/api/admin/users"),
-      api<any>("/api/admin/stats"),
-      api<SecurityPolicy>("/api/admin/security-policy"),
-    ]);
+    aiModelForm.value = {
+      baseURL: aiModel.value.baseURL,
+      model: aiModel.value.model,
+      apiKey: "",
+      clearAPIKey: false,
+    };
 }
 function normalizePIN(value: string) {
   return value.replace(/\D/g, "").slice(0, 6);
@@ -316,15 +341,6 @@ watch(
       void persistPreferences(false);
   },
 );
-async function toggleBrowserNotifications(value: boolean) {
-  if (value && "Notification" in window) {
-    const permission = await Notification.requestPermission();
-    if (permission !== "granted") {
-      props.preferences.browserNotifications = false;
-      return ElMessage.warning("浏览器通知权限未授予");
-    }
-  }
-}
 async function revoke(id: string) {
   const device = devices.value.find((item) => item.id === id);
   await api(`/api/auth/devices/${id}`, { method: "DELETE" });
@@ -463,14 +479,68 @@ async function savePolicy() {
     ElMessage.error(e instanceof Error ? e.message : "保存失败");
   }
 }
+async function saveAIModel(showNotice = true) {
+  const form = aiModelForm.value;
+  if (Boolean(form.baseURL.trim()) !== Boolean(form.model.trim())) {
+    ElMessage.warning("API 地址和模型名称必须同时填写");
+    return false;
+  }
+  savingAIModel.value = true;
+  try {
+    aiModel.value = await api<AIModelConfig>("/api/admin/ai-model", {
+      method: "PUT",
+      body: json(form),
+    });
+    aiModelForm.value = {
+      baseURL: aiModel.value.baseURL,
+      model: aiModel.value.model,
+      apiKey: "",
+      clearAPIKey: false,
+    };
+    if (showNotice) ElMessage.success("AI 模型配置已保存并生效");
+    return true;
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "模型配置保存失败");
+    return false;
+  } finally {
+    savingAIModel.value = false;
+  }
+}
+async function testAIModel() {
+  if (!(await saveAIModel(false))) return;
+  testingAIModel.value = true;
+  try {
+    const result = await api<{ model: string; message: string }>(
+      "/api/admin/ai-model/test",
+      { method: "POST" },
+    );
+    ElMessage.success(`连接正常 · ${result.model}`);
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "模型连接测试失败");
+  } finally {
+    testingAIModel.value = false;
+  }
+}
 async function backup() {
   const result = await api<{ file: string; sha256: string; verified: boolean }>(
     "/api/admin/backup",
     { method: "POST" },
   );
-  ElMessage.success(
-    `备份已创建并通过完整性验证：${result.file} · ${result.sha256.slice(0, 12)}…`,
-  );
+	ElMessage.success(
+		`备份已创建并通过完整性验证：${result.file} · ${result.sha256.slice(0, 12)}…`,
+	);
+	backups.value = await api<any[]>("/api/admin/backups");
+}
+function downloadBackup(file: string) {
+	const link = document.createElement("a"); link.href = `/api/admin/backups/${encodeURIComponent(file)}/download`; link.click();
+}
+async function restoreBackup(file: string) {
+	try {
+		await ElMessageBox.confirm(`恢复后当前数据库会被替换，现有登录会话会失效。系统会先自动创建恢复前备份。确认恢复“${file}”？`, "恢复数据库", { type: "warning", confirmButtonText: "确认恢复", cancelButtonText: "取消" });
+		await api(`/api/admin/backups/${encodeURIComponent(file)}/restore`, { method: "POST" });
+		ElMessage.success("恢复完成，请重新登录");
+		emit("logout");
+	} catch (error: any) { if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof Error ? error.message : "恢复失败"); }
 }
 async function changePassword() {
   const p = passwordForm.value;
@@ -614,9 +684,6 @@ function forwardBatch(text: string, sessionIDs: string[]) {
         >
           <KeyRound :size="17" /><span>凭据管理</span>
         </button>
-        <button :class="{ active: tab === 'audit' }" @click="tab = 'audit'">
-          <ScrollText :size="17" /><span>审计记录</span>
-        </button>
         <button
           v-if="auth.user?.role === 'admin'"
           :class="{ active: tab === 'users' }"
@@ -630,6 +697,13 @@ function forwardBatch(text: string, sessionIDs: string[]) {
           @click="tab = 'admin'"
         >
           <ServerCog :size="17" /><span>系统管理</span>
+        </button>
+        <button
+          v-if="auth.user?.role === 'admin'"
+          :class="{ active: tab === 'ai' }"
+          @click="tab = 'ai'"
+        >
+          <Bot :size="17" /><span>AI 模型</span>
         </button>
         <span class="settings-menu-divider">工具</span>
         <button
@@ -647,11 +721,8 @@ function forwardBatch(text: string, sessionIDs: string[]) {
         <button :class="{ active: tab === 'data' }" @click="tab = 'data'">
           <Database :size="17" /><span>数据</span>
         </button>
-        <button
-          :class="{ active: tab === 'notifications' }"
-          @click="tab = 'notifications'"
-        >
-          <Bell :size="17" /><span>通知</span>
+        <button :class="{ active: tab === 'tasks' }" @click="tab = 'tasks'">
+          <ListTodo :size="17" /><span>任务队列</span>
         </button>
       </nav>
       <section
@@ -660,9 +731,9 @@ function forwardBatch(text: string, sessionIDs: string[]) {
           'has-detail-tabs': [
             'terminal',
             'devices',
-            'audit',
             'users',
             'admin',
+            'ai',
           ].includes(tab),
         }"
       >
@@ -672,9 +743,10 @@ function forwardBatch(text: string, sessionIDs: string[]) {
           @saved="emit('credentialSaved', $event)"
           @deleted="emit('credentialDeleted', $event)"
         />
+        <TaskPanel v-if="tab === 'tasks'" :sessions="sessions" />
         <el-tabs
           v-if="
-            ['terminal', 'devices', 'audit', 'users', 'admin'].includes(tab)
+            ['terminal', 'devices', 'users', 'admin', 'ai'].includes(tab)
           "
           v-model="tab"
           class="settings-tabs settings-detail-tabs"
@@ -840,13 +912,6 @@ function forwardBatch(text: string, sessionIDs: string[]) {
               <div class="setting-row">
                 <span>声音响铃</span
                 ><el-switch v-model="preferences.soundBell" />
-              </div>
-              <div class="setting-row">
-                <span>浏览器通知</span
-                ><el-switch
-                  v-model="preferences.browserNotifications"
-                  @change="toggleBrowserNotifications"
-                />
               </div>
               <div class="setting-row">
                 <span>多行粘贴保护</span
@@ -1052,20 +1117,6 @@ function forwardBatch(text: string, sessionIDs: string[]) {
               >
             </div>
           </el-tab-pane>
-          <el-tab-pane label="审计" name="audit"
-            ><div class="list-stack">
-              <div v-for="a in audits" :key="a.id" class="data-row">
-                <div>
-                  <strong>{{ a.event_type }}</strong
-                  ><small
-                    >{{ a.resource_type }} {{ a.resource_id }} ·
-                    {{ new Date(a.created_at).toLocaleString() }}</small
-                  >
-                </div>
-                <span class="muted">{{ a.ip }}</span>
-              </div>
-            </div></el-tab-pane
-          >
           <el-tab-pane
             v-if="auth.user?.role === 'admin'"
             label="用户"
@@ -1149,7 +1200,7 @@ function forwardBatch(text: string, sessionIDs: string[]) {
               </div>
               <div>
                 <strong>{{ formatBytes(stats.databaseBytes || 0) }}</strong
-                ><span>数据库 · {{ stats.auditEvents || 0 }} 条审计</span>
+                ><span>数据库</span>
               </div>
               <div>
                 <strong>{{ stats.backups || 0 }}</strong
@@ -1207,20 +1258,85 @@ function forwardBatch(text: string, sessionIDs: string[]) {
                 >保存安全策略</el-button
               >
             </div>
-            <el-button :icon="HardDriveDownload" @click="backup"
-              >创建数据库备份</el-button
-            >
+            <div class="backup-tools">
+              <el-button :icon="HardDriveDownload" @click="backup">创建数据库备份</el-button>
+              <div v-for="item in backups" :key="item.file" class="data-row backup-row">
+                <div><strong>{{ item.file }}</strong><small>{{ formatBytes(item.size) }} · {{ new Date(item.createdAt).toLocaleString() }} · {{ item.sha256?.slice(0, 12) }}</small></div>
+                <div class="row-actions"><el-button text :icon="Download" @click="downloadBackup(item.file)">下载</el-button><el-button text type="warning" :icon="RefreshCw" @click="restoreBackup(item.file)">恢复</el-button></div>
+              </div>
+            </div>
+          </el-tab-pane>
+          <el-tab-pane
+            v-if="auth.user?.role === 'admin'"
+            label="AI 模型"
+            name="ai"
+          >
+            <div class="settings-section ai-model-section">
+              <div class="security-heading">
+                <div>
+                  <h3>Agent 模型服务</h3>
+                  <p>兼容 Chat Completions 工具调用的模型接口。</p>
+                </div>
+                <span class="security-state" :class="{ enabled: aiModel.configured }">
+                  {{ aiModel.configured ? "已启用" : "未配置" }}
+                </span>
+              </div>
+              <el-form label-position="top" class="ai-model-form">
+                <el-form-item label="API 地址">
+                  <el-input
+                    v-model="aiModelForm.baseURL"
+                    placeholder="https://api.example.com/v1"
+                    clearable
+                  />
+                </el-form-item>
+                <el-form-item label="模型名称">
+                  <el-input
+                    v-model="aiModelForm.model"
+                    placeholder="输入模型标识"
+                    clearable
+                  />
+                </el-form-item>
+                <el-form-item label="API Key">
+                  <el-input
+                    v-model="aiModelForm.apiKey"
+                    type="password"
+                    show-password
+                    autocomplete="new-password"
+                    :disabled="aiModelForm.clearAPIKey"
+                    :placeholder="aiModel.apiKeyConfigured ? '已配置，留空保持不变' : '输入 API Key（可选）'"
+                  />
+                </el-form-item>
+                <el-checkbox
+                  v-if="aiModel.apiKeyConfigured"
+                  v-model="aiModelForm.clearAPIKey"
+                >清除已保存的 API Key</el-checkbox>
+              </el-form>
+              <div class="row-actions ai-model-actions">
+                <el-button
+                  :icon="FlaskConical"
+                  :loading="testingAIModel"
+                  :disabled="savingAIModel"
+                  @click="testAIModel"
+                >测试连接</el-button>
+                <el-button
+                  type="primary"
+                  :icon="Save"
+                  :loading="savingAIModel"
+                  :disabled="testingAIModel"
+                  @click="saveAIModel()"
+                >保存配置</el-button>
+              </div>
+            </div>
           </el-tab-pane>
         </el-tabs>
         <ToolsDrawer
-          v-if="['snippets', 'forwards', 'data', 'notifications'].includes(tab)"
+          v-if="['snippets', 'forwards', 'data'].includes(tab)"
           :section="tab"
           :hosts="hosts"
           :sessions="sessions"
           @insert="emit('insert', $event)"
           @execute="emit('execute', $event)"
           @batch-execute="forwardBatch"
-          @notification-open="emit('notificationOpen', $event)"
         />
       </section>
     </div>

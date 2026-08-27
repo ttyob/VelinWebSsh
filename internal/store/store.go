@@ -31,9 +31,12 @@ type Host struct {
 	Address           string     `json:"address"`
 	Username          string     `json:"username"`
 	GroupName         string     `json:"groupName"`
+	SortOrder         int        `json:"sortOrder"`
 	Tags              string     `json:"tags"`
 	Notes             string     `json:"notes"`
 	CredentialID      string     `json:"credentialID"`
+	PasswordEnc       string     `json:"-"`
+	HasPassword       bool       `json:"hasPassword"`
 	Port              int        `json:"port"`
 	InitialDir        string     `json:"initialDirectory"`
 	ConnectTimeout    int        `json:"connectTimeout"`
@@ -86,15 +89,6 @@ type Snippet struct {
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
-type Notification struct {
-	ID        string    `json:"id"`
-	UserID    string    `json:"userID"`
-	SessionID string    `json:"sessionID"`
-	Title     string    `json:"title"`
-	Kind      string    `json:"kind"`
-	Read      bool      `json:"read"`
-	CreatedAt time.Time `json:"createdAt"`
-}
 type PortForward struct {
 	ID            string    `json:"id"`
 	UserID        string    `json:"userID"`
@@ -126,6 +120,31 @@ type WebService struct {
 	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
+type CommandTask struct {
+	ID         string     `json:"id"`
+	UserID     string     `json:"userID"`
+	Command    string     `json:"command"`
+	SessionIDs []string   `json:"sessionIDs"`
+	Status     string     `json:"status"`
+	Output     string     `json:"output,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	StartedAt  *time.Time `json:"startedAt,omitempty"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+}
+
+type TerminalRecording struct {
+	ID          string     `json:"id"`
+	UserID      string     `json:"userID"`
+	SessionID   string     `json:"sessionID"`
+	SessionName string     `json:"sessionName"`
+	Path        string     `json:"-"`
+	Status      string     `json:"status"`
+	Bytes       int64      `json:"bytes"`
+	StartedAt   time.Time  `json:"startedAt"`
+	FinishedAt  *time.Time `json:"finishedAt,omitempty"`
+}
+
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -145,7 +164,7 @@ CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UN
 CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_auth_token ON auth_sessions(token_hash);
 CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, secret_enc TEXT NOT NULL, passphrase_enc TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, group_name TEXT NOT NULL DEFAULT '', tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', session_mode TEXT NOT NULL DEFAULT 'tmux', jump_host_id TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, password_enc TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', session_mode TEXT NOT NULL DEFAULT 'tmux', jump_host_id TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_hosts_user ON hosts(user_id, name);
 CREATE TABLE IF NOT EXISTS known_host_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, fingerprint TEXT NOT NULL, public_key TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,address,port));
 CREATE TABLE IF NOT EXISTS terminal_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, credential_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, remote_user TEXT NOT NULL, session_mode TEXT NOT NULL DEFAULT 'tmux', tmux_socket TEXT NOT NULL, tmux_name TEXT NOT NULL, owner_marker TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -164,6 +183,12 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 	CREATE TABLE IF NOT EXISTS user_totp (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, secret_enc TEXT NOT NULL, recovery_hashes TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 	CREATE TABLE IF NOT EXISTS web_services (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE, name TEXT NOT NULL, proxy_mode TEXT NOT NULL DEFAULT 'path', listen_port INTEGER NOT NULL DEFAULT 0, target_url TEXT NOT NULL, upstream_host TEXT NOT NULL DEFAULT '', skip_tls_verify INTEGER NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 	CREATE INDEX IF NOT EXISTS idx_web_services_user ON web_services(user_id,name);
+	CREATE TABLE IF NOT EXISTS host_monitor_policies (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL REFERENCES hosts(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 0, interval_seconds INTEGER NOT NULL DEFAULT 30, cpu_threshold REAL NOT NULL DEFAULT 90, memory_threshold REAL NOT NULL DEFAULT 90, disk_threshold REAL NOT NULL DEFAULT 90, cooldown_seconds INTEGER NOT NULL DEFAULT 900, last_alert_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,host_id));
+	CREATE INDEX IF NOT EXISTS idx_monitor_policy_user ON host_monitor_policies(user_id,host_id);
+	CREATE TABLE IF NOT EXISTS command_tasks (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, command TEXT NOT NULL, session_ids TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL DEFAULT 'queued', output TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, started_at DATETIME, finished_at DATETIME);
+	CREATE INDEX IF NOT EXISTS idx_command_tasks_user ON command_tasks(user_id,created_at DESC);
+	CREATE TABLE IF NOT EXISTS terminal_recordings (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, session_id TEXT NOT NULL, session_name TEXT NOT NULL DEFAULT '', path TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'recording', bytes INTEGER NOT NULL DEFAULT 0, started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at DATETIME);
+	CREATE INDEX IF NOT EXISTS idx_recordings_user ON terminal_recordings(user_id,started_at DESC);
 	CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 `)
 	if err != nil {
@@ -172,7 +197,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 	columns := []struct{ name, definition string }{
 		{"initial_directory", "TEXT NOT NULL DEFAULT ''"}, {"connect_timeout", "INTEGER NOT NULL DEFAULT 12"},
 		{"keepalive_interval", "INTEGER NOT NULL DEFAULT 30"}, {"max_retries", "INTEGER NOT NULL DEFAULT 5"},
-		{"terminal_type", "TEXT NOT NULL DEFAULT 'xterm-256color'"}, {"last_status", "TEXT NOT NULL DEFAULT ''"},
+		{"terminal_type", "TEXT NOT NULL DEFAULT 'xterm-256color'"}, {"password_enc", "TEXT NOT NULL DEFAULT ''"}, {"sort_order", "INTEGER NOT NULL DEFAULT 0"}, {"last_status", "TEXT NOT NULL DEFAULT ''"},
 		{"session_mode", "TEXT NOT NULL DEFAULT 'tmux'"},
 		{"jump_host_id", "TEXT NOT NULL DEFAULT ''"},
 		{"platform", "TEXT NOT NULL DEFAULT ''"},
@@ -211,7 +236,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 	if err = s.ensureColumn("terminal_sessions", "session_mode", "TEXT NOT NULL DEFAULT 'tmux'"); err != nil {
 		return err
 	}
-	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12); PRAGMA user_version=12;`)
+	_, err = s.DB.Exec(`INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13); PRAGMA user_version=13;`)
 	return err
 }
 
@@ -420,19 +445,20 @@ func (s *Store) SaveSystemSetting(key string, value any) error {
 	return err
 }
 
-const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id,platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
+const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),COALESCE(password_enc,''),group_name,COALESCE(sort_order,0),tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id,platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
 
 func scanHost(row interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var connected sql.NullTime
-	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.GroupName, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.SessionMode, &h.JumpHostID, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
+	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.PasswordEnc, &h.GroupName, &h.SortOrder, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.SessionMode, &h.JumpHostID, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
+	h.HasPassword = h.PasswordEnc != ""
 	if connected.Valid {
 		h.LastConnectedAt = &connected.Time
 	}
 	return h, err
 }
 func (s *Store) Hosts(userID string) ([]Host, error) {
-	rows, err := s.DB.Query(`SELECT `+hostCols+` FROM hosts WHERE user_id=? ORDER BY COALESCE(last_connected_at,created_at) DESC,name`, userID)
+	rows, err := s.DB.Query(`SELECT `+hostCols+` FROM hosts WHERE user_id=? ORDER BY sort_order,name`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -454,8 +480,40 @@ func (s *Store) SaveHost(h Host) error {
 	if h.SessionMode == "" {
 		h.SessionMode = "tmux"
 	}
-	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,group_name,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,group_name=excluded.group_name,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,session_mode=excluded.session_mode,jump_host_id=excluded.jump_host_id,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.GroupName, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType, h.SessionMode, h.JumpHostID)
+	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,password_enc,group_name,sort_order,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,password_enc=excluded.password_enc,group_name=excluded.group_name,sort_order=excluded.sort_order,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,session_mode=excluded.session_mode,jump_host_id=excluded.jump_host_id,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.PasswordEnc, h.GroupName, h.SortOrder, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType, h.SessionMode, h.JumpHostID)
 	return err
+}
+
+type HostOrder struct {
+	ID        string
+	GroupName string
+	SortOrder int
+}
+
+func (s *Store) ReorderHosts(userID string, items []HostOrder) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item.ID == "" {
+			return sql.ErrNoRows
+		}
+		if _, ok := seen[item.ID]; ok {
+			return errors.New("duplicate host in reorder request")
+		}
+		seen[item.ID] = struct{}{}
+		var owner string
+		if err = tx.QueryRow(`SELECT user_id FROM hosts WHERE id=?`, item.ID).Scan(&owner); err != nil || owner != userID {
+			return sql.ErrNoRows
+		}
+		if _, err = tx.Exec(`UPDATE hosts SET group_name=?,sort_order=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, item.GroupName, item.SortOrder, userID, item.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 func (s *Store) UpdateHostConnection(userID, id, status string, latency int) error {
 	_, err := s.DB.Exec(`UPDATE hosts SET last_status=?,last_latency_ms=?,last_connected_at=CASE WHEN ?='online' THEN CURRENT_TIMESTAMP ELSE last_connected_at END,updated_at=CURRENT_TIMESTAMP WHERE user_id=? AND id=?`, status, latency, status, userID, id)
@@ -738,30 +796,6 @@ func (s *Store) DeleteSnippet(userID, id string) error {
 	_, err := s.DB.Exec(`DELETE FROM snippets WHERE user_id=? AND id=?`, userID, id)
 	return err
 }
-func (s *Store) Notifications(userID string) ([]Notification, error) {
-	rows, err := s.DB.Query(`SELECT id,user_id,session_id,title,kind,read,created_at FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 200`, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []Notification
-	for rows.Next() {
-		var value Notification
-		if err = rows.Scan(&value.ID, &value.UserID, &value.SessionID, &value.Title, &value.Kind, &value.Read, &value.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, value)
-	}
-	return out, rows.Err()
-}
-func (s *Store) SaveNotification(value Notification) error {
-	_, err := s.DB.Exec(`INSERT INTO notifications(id,user_id,session_id,title,kind)VALUES(?,?,?,?,?)`, value.ID, value.UserID, value.SessionID, value.Title, value.Kind)
-	return err
-}
-func (s *Store) ReadNotifications(userID string) error {
-	_, err := s.DB.Exec(`UPDATE notifications SET read=1 WHERE user_id=?`, userID)
-	return err
-}
 
 const forwardCols = `id,user_id,host_id,name,kind,listen_address,listen_port,target_host,target_port,status,last_error,bytes_in,bytes_out,created_at,updated_at`
 
@@ -861,6 +895,105 @@ func (s *Store) DeleteWebService(userID, id string) error {
 	}
 	return nil
 }
+
+func (s *Store) CommandTasks(userID string) ([]CommandTask, error) {
+	rows, err := s.DB.Query(`SELECT id,command,session_ids,status,output,error,created_at,started_at,finished_at FROM command_tasks WHERE user_id=? ORDER BY created_at DESC LIMIT 100`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]CommandTask, 0)
+	for rows.Next() {
+		var value CommandTask
+		var raw string
+		var started, finished sql.NullTime
+		if err := rows.Scan(&value.ID, &value.Command, &raw, &value.Status, &value.Output, &value.Error, &value.CreatedAt, &started, &finished); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(raw), &value.SessionIDs)
+		if started.Valid {
+			value.StartedAt = &started.Time
+		}
+		if finished.Valid {
+			value.FinishedAt = &finished.Time
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) CommandTask(userID, id string) (CommandTask, error) {
+	var value CommandTask
+	var raw string
+	var started, finished sql.NullTime
+	err := s.DB.QueryRow(`SELECT id,command,session_ids,status,output,error,created_at,started_at,finished_at FROM command_tasks WHERE user_id=? AND id=?`, userID, id).Scan(&value.ID, &value.Command, &raw, &value.Status, &value.Output, &value.Error, &value.CreatedAt, &started, &finished)
+	if err != nil {
+		return value, err
+	}
+	_ = json.Unmarshal([]byte(raw), &value.SessionIDs)
+	if started.Valid {
+		value.StartedAt = &started.Time
+	}
+	if finished.Valid {
+		value.FinishedAt = &finished.Time
+	}
+	return value, nil
+}
+
+func (s *Store) CreateCommandTask(value CommandTask) error {
+	raw, err := json.Marshal(value.SessionIDs)
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.Exec(`INSERT INTO command_tasks(id,user_id,command,session_ids,status) VALUES(?,?,?,?,?)`, value.ID, value.UserID, value.Command, string(raw), "queued")
+	return err
+}
+
+func (s *Store) UpdateCommandTask(userID, id, status, output, message string, started, finished *time.Time) error {
+	_, err := s.DB.Exec(`UPDATE command_tasks SET status=?,output=?,error=?,started_at=?,finished_at=? WHERE user_id=? AND id=?`, status, output, message, started, finished, userID, id)
+	return err
+}
+
+func (s *Store) CreateRecording(value TerminalRecording) error {
+	_, err := s.DB.Exec(`INSERT INTO terminal_recordings(id,user_id,session_id,session_name,path,status,bytes,started_at) VALUES(?,?,?,?,?,?,?,?)`, value.ID, value.UserID, value.SessionID, value.SessionName, value.Path, value.Status, value.Bytes, value.StartedAt)
+	return err
+}
+
+func (s *Store) Recording(userID, id string) (TerminalRecording, error) {
+	var value TerminalRecording
+	var finished sql.NullTime
+	err := s.DB.QueryRow(`SELECT id,user_id,session_id,session_name,path,status,bytes,started_at,finished_at FROM terminal_recordings WHERE user_id=? AND id=?`, userID, id).Scan(&value.ID, &value.UserID, &value.SessionID, &value.SessionName, &value.Path, &value.Status, &value.Bytes, &value.StartedAt, &finished)
+	if finished.Valid {
+		value.FinishedAt = &finished.Time
+	}
+	return value, err
+}
+
+func (s *Store) Recordings(userID string) ([]TerminalRecording, error) {
+	rows, err := s.DB.Query(`SELECT id,user_id,session_id,session_name,path,status,bytes,started_at,finished_at FROM terminal_recordings WHERE user_id=? ORDER BY started_at DESC LIMIT 100`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]TerminalRecording, 0)
+	for rows.Next() {
+		var value TerminalRecording
+		var finished sql.NullTime
+		if err := rows.Scan(&value.ID, &value.UserID, &value.SessionID, &value.SessionName, &value.Path, &value.Status, &value.Bytes, &value.StartedAt, &finished); err != nil {
+			return nil, err
+		}
+		if finished.Valid {
+			value.FinishedAt = &finished.Time
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) FinishRecording(userID, id, status string, bytes int64, finished time.Time) error {
+	_, err := s.DB.Exec(`UPDATE terminal_recordings SET status=?,bytes=?,finished_at=? WHERE user_id=? AND id=?`, status, bytes, finished, userID, id)
+	return err
+}
 func (s *Store) TOTP(userID string) (secret string, recovery []string, enabled bool, err error) {
 	var raw string
 	err = s.DB.QueryRow(`SELECT secret_enc,recovery_hashes,enabled FROM user_totp WHERE user_id=?`, userID).Scan(&secret, &raw, &enabled)
@@ -881,10 +1014,6 @@ func (s *Store) DeleteTOTP(userID string) error {
 	_, err := s.DB.Exec(`DELETE FROM user_totp WHERE user_id=?`, userID)
 	return err
 }
-func (s *Store) Audit(userID, event, resourceType, resourceID, ip string, details any) {
-	raw, _ := json.Marshal(details)
-	_, _ = s.DB.ExecContext(context.Background(), `INSERT INTO audit_events(user_id,event_type,resource_type,resource_id,ip,details)VALUES(?,?,?,?,?,?)`, userID, event, resourceType, resourceID, ip, string(raw))
-}
 func (s *Store) KnownHost(userID, address string, port int) (string, string, error) {
 	var fp, key string
 	err := s.DB.QueryRow(`SELECT fingerprint,public_key FROM known_host_keys WHERE user_id=? AND address=? AND port=?`, userID, address, port).Scan(&fp, &key)
@@ -897,6 +1026,118 @@ func (s *Store) TrustHost(userID, address string, port int, fp, key string) erro
 func (s *Store) Backup(ctx context.Context, path string) error {
 	_, err := s.DB.ExecContext(ctx, `VACUUM INTO ?`, path)
 	return err
+}
+
+func quoteSQLiteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+// Restore copies the compatible tables from a verified backup into the open
+// database connection. Keeping the connection open avoids invalidating all
+// API dependencies that reference Store, while the transaction keeps the
+// restore atomic from other requests.
+func (s *Store) Restore(ctx context.Context, path string) error {
+	if _, err := s.DB.ExecContext(ctx, `ATTACH DATABASE ? AS velin_restore`, path); err != nil {
+		return err
+	}
+	defer s.DB.Exec(`DETACH DATABASE velin_restore`)
+	if _, err := s.DB.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		return err
+	}
+	defer s.DB.Exec(`PRAGMA foreign_keys=ON`)
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		return err
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		tables = append(tables, name)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, table := range tables {
+		var exists string
+		if err = tx.QueryRow(`SELECT name FROM velin_restore.sqlite_master WHERE type='table' AND name=?`, table).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return err
+		}
+		mainColumns, err := tableColumns(tx, "main", table)
+		if err != nil {
+			return err
+		}
+		restoreColumns, err := tableColumns(tx, "velin_restore", table)
+		if err != nil {
+			return err
+		}
+		available := make(map[string]bool, len(restoreColumns))
+		for _, column := range restoreColumns {
+			available[column] = true
+		}
+		columns := make([]string, 0, len(mainColumns))
+		for _, column := range mainColumns {
+			if available[column] {
+				columns = append(columns, column)
+			}
+		}
+		if len(columns) == 0 {
+			continue
+		}
+		qTable := quoteSQLiteIdentifier(table)
+		if _, err = tx.Exec(`DELETE FROM main.` + qTable); err != nil {
+			return err
+		}
+		quoted := make([]string, len(columns))
+		for i, column := range columns {
+			quoted[i] = quoteSQLiteIdentifier(column)
+		}
+		list := strings.Join(quoted, ",")
+		if _, err = tx.Exec(`INSERT INTO main.` + qTable + ` (` + list + `) SELECT ` + list + ` FROM velin_restore.` + qTable); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(`DELETE FROM main.auth_sessions`); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return s.migrate()
+}
+
+func tableColumns(tx *sql.Tx, schema, table string) ([]string, error) {
+	rows, err := tx.Query(`PRAGMA ` + schema + `.table_info(` + quoteSQLiteIdentifier(table) + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		columns = append(columns, name)
+	}
+	return columns, rows.Err()
 }
 func VerifyBackup(path string) error {
 	db, err := sql.Open("sqlite", path+"?mode=ro")
@@ -915,7 +1156,7 @@ func VerifyBackup(path string) error {
 	if err = db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version < 1 || version > 12 {
+	if version < 1 || version > 13 {
 		return fmt.Errorf("unsupported database version %d", version)
 	}
 	requiredTables := []string{"users", "hosts", "workspaces", "terminal_sessions"}

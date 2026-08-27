@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/pquerna/otp/totp"
+	"velin-webssh/internal/agent"
 	"velin-webssh/internal/config"
 	"velin-webssh/internal/forward"
 	"velin-webssh/internal/security"
@@ -44,6 +47,7 @@ type API struct {
 	vault      *security.Vault
 	terminals  *terminal.Manager
 	forwards   *forward.Manager
+	agents     *agent.Manager
 	webProxies *webProxyManager
 	started    time.Time
 	requests   atomic.Int64
@@ -56,6 +60,7 @@ type API struct {
 	http4xx    atomic.Uint64
 	http5xx    atomic.Uint64
 	wsTotal    atomic.Uint64
+	taskQueue  chan commandTaskRequest
 }
 
 type contextKey string
@@ -80,9 +85,11 @@ func (a *API) securityPolicy() securityPolicy {
 	return policy
 }
 
-func New(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Manager, forwards *forward.Manager) *API {
-	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, webProxies: newWebProxyManager(t, cfg.HostPortAddr), started: time.Now()}
+func New(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Manager, forwards *forward.Manager, agents *agent.Manager) *API {
+	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, agents: agents, webProxies: newWebProxyManager(t, cfg.HostPortAddr), started: time.Now(), taskQueue: make(chan commandTaskRequest, 100)}
+	a.restoreAIModelConfig()
 	a.restoreHostPortWebServices()
+	go a.commandTaskWorker()
 	return a
 }
 
@@ -117,9 +124,20 @@ func (a *API) Router() http.Handler {
 		r.Get("/api/hosts", a.hosts)
 		r.Post("/api/hosts", a.saveHost)
 		r.Post("/api/hosts/batch", a.batchHosts)
+		r.Post("/api/hosts/reorder", a.reorderHosts)
 		r.Put("/api/hosts/{id}", a.saveHost)
 		r.Post("/api/hosts/{id}/test", a.testHost)
 		r.Get("/api/hosts/{id}/sessions", a.hostSessions)
+		r.Get("/api/hosts/{id}/agent", a.agentStatus)
+		r.Post("/api/hosts/{id}/agent/connect", a.connectAgent)
+		r.Get("/api/hosts/{id}/agent/snapshot", a.agentSnapshot)
+		r.Get("/api/hosts/{id}/agent/processes", a.agentProcesses)
+		r.Get("/api/agent/models", a.agentModels)
+		r.Get("/api/agent/backends", a.agentBackends)
+		r.Post("/api/hosts/{id}/agent/chat", a.agentChat)
+		r.Post("/api/hosts/{id}/agent/command", a.agentCommand)
+		r.Post("/api/hosts/{id}/docker/login", a.dockerLogin)
+		r.Delete("/api/hosts/{id}/agent", a.disconnectAgent)
 		r.Delete("/api/hosts/{id}", a.deleteHost)
 		r.Get("/api/credentials", a.credentials)
 		r.Post("/api/credentials", a.saveCredential)
@@ -128,8 +146,12 @@ func (a *API) Router() http.Handler {
 		r.Post("/api/sessions", a.createSession)
 		r.Post("/api/sessions/{id}/restore", a.restoreSession)
 		r.Get("/api/sessions/{id}/directory", a.sessionDirectory)
+		r.Get("/api/sessions/{id}/foreground", a.sessionForeground)
 		r.Patch("/api/sessions/{id}", a.updateSession)
 		r.Delete("/api/sessions/{id}", a.terminateSession)
+		r.Get("/api/tasks", a.tasks)
+		r.Post("/api/tasks", a.createTask)
+		r.Get("/api/tasks/{id}", a.task)
 		r.Get("/api/workspace", a.workspace)
 		r.Put("/api/workspace", a.saveWorkspace)
 		r.Get("/api/preferences", a.preferences)
@@ -140,14 +162,12 @@ func (a *API) Router() http.Handler {
 		r.Post("/api/snippets", a.saveSnippet)
 		r.Put("/api/snippets/{id}", a.saveSnippet)
 		r.Delete("/api/snippets/{id}", a.deleteSnippet)
-		r.Get("/api/notifications", a.notifications)
-		r.Post("/api/notifications", a.createNotification)
-		r.Post("/api/notifications/read", a.readNotifications)
 		r.Get("/api/sftp/{hostID}/list", a.sftpList)
 		r.Get("/api/sftp/{hostID}/download", a.sftpDownload)
 		r.Get("/api/sftp/{hostID}/text", a.sftpReadText)
 		r.Put("/api/sftp/{hostID}/text", a.sftpWriteText)
 		r.Put("/api/sftp/{hostID}/upload", a.sftpUpload)
+		r.Get("/api/sftp/{hostID}/transfer-status", a.sftpTransferStatus)
 		r.Post("/api/sftp/{hostID}/mkdir", a.sftpMkdir)
 		r.Post("/api/sftp/{hostID}/rename", a.sftpRename)
 		r.Post("/api/sftp/{hostID}/delete", a.sftpDelete)
@@ -168,7 +188,11 @@ func (a *API) Router() http.Handler {
 		r.Handle("/web-proxy/{token}/*", http.HandlerFunc(a.serveWebProxy))
 		r.Handle("/web-service-proxy/{serviceID}", http.HandlerFunc(a.serveStableWebProxy))
 		r.Handle("/web-service-proxy/{serviceID}/*", http.HandlerFunc(a.serveStableWebProxy))
-		r.Get("/api/audit", a.audit)
+		r.Get("/api/recordings", a.recordings)
+		r.Post("/api/sessions/{id}/recording", a.startRecording)
+		r.Delete("/api/sessions/{id}/recording", a.stopRecording)
+		r.Post("/api/recordings/{id}/upload", a.uploadRecording)
+		r.Get("/api/recordings/{id}/download", a.downloadRecording)
 		r.Group(func(r chi.Router) {
 			r.Use(a.adminOnly)
 			r.Get("/api/admin/users", a.users)
@@ -177,10 +201,15 @@ func (a *API) Router() http.Handler {
 			r.Delete("/api/admin/users/{id}", a.deleteUser)
 			r.Get("/api/admin/security-policy", a.getSecurityPolicy)
 			r.Put("/api/admin/security-policy", a.saveSecurityPolicy)
+			r.Get("/api/admin/ai-model", a.getAIModelConfig)
+			r.Put("/api/admin/ai-model", a.saveAIModelConfig)
+			r.Post("/api/admin/ai-model/test", a.testAIModelConfig)
 			r.Get("/api/admin/stats", a.stats)
 			r.Get("/api/admin/metrics", a.metrics)
 			r.Post("/api/admin/backup", a.backup)
 			r.Get("/api/admin/backups", a.backups)
+			r.Get("/api/admin/backups/{file}/download", a.downloadBackup)
+			r.Post("/api/admin/backups/{file}/restore", a.restoreBackup)
 		})
 	})
 	r.Get("/ws/sessions/{id}", a.terminalWS)
@@ -232,6 +261,12 @@ func (a *API) csrfProtection(next http.Handler) http.Handler {
 		}
 		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
 			writeError(w, http.StatusForbidden, "cross_site_rejected", "不允许跨站写请求")
+			return
+		}
+		cookie, cookieErr := r.Cookie(csrfCookieName)
+		header := strings.TrimSpace(r.Header.Get("X-CSRF-Token"))
+		if cookieErr != nil || header == "" || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(header)) != 1 {
+			writeError(w, http.StatusForbidden, "csrf_rejected", "安全令牌无效，请刷新页面重试")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -411,7 +446,6 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	u, hash, err := a.store.UserByUsername(identity)
 	if err != nil || u.Disabled || !security.VerifyPassword(hash, in.Password) {
 		_ = a.store.RecordLoginFailure(identity, ip, policy.LoginFailureThreshold, policy.LockMinutes)
-		a.store.Audit(u.ID, "login_failed", "user", u.ID, ip, nil)
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
@@ -429,7 +463,6 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 500, "database_error", "无法消费恢复码，请重试")
 				return
 			}
-			a.store.Audit(u.ID, "totp_recovery_used", "user", u.ID, ip, map[string]int{"remaining": len(remaining)})
 		}
 		if !valid {
 			_ = a.store.RecordLoginFailure(identity, ip, policy.LoginFailureThreshold, policy.LockMinutes)
@@ -453,7 +486,6 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: token, Path: "/", HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: int(ttl.Seconds())})
-	a.store.Audit(u.ID, "login", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]any{"user": u})
 }
 func (a *API) logout(w http.ResponseWriter, r *http.Request) {
@@ -483,7 +515,6 @@ func (a *API) lockSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "lock_failed", "无法锁定当前工作区")
 		return
 	}
-	a.store.Audit(u.ID, "workspace_locked", "auth_session", "current", ipOf(r), map[string]string{"reason": reason})
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *API) unlockSession(w http.ResponseWriter, r *http.Request) {
@@ -504,7 +535,6 @@ func (a *API) unlockSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validLockPIN(in.PIN) || !security.VerifyPassword(hash, in.PIN) {
 		_ = a.store.RecordAuthSessionUnlockFailure(tokenHash)
-		a.store.Audit(u.ID, "workspace_unlock_failed", "auth_session", "current", ipOf(r), nil)
 		writeError(w, http.StatusUnauthorized, "invalid_lock_pin", "锁屏 PIN 错误")
 		return
 	}
@@ -512,7 +542,6 @@ func (a *API) unlockSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "unlock_failed", "无法解锁当前工作区")
 		return
 	}
-	a.store.Audit(u.ID, "workspace_unlocked", "auth_session", "current", ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func validLockPIN(pin string) bool {
@@ -553,7 +582,6 @@ func (a *API) setLockPIN(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "lock_pin_save_failed", "无法保存锁屏 PIN")
 		return
 	}
-	a.store.Audit(u.ID, "workspace_lock_pin_changed", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"configured": true})
 }
 func (a *API) disableLockPIN(w http.ResponseWriter, r *http.Request) {
@@ -562,7 +590,6 @@ func (a *API) disableLockPIN(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "lock_pin_disable_failed", "无法关闭锁屏")
 		return
 	}
-	a.store.Audit(u.ID, "workspace_lock_disabled", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"configured": false})
 }
 func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
@@ -585,7 +612,6 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "password_change_failed", "当前密码错误")
 		return
 	}
-	a.store.Audit(u.ID, "password_changed", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *API) totpStatus(w http.ResponseWriter, r *http.Request) {
@@ -653,7 +679,6 @@ func (a *API) enableTOTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", "启用 TOTP 失败")
 		return
 	}
-	a.store.Audit(u.ID, "totp_enabled", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]any{"enabled": true, "recoveryCodes": codes})
 }
 func (a *API) disableTOTP(w http.ResponseWriter, r *http.Request) {
@@ -681,7 +706,6 @@ func (a *API) disableTOTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", "关闭双因素认证失败")
 		return
 	}
-	a.store.Audit(u.ID, "totp_disabled", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func verifySecondFactor(secret string, recoveryHashes []string, code string) (valid bool, remaining []string, recoveryUsed bool) {
@@ -729,7 +753,6 @@ func (a *API) revokeAllDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Path: "/", MaxAge: -1, HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
-	a.store.Audit(u.ID, "all_devices_revoked", "user", u.ID, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *API) deleteDevice(w http.ResponseWriter, r *http.Request) {
@@ -749,6 +772,49 @@ func (a *API) hosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, nonNil(out))
+}
+
+func (a *API) reorderHosts(w http.ResponseWriter, r *http.Request) {
+	u := currentUser(r)
+	var in struct {
+		Items []struct {
+			ID        string `json:"id"`
+			GroupName string `json:"groupName"`
+			SortOrder int    `json:"sortOrder"`
+		} `json:"items"`
+	}
+	if !decode(w, r, &in) {
+		return
+	}
+	if len(in.Items) == 0 || len(in.Items) > 10000 {
+		writeError(w, 400, "invalid_host_order", "排序主机数量无效")
+		return
+	}
+	items := make([]store.HostOrder, 0, len(in.Items))
+	seen := make(map[string]struct{}, len(in.Items))
+	for _, item := range in.Items {
+		item.ID = strings.TrimSpace(item.ID)
+		item.GroupName = normalizeHostGroup(item.GroupName)
+		if item.ID == "" || item.SortOrder < 0 || len([]rune(item.GroupName)) > 1024 {
+			writeError(w, 400, "invalid_host_order", "主机排序参数无效")
+			return
+		}
+		if _, ok := seen[item.ID]; ok {
+			writeError(w, 400, "invalid_host_order", "排序请求包含重复主机")
+			return
+		}
+		seen[item.ID] = struct{}{}
+		items = append(items, store.HostOrder{ID: item.ID, GroupName: item.GroupName, SortOrder: item.SortOrder})
+	}
+	if err := a.store.ReorderHosts(u.ID, items); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, 404, "host_not_found", "主机不存在")
+		} else {
+			writeError(w, 500, "database_error", err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func normalizeHostGroup(value string) string {
 	parts := strings.Split(value, "/")
@@ -778,8 +844,8 @@ func (a *API) validateJumpHost(userID, targetID, jumpHostID string) error {
 		if err != nil {
 			return err
 		}
-		if jumpHost.CredentialID == "" {
-			return fmt.Errorf("跳板机“%s”需要绑定已保存的凭据", jumpHost.Name)
+		if jumpHost.CredentialID == "" && !jumpHost.HasPassword {
+			return fmt.Errorf("跳板机“%s”需要保存主机密码或绑定已保存的凭据", jumpHost.Name)
 		}
 		jumpHostID = jumpHost.JumpHostID
 	}
@@ -836,7 +902,6 @@ func (a *API) batchHosts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	a.store.Audit(u.ID, "hosts_batch_"+in.Action, "host", strings.Join(in.IDs, ","), ipOf(r), map[string]any{"count": len(in.IDs)})
 	writeJSON(w, 200, map[string]any{"ok": true, "count": len(in.IDs)})
 }
 func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
@@ -844,6 +909,7 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		store.Host
 		Password string `json:"password"`
+		AuthMode string `json:"authMode"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -893,37 +959,60 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_jump_host", err.Error())
 		return
 	}
-	createdCredentialID := ""
-	if in.Password != "" {
-		enc, err := a.vault.Encrypt(in.Password)
-		if err != nil {
-			writeError(w, 500, "encryption_error", "密码加密失败")
+	existingPassword := ""
+	if h.ID != "" {
+		if existing, err := a.store.Host(u.ID, h.ID); err == nil {
+			existingPassword = existing.PasswordEnc
+		}
+	}
+	authMode := strings.TrimSpace(in.AuthMode)
+	if authMode == "" {
+		switch {
+		case in.Password != "":
+			authMode = "password"
+		case h.CredentialID != "":
+			authMode = "credential"
+		default:
+			authMode = "prompt"
+		}
+	}
+	switch authMode {
+	case "password":
+		if in.Password != "" {
+			enc, err := a.vault.Encrypt(in.Password)
+			if err != nil {
+				writeError(w, 500, "encryption_error", "密码加密失败")
+				return
+			}
+			h.PasswordEnc = enc
+		} else if existingPassword != "" {
+			h.PasswordEnc = existingPassword
+		} else {
+			writeError(w, 400, "invalid_password", "请填写 SSH 密码")
 			return
 		}
-		createdCredentialID = uuid.NewString()
-		credential := store.Credential{
-			ID: createdCredentialID, UserID: u.ID,
-			Name: "主机密码 · " + h.Name, Kind: "password", Secret: enc,
-		}
-		if err = a.store.SaveCredential(credential); err != nil {
-			writeError(w, 500, "database_error", "密码保存失败")
+		h.CredentialID = ""
+	case "credential":
+		h.PasswordEnc = ""
+		if h.CredentialID == "" {
+			writeError(w, 400, "invalid_credential", "请选择凭据")
 			return
 		}
-		h.CredentialID = createdCredentialID
-	} else if h.CredentialID != "" {
 		if _, err := a.store.Credential(u.ID, h.CredentialID); err != nil {
 			writeError(w, 400, "invalid_credential", "凭据不存在")
 			return
 		}
+	case "prompt":
+		h.CredentialID = ""
+		h.PasswordEnc = ""
+	default:
+		writeError(w, 400, "invalid_auth_mode", "不支持的认证方式")
+		return
 	}
 	if err := a.store.SaveHost(h); err != nil {
-		if createdCredentialID != "" {
-			_ = a.store.DeleteCredential(u.ID, createdCredentialID)
-		}
 		writeError(w, 500, "database_error", err.Error())
 		return
 	}
-	a.store.Audit(u.ID, "host_saved", "host", h.ID, ipOf(r), map[string]any{"name": h.Name})
 	saved, _ := a.store.Host(u.ID, h.ID)
 	writeJSON(w, 200, saved)
 }
@@ -971,7 +1060,6 @@ func (a *API) testHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = a.store.UpdateHostConnection(u.ID, host.ID, "online", int(result.LatencyMS))
-	a.store.Audit(u.ID, "host_tested", "host", host.ID, ipOf(r), result)
 	writeJSON(w, 200, result)
 }
 func connectionErrorCode(err error) string {
@@ -1005,13 +1093,13 @@ func (a *API) deleteHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "host_in_use", err.Error())
 		return
 	}
+	a.agents.Disconnect(u.ID, id)
 	for _, service := range services {
 		if service.HostID == id {
 			a.webProxies.deleteStable(u.ID, service.ID)
 			a.webProxies.deleteHostPort(service.ID)
 		}
 	}
-	a.store.Audit(u.ID, "host_deleted", "host", id, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -1054,7 +1142,6 @@ func (a *API) saveCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", err.Error())
 		return
 	}
-	a.store.Audit(u.ID, "credential_saved", "credential", c.ID, ipOf(r), map[string]string{"kind": c.Kind})
 	saved, _ := a.store.Credential(u.ID, c.ID)
 	saved.Secret = ""
 	saved.Passphrase = ""
@@ -1067,7 +1154,6 @@ func (a *API) deleteCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "credential_in_use", err.Error())
 		return
 	}
-	a.store.Audit(u.ID, "credential_deleted", "credential", id, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -1109,7 +1195,6 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 502, connectionErrorCode(err), err.Error())
 		return
 	}
-	a.store.Audit(u.ID, "session_created", "terminal", meta.ID, ipOf(r), map[string]string{"host_id": host.ID})
 	writeJSON(w, 201, meta)
 }
 func (a *API) sessions(w http.ResponseWriter, r *http.Request) {
@@ -1133,6 +1218,20 @@ func (a *API) sessionDirectory(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]string{"path": directory})
 }
+
+func (a *API) sessionForeground(w http.ResponseWriter, r *http.Request) {
+	session, err := a.terminals.Get(currentUser(r).ID, chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, 404, "session_not_attached", "终端当前未连接")
+		return
+	}
+	command, err := session.ForegroundCommand()
+	if err != nil {
+		writeError(w, 502, "foreground_unavailable", "无法读取终端当前进程")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"command": command})
+}
 func (a *API) updateSession(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	var in struct{ Name string }
@@ -1149,7 +1248,6 @@ func (a *API) updateSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "session_not_found", "会话不存在")
 		return
 	}
-	a.store.Audit(u.ID, "session_renamed", "terminal", id, ipOf(r), nil)
 	updated, _ := a.store.Terminal(u.ID, id)
 	writeJSON(w, 200, updated)
 }
@@ -1186,7 +1284,6 @@ func (a *API) terminateSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 502, "terminate_failed", err.Error())
 		return
 	}
-	a.store.Audit(u.ID, "session_terminated", "terminal", id, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
@@ -1258,7 +1355,6 @@ func (a *API) exportData(w http.ResponseWriter, r *http.Request) {
 		webServices[i].UserID = ""
 	}
 	w.Header().Set("Content-Disposition", `attachment; filename="velin-export.json"`)
-	a.store.Audit(u.ID, "data_exported", "user", u.ID, ipOf(r), map[string]int{"hosts": len(hosts), "snippets": len(snippets), "webServices": len(webServices)})
 	writeJSON(w, 200, map[string]any{"format": "velin-export", "version": 1, "exportedAt": time.Now().UTC(), "hosts": hosts, "preferences": preferences, "snippets": snippets, "webServices": webServices})
 }
 
@@ -1363,7 +1459,6 @@ func (a *API) importOpenSSH(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if in.Commit {
-		a.store.Audit(u.ID, "openssh_imported", "host", "", ipOf(r), map[string]int{"created": created})
 	}
 	writeJSON(w, 200, map[string]any{"hosts": preview, "created": created})
 }
@@ -1408,40 +1503,6 @@ func (a *API) deleteSnippet(w http.ResponseWriter, r *http.Request) {
 	_ = a.store.DeleteSnippet(currentUser(r).ID, chi.URLParam(r, "id"))
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
-func (a *API) notifications(w http.ResponseWriter, r *http.Request) {
-	out, err := a.store.Notifications(currentUser(r).ID)
-	if err != nil {
-		writeError(w, 500, "database_error", "加载通知失败")
-		return
-	}
-	writeJSON(w, 200, nonNil(out))
-}
-func (a *API) createNotification(w http.ResponseWriter, r *http.Request) {
-	u := currentUser(r)
-	var in struct{ SessionID, Kind string }
-	if !decode(w, r, &in) {
-		return
-	}
-	session, err := a.store.Terminal(u.ID, in.SessionID)
-	if err != nil {
-		writeError(w, 404, "session_not_found", "会话不存在")
-		return
-	}
-	kind := in.Kind
-	if kind != "bell" && kind != "quiet" {
-		kind = "info"
-	}
-	value := store.Notification{ID: uuid.NewString(), UserID: u.ID, SessionID: session.ID, Title: session.Name, Kind: kind}
-	if err = a.store.SaveNotification(value); err != nil {
-		writeError(w, 500, "database_error", "创建通知失败")
-		return
-	}
-	writeJSON(w, 201, value)
-}
-func (a *API) readNotifications(w http.ResponseWriter, r *http.Request) {
-	_ = a.store.ReadNotifications(currentUser(r).ID)
-	writeJSON(w, 200, map[string]bool{"ok": true})
-}
 func (a *API) portForwards(w http.ResponseWriter, r *http.Request) {
 	out, err := a.forwards.List(currentUser(r).ID)
 	if err != nil {
@@ -1472,7 +1533,6 @@ func (a *API) startPortForward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 502, "forward_start_failed", err.Error())
 		return
 	}
-	a.store.Audit(u.ID, "forward_started", "forward", id, ipOf(r), nil)
 	value, _ := a.store.PortForward(u.ID, id)
 	writeJSON(w, 200, value)
 }
@@ -1483,7 +1543,6 @@ func (a *API) stopPortForward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "forward_not_found", "转发不存在")
 		return
 	}
-	a.store.Audit(u.ID, "forward_stopped", "forward", id, ipOf(r), nil)
 	value, _ := a.store.PortForward(u.ID, id)
 	writeJSON(w, 200, value)
 }
@@ -1494,34 +1553,7 @@ func (a *API) deletePortForward(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "forward_not_found", "转发不存在")
 		return
 	}
-	a.store.Audit(u.ID, "forward_deleted", "forward", id, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
-}
-
-func (a *API) audit(w http.ResponseWriter, r *http.Request) {
-	u := currentUser(r)
-	query := `SELECT id,event_type,resource_type,resource_id,ip,details,created_at FROM audit_events WHERE user_id=?`
-	args := []any{u.ID}
-	if u.Role == "admin" && r.URL.Query().Get("all") == "true" {
-		query = `SELECT id,event_type,resource_type,resource_id,ip,details,created_at FROM audit_events`
-		args = nil
-	}
-	query += ` ORDER BY id DESC LIMIT 200`
-	rows, err := a.store.DB.Query(query, args...)
-	if err != nil {
-		writeError(w, 500, "database_error", err.Error())
-		return
-	}
-	defer rows.Close()
-	var out []map[string]any
-	for rows.Next() {
-		var id int64
-		var event, rt, rid, ip, details string
-		var at time.Time
-		_ = rows.Scan(&id, &event, &rt, &rid, &ip, &details, &at)
-		out = append(out, map[string]any{"id": id, "event_type": event, "resource_type": rt, "resource_id": rid, "ip": ip, "details": json.RawMessage(details), "created_at": at})
-	}
-	writeJSON(w, 200, nonNil(out))
 }
 
 func (a *API) users(w http.ResponseWriter, r *http.Request) {
@@ -1565,7 +1597,6 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 	if policy.ForceChangeOnCreate {
 		_, _ = a.store.DB.Exec(`UPDATE users SET force_password_change=1 WHERE id=?`, id)
 	}
-	a.store.Audit(currentUser(r).ID, "user_created", "user", id, ipOf(r), map[string]string{"username": in.Username})
 	u, _ := a.store.UserByID(id)
 	writeJSON(w, 201, u)
 }
@@ -1661,7 +1692,6 @@ func (a *API) updateUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", "更新用户失败")
 		return
 	}
-	a.store.Audit(actor.ID, "user_updated", "user", id, ipOf(r), nil)
 	u, err := a.store.UserByID(id)
 	if err != nil {
 		writeError(w, 404, "not_found", "用户不存在")
@@ -1692,7 +1722,6 @@ func (a *API) deleteUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "not_found", "用户不存在")
 		return
 	}
-	a.store.Audit(actor.ID, "user_deleted", "user", id, ipOf(r), nil)
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *API) getSecurityPolicy(w http.ResponseWriter, r *http.Request) {
@@ -1711,16 +1740,14 @@ func (a *API) saveSecurityPolicy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "database_error", "保存安全策略失败")
 		return
 	}
-	a.store.Audit(currentUser(r).ID, "security_policy_changed", "system", "security_policy", ipOf(r), policy)
 	writeJSON(w, 200, policy)
 }
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
-	var users, activeUsers, hosts, sessions, audits int
+	var users, activeUsers, hosts, sessions int
 	_ = a.store.DB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users)
 	_ = a.store.DB.QueryRow(`SELECT COUNT(DISTINCT user_id) FROM auth_sessions WHERE expires_at>CURRENT_TIMESTAMP`).Scan(&activeUsers)
 	_ = a.store.DB.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&hosts)
 	_ = a.store.DB.QueryRow(`SELECT COUNT(*) FROM terminal_sessions WHERE status NOT IN ('ended')`).Scan(&sessions)
-	_ = a.store.DB.QueryRow(`SELECT COUNT(*) FROM audit_events`).Scan(&audits)
 	var dbSize int64
 	if info, err := os.Stat(a.cfg.DatabasePath); err == nil {
 		dbSize = info.Size()
@@ -1732,7 +1759,7 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 			latestBackup = info.ModTime().Format(time.RFC3339)
 		}
 	}
-	writeJSON(w, 200, map[string]any{"users": users, "activeUsers": activeUsers, "hosts": hosts, "sessions": sessions, "websockets": a.websockets.Load(), "httpRequests": a.requests.Load(), "databaseBytes": dbSize, "auditEvents": audits, "backups": len(entries), "latestBackupAt": latestBackup, "uptimeSeconds": int(time.Since(a.started).Seconds()), "deploymentID": a.cfg.DeploymentID, "goVersion": runtime.Version()})
+	writeJSON(w, 200, map[string]any{"users": users, "activeUsers": activeUsers, "hosts": hosts, "sessions": sessions, "websockets": a.websockets.Load(), "httpRequests": a.requests.Load(), "databaseBytes": dbSize, "backups": len(entries), "latestBackupAt": latestBackup, "uptimeSeconds": int(time.Since(a.started).Seconds()), "deploymentID": a.cfg.DeploymentID, "goVersion": runtime.Version()})
 }
 func (a *API) backup(w http.ResponseWriter, r *http.Request) {
 	name := "velin-" + time.Now().UTC().Format("20060102-150405") + ".db"
@@ -1762,8 +1789,7 @@ func (a *API) backup(w http.ResponseWriter, r *http.Request) {
 			_ = os.Remove(old + ".sha256")
 		}
 	}
-	a.store.Audit(currentUser(r).ID, "backup_created", "system", name, ipOf(r), nil)
-	writeJSON(w, 201, map[string]any{"file": name, "sha256": checksum, "verified": true, "schemaVersion": 6})
+	writeJSON(w, 201, map[string]any{"file": name, "sha256": checksum, "verified": true, "schemaVersion": 13})
 }
 func (a *API) backups(w http.ResponseWriter, r *http.Request) {
 	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db"))
@@ -1830,6 +1856,28 @@ func (a *API) metrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "# TYPE velin_web_proxy_sessions gauge\nvelin_web_proxy_sessions %d\n", a.webProxies.activeCount())
 }
 
+type terminalWSMessage struct {
+	Type, Data, Requester  string
+	Foreground, Background string
+	Rows, Cols             int
+	Position, HistorySize  int
+	Sequence               uint64
+	Approved               bool
+}
+
+func forwardTerminalEventDuringReplay(writeJSON func(any) error, ev terminal.Event, pendingOutput *[]terminal.Event) error {
+	if ev.Type != "output" {
+		return writeJSON(ev)
+	}
+	previewEvent := ev
+	previewEvent.Type = "replay_live"
+	if err := writeJSON(previewEvent); err != nil {
+		return err
+	}
+	*pendingOutput = append(*pendingOutput, ev)
+	return nil
+}
+
 func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 	u, tokenHash, err := a.currentAuthSession(r)
 	if err != nil || u.Disabled {
@@ -1855,63 +1903,139 @@ func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 	a.wsTotal.Add(1)
 	defer a.websockets.Add(-1)
 	defer conn.Close()
+	conn.SetReadLimit(128 * 1024)
+	var writeMu sync.Mutex
+	writeJSON := func(value any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(value)
+	}
 	clientID := uuid.NewString()
-	events, history, truncated := s.Subscribe(clientID)
+	reconnectKey := r.URL.Query().Get("reconnect")
+	if _, parseErr := uuid.Parse(reconnectKey); parseErr != nil {
+		reconnectKey = ""
+	}
+	resumeStreamID := r.URL.Query().Get("stream")
+	resumeOffset, _ := strconv.ParseUint(r.URL.Query().Get("offset"), 10, 64)
+	events, subscriptionDone, replay := s.Subscribe(clientID, resumeStreamID, resumeOffset, reconnectKey)
 	defer s.Unsubscribe(clientID)
 	controller := ""
 	if s.IsController(clientID) {
 		controller = clientID
 	}
-	_ = conn.WriteJSON(terminal.Event{Type: "hello", ClientID: clientID, Controller: controller, Data: base64.StdEncoding.EncodeToString(history), Truncated: truncated})
+	meta := s.Meta()
+	if err = writeJSON(terminal.Event{Type: "hello", ClientID: clientID, Controller: controller, Status: meta.Status, Message: meta.LastError, Truncated: replay.Truncated, StreamID: replay.StreamID, Offset: replay.Offset, HistorySize: s.CachedHistorySize()}); err != nil {
+		return
+	}
+	go func() {
+		size := s.HistorySize()
+		_ = writeJSON(terminal.Event{Type: "history_state", HistorySize: size, Position: size})
+	}()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		defer conn.Close()
 		lockTicker := time.NewTicker(time.Second)
 		defer lockTicker.Stop()
+		pendingOutput := make([]terminal.Event, 0, 16)
+		forwardDuringReplay := func(ev terminal.Event) bool {
+			return forwardTerminalEventDuringReplay(writeJSON, ev, &pendingOutput) == nil
+		}
+		drainReplayEvents := func(limit int) bool {
+			for count := 0; limit < 0 || count < limit; count++ {
+				select {
+				case ev := <-events:
+					if !forwardDuringReplay(ev) {
+						return false
+					}
+				case <-subscriptionDone:
+					return false
+				case <-lockTicker.C:
+					locked, lockErr := a.store.AuthSessionLocked(tokenHash)
+					if lockErr != nil || locked {
+						return false
+					}
+				default:
+					return true
+				}
+			}
+			return true
+		}
+		fullReplay := resumeStreamID == "" || resumeStreamID != replay.StreamID || replay.Truncated
+		if fullReplay {
+			if preview := s.Snapshot(200); len(preview) > 0 {
+				if writeJSON(terminal.Event{Type: "replay_preview", Data: base64.StdEncoding.EncodeToString(preview)}) != nil {
+					return
+				}
+			}
+		}
+		for index, segment := range replay.Segments {
+			if writeJSON(terminal.Event{Type: "replay", Data: base64.StdEncoding.EncodeToString(segment), ReplayFinal: index+1 == len(replay.Segments)}) != nil {
+				return
+			}
+			if !drainReplayEvents(16) {
+				return
+			}
+		}
+		if len(replay.Segments) == 0 {
+			if writeJSON(terminal.Event{Type: "replay_end"}) != nil {
+				return
+			}
+		}
+		if !drainReplayEvents(-1) {
+			return
+		}
+		for _, ev := range pendingOutput {
+			if writeJSON(ev) != nil {
+				return
+			}
+		}
 		for {
 			select {
 			case ev, ok := <-events:
-				if !ok || conn.WriteJSON(ev) != nil {
+				if !ok || writeJSON(ev) != nil {
 					return
 				}
+			case <-subscriptionDone:
+				return
 			case <-lockTicker.C:
 				locked, lockErr := a.store.AuthSessionLocked(tokenHash)
 				if lockErr != nil || locked {
-					_ = conn.Close()
 					return
 				}
 			}
 		}
 	}()
-	conn.SetReadLimit(128 * 1024)
-	for {
-		var msg struct {
-			Type, Data, Requester  string
-			Foreground, Background string
-			Rows, Cols             int
-			Approved               bool
+	handleMessage := func(msg terminalWSMessage) {
+		position := msg.Position
+		if position == 0 && msg.Rows != 0 {
+			position = msg.Rows
 		}
-		if err = conn.ReadJSON(&msg); err != nil {
-			return
-		}
-		if locked, lockErr := a.store.AuthSessionLocked(tokenHash); lockErr != nil || locked {
-			return
+		historySize := msg.HistorySize
+		if historySize == 0 && msg.Cols != 0 {
+			historySize = msg.Cols
 		}
 		switch msg.Type {
 		case "input":
-			raw, e := base64.StdEncoding.DecodeString(msg.Data)
-			if e == nil {
+			raw, decodeErr := base64.StdEncoding.DecodeString(msg.Data)
+			if decodeErr == nil {
 				_ = s.Write(clientID, raw)
 			}
 		case "resize":
 			_ = s.Resize(clientID, msg.Rows, msg.Cols)
+		case "scroll_history":
+			_ = s.ScrollHistory(clientID, msg.Rows)
+		case "scroll_history_to":
+			s.QueueHistoryPosition(clientID, position, historySize, msg.Sequence)
+		case "history_state":
+			go s.SendHistoryState(clientID)
 		case "terminal_theme":
 			_ = s.SetTerminalColors(clientID, msg.Foreground, msg.Background)
 		case "request_control":
 			if s.RequestControl(clientID) {
-				_ = conn.WriteJSON(terminal.Event{Type: "control_granted", Controller: clientID})
+				_ = writeJSON(terminal.Event{Type: "control_granted", Controller: clientID})
 			} else {
-				_ = conn.WriteJSON(terminal.Event{Type: "control_pending"})
+				_ = writeJSON(terminal.Event{Type: "control_pending"})
 			}
 		case "control_response":
 			s.RespondControl(clientID, msg.Requester, msg.Approved)
@@ -1919,7 +2043,18 @@ func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 			s.ReleaseControl(clientID)
 		case "ping":
 			s.TouchControl(clientID)
+			_ = writeJSON(terminal.Event{Type: "pong"})
 		}
+	}
+	for {
+		var msg terminalWSMessage
+		if err = conn.ReadJSON(&msg); err != nil {
+			return
+		}
+		if locked, lockErr := a.store.AuthSessionLocked(tokenHash); lockErr != nil || locked {
+			return
+		}
+		handleMessage(msg)
 		select {
 		case <-done:
 			return

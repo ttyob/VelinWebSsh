@@ -265,7 +265,6 @@ func (a *API) sftpWriteText(w http.ResponseWriter, r *http.Request) {
 	}
 	cleanup = false
 	version := editableTextVersion(content)
-	a.store.Audit(currentUser(r).ID, "sftp_text_saved", "host", chi.URLParam(r, "hostID"), ipOf(r), map[string]any{"path": remotePath, "bytes": len(content)})
 	writeJSON(w, 200, map[string]any{"path": remotePath, "version": version, "bytes": len(content)})
 }
 
@@ -281,8 +280,19 @@ func (a *API) sftpUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_path", "请指定远程文件路径")
 		return
 	}
-	if r.URL.Query().Get("overwrite") != "true" {
-		if _, statErr := client.Lstat(remotePath); statErr == nil {
+	offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+	if offset < 0 {
+		writeError(w, 400, "invalid_offset", "上传偏移量无效")
+		return
+	}
+	existing, statErr := client.Lstat(remotePath)
+	if offset > 0 {
+		if statErr != nil || existing.IsDir() || existing.Size() != offset {
+			writeJSONStatus(w, 409, map[string]any{"code": "upload_offset_conflict", "message": "远程文件大小与上传偏移不一致", "offset": existingSize(existing, statErr)})
+			return
+		}
+	} else if r.URL.Query().Get("overwrite") != "true" {
+		if statErr == nil {
 			writeError(w, 409, "file_exists", "远程文件已存在")
 			return
 		}
@@ -291,19 +301,60 @@ func (a *API) sftpUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 413, "file_too_large", "文件超过 2 GiB 上限")
 		return
 	}
-	file, err := client.OpenFile(remotePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	flags := os.O_WRONLY | os.O_CREATE
+	if offset == 0 {
+		flags |= os.O_TRUNC
+	}
+	file, err := client.OpenFile(remotePath, flags)
 	if err != nil {
 		writeError(w, 502, "sftp_open_failed", err.Error())
 		return
 	}
 	defer file.Close()
+	if offset > 0 {
+		if _, err = file.Seek(offset, io.SeekStart); err != nil {
+			writeError(w, 502, "sftp_seek_failed", err.Error())
+			return
+		}
+	}
 	written, err := io.Copy(file, http.MaxBytesReader(w, r.Body, 2<<30))
 	if err != nil {
 		_ = client.Remove(remotePath)
 		writeError(w, 502, "sftp_upload_failed", err.Error())
 		return
 	}
-	writeJSON(w, 201, map[string]any{"path": remotePath, "bytes": written})
+	writeJSON(w, 201, map[string]any{"path": remotePath, "bytes": written, "offset": offset + written})
+}
+
+func existingSize(info os.FileInfo, err error) int64 {
+	if err != nil || info == nil {
+		return 0
+	}
+	return info.Size()
+}
+
+func (a *API) sftpTransferStatus(w http.ResponseWriter, r *http.Request) {
+	client, err := a.openSFTP(r)
+	if err != nil {
+		writeError(w, 502, "sftp_connection_failed", err.Error())
+		return
+	}
+	defer client.Close()
+	remotePath, pathErr := writableRemotePath(r.URL.Query().Get("path"))
+	if pathErr != nil {
+		writeError(w, 400, "invalid_path", "请指定远程文件路径")
+		return
+	}
+	info, err := client.Lstat(remotePath)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"path": remotePath, "size": int64(0), "exists": false})
+		return
+	}
+	if info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		writeError(w, 400, "invalid_transfer_target", "目标不是普通文件")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"path": remotePath, "size": info.Size(), "exists": true})
 }
 
 func (a *API) sftpMkdir(w http.ResponseWriter, r *http.Request) {

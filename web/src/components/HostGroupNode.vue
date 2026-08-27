@@ -19,6 +19,9 @@ export interface HostTreeGroup {
   hosts: Host[];
   children: HostTreeGroup[];
 }
+export type HostDropTarget =
+  | { kind: "host"; groupPath: string; hostID: string; after: boolean }
+  | { kind: "group"; groupPath: string };
 
 const props = defineProps<{
   group: HostTreeGroup;
@@ -27,6 +30,8 @@ const props = defineProps<{
   selected: Set<string>;
   collapsed: Set<string>;
   testing?: string;
+  draggingHostID?: string;
+  dropTarget?: HostDropTarget | null;
 }>();
 const emit = defineEmits<{
   connect: [Host];
@@ -37,6 +42,10 @@ const emit = defineEmits<{
   delete: [Host];
   toggleSelection: [string, boolean];
   toggleGroup: [string];
+  dragStart: [Host];
+  dragEnd: [];
+  dragOver: [HostDropTarget];
+  drop: [HostDropTarget];
 }>();
 
 const count = computed(() => countHosts(props.group));
@@ -80,7 +89,7 @@ function distributionBadge(value?: string) {
   return (
     distributionBadges[id] || {
       label: id || "Linux",
-      color: "#6fba82",
+      color: "#6f9cff",
     }
   );
 }
@@ -107,27 +116,101 @@ function countHosts(group: HostTreeGroup): number {
 function forwardSelection(id: string, value: boolean) {
   emit("toggleSelection", id, value);
 }
+function openHostMenu(event: MouseEvent) {
+  if (props.selecting) return;
+  const row = event.currentTarget;
+  if (row instanceof HTMLElement)
+    row.querySelector<HTMLButtonElement>(".row-menu")?.click();
+}
+function dragStart(event: DragEvent, host: Host) {
+  if (props.selecting) return;
+  event.dataTransfer?.setData("text/plain", host.id);
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+  emit("dragStart", host);
+}
+function dragOverHost(event: DragEvent, host: Host) {
+  event.preventDefault();
+  event.stopPropagation();
+  const row = event.currentTarget;
+  const after =
+    row instanceof HTMLElement &&
+    event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
+  emit("dragOver", {
+    kind: "host",
+    groupPath: props.group.path,
+    hostID: host.id,
+    after,
+  });
+}
+function dragOverGroup(event: DragEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  emit("dragOver", { kind: "group", groupPath: props.group.path });
+}
+function emitDrop(event: DragEvent, target: HostDropTarget) {
+  event.preventDefault();
+  event.stopPropagation();
+  emit("drop", target);
+}
+function dropHost(event: DragEvent, host: Host) {
+  const row = event.currentTarget;
+  const after =
+    row instanceof HTMLElement &&
+    event.clientY > row.getBoundingClientRect().top + row.offsetHeight / 2;
+  emitDrop(event, {
+    kind: "host",
+    groupPath: props.group.path,
+    hostID: host.id,
+    after,
+  });
+}
 </script>
 
 <template>
   <section class="host-tree-group" :style="{ '--host-group-depth': depth }">
     <button
       class="host-group-heading"
-      :class="{ collapsed: collapsed.has(group.path) }"
       :title="group.path"
+      @dragover="dragOverGroup"
+      @drop="emitDrop($event, { kind: 'group', groupPath: group.path })"
+      :class="{
+        collapsed: collapsed.has(group.path),
+        'drop-target':
+          dropTarget?.kind === 'group' && dropTarget.groupPath === group.path,
+      }"
       @click="emit('toggleGroup', group.path)"
     >
       <ChevronRight :size="14" />
       <span>{{ group.name }}</span>
       <small>{{ count }}</small>
     </button>
-    <div v-show="!collapsed.has(group.path)" class="host-group-content">
+    <div
+      v-show="!collapsed.has(group.path)"
+      class="host-group-content"
+      :class="{
+        'drop-target':
+          dropTarget?.kind === 'group' && dropTarget.groupPath === group.path,
+      }"
+      @dragover="dragOverGroup"
+      @drop="emitDrop($event, { kind: 'group', groupPath: group.path })"
+    >
       <article
         v-for="host in group.hosts"
         :key="host.id"
         class="host-row"
-        :class="{ selected: selected.has(host.id) }"
+        :class="{
+          selected: selected.has(host.id),
+          dragging: draggingHostID === host.id,
+          'drop-target':
+            dropTarget?.kind === 'host' && dropTarget.hostID === host.id,
+        }"
+        :draggable="!selecting"
+        @dragstart="dragStart($event, host)"
+        @dragend="emit('dragEnd')"
+        @dragover="dragOverHost($event, host)"
+        @drop="dropHost($event, host)"
         @dblclick="!selecting && emit('connect', host)"
+        @contextmenu.prevent="openHostMenu"
       >
         <el-checkbox
           v-if="selecting"
@@ -175,7 +258,9 @@ function forwardSelection(id: string, value: boolean) {
           <strong>{{ host.name }}</strong>
         </div>
         <span v-if="!selecting" class="host-row-actions"
-          ><el-dropdown trigger="click" @click.stop
+          ><el-dropdown
+            trigger="click"
+            @click.stop
             ><button class="icon-btn row-menu">
               <MoreHorizontal :size="16" /></button
             ><template #dropdown
@@ -213,6 +298,8 @@ function forwardSelection(id: string, value: boolean) {
         :selected="selected"
         :collapsed="collapsed"
         :testing="testing"
+        :dragging-host-id="draggingHostID"
+        :drop-target="dropTarget"
         @connect="emit('connect', $event)"
         @web="emit('web', $event)"
         @test="emit('test', $event)"
@@ -221,6 +308,10 @@ function forwardSelection(id: string, value: boolean) {
         @delete="emit('delete', $event)"
         @toggle-selection="forwardSelection"
         @toggle-group="emit('toggleGroup', $event)"
+        @drag-start="emit('dragStart', $event)"
+        @drag-end="emit('dragEnd')"
+        @drag-over="emit('dragOver', $event)"
+        @drop="emit('drop', $event)"
       />
     </div>
   </section>

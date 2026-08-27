@@ -26,13 +26,17 @@ async function getCSRFToken(refresh = false): Promise<string> {
   return csrfRequest
 }
 
+export async function csrfHeaders() {
+  return { 'X-CSRF-Token': await getCSRFToken() }
+}
+
 function requiresCSRF(method = 'GET') {
   return !['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase())
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
-  if (init.body && !(init.body instanceof FormData)) headers.set('Content-Type', 'application/json')
+  if (typeof init.body === 'string') headers.set('Content-Type', 'application/json')
   if (requiresCSRF(init.method)) headers.set('X-CSRF-Token', await getCSRFToken())
   let response = await fetch(path, { ...init, headers, credentials: 'same-origin' })
   if (response.status === 403 && requiresCSRF(init.method)) {

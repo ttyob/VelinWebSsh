@@ -9,6 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +28,11 @@ var (
 	ErrHostKeyChanged     = errors.New("host key changed")
 	ErrNotController      = errors.New("terminal is controlled by another client")
 	ErrNormalSessionEnded = errors.New("normal SSH sessions cannot be restored after the Velin service restarts")
+)
+
+const (
+	tmuxHistoryLimit       = 100000
+	terminalOutputBufferMB = 64
 )
 
 type HostKeyError struct{ Kind, Fingerprint, PublicKey, HostName, Address string }
@@ -51,8 +60,16 @@ type Manager struct {
 	store        *store.Store
 	vault        *security.Vault
 	deploymentID string
+	recordingDir string
+	ffmpegBinary string
 	mu           sync.RWMutex
+	tmuxLocks    sync.Map
 	sessions     map[string]*Session
+}
+
+type activeRecording struct {
+	meta  store.TerminalRecording
+	bytes int64
 }
 
 func (m *Manager) DialSaved(ctx context.Context, userID, hostID string) (*ssh.Client, store.Host, error) {
@@ -72,34 +89,131 @@ func (m *Manager) DialSaved(ctx context.Context, userID, hostID string) (*ssh.Cl
 }
 
 type Session struct {
-	meta           store.TerminalSession
-	manager        *Manager
-	mu             sync.RWMutex
-	sshClient      *ssh.Client
-	sshSession     *ssh.Session
-	stdin          io.WriteCloser
-	subs           map[string]chan Event
-	controller     string
-	controllerSeen time.Time
-	pendingControl string
-	buffer         *ringBuffer
-	closed         bool
+	meta                  store.TerminalSession
+	manager               *Manager
+	mu                    sync.RWMutex
+	broadcastMu           sync.Mutex
+	historyScrollMu       sync.Mutex
+	commandMu             sync.Mutex
+	sshClient             *ssh.Client
+	sshSession            *ssh.Session
+	commandRunner         *commandRunner
+	recordingMu           sync.Mutex
+	recording             *activeRecording
+	stdin                 io.WriteCloser
+	subs                  map[string]*terminalSubscriber
+	controller            string
+	controllerSeen        time.Time
+	pendingControl        string
+	buffer                *ringBuffer
+	streamID              string
+	tmuxCaptureSafe       bool
+	tmuxHistoryMode       bool
+	tmuxHistoryPos        int
+	tmuxHistoryKnown      bool
+	historyScrollPending  bool
+	historyScrollRunning  bool
+	historyScrollClient   string
+	historyScrollPosition int
+	historyScrollEnd      int
+	historyScrollSequence uint64
+	historySize           int
+	historySizeUpdated    time.Time
+	closed                bool
+	connectCancel         context.CancelFunc
+}
+
+type terminalSubscriber struct {
+	events       chan Event
+	done         chan struct{}
+	doneOnce     sync.Once
+	reconnectKey string
+}
+
+func newTerminalSubscriber(reconnectKey string) *terminalSubscriber {
+	return &terminalSubscriber{events: make(chan Event, 256), done: make(chan struct{}), reconnectKey: reconnectKey}
+}
+
+func (s *terminalSubscriber) close() {
+	s.doneOnce.Do(func() { close(s.done) })
 }
 
 type Event struct {
-	Type       string `json:"type"`
-	Data       string `json:"data,omitempty"`
-	Status     string `json:"status,omitempty"`
-	Message    string `json:"message,omitempty"`
-	ClientID   string `json:"clientID,omitempty"`
-	Controller string `json:"controller,omitempty"`
-	Truncated  bool   `json:"truncated,omitempty"`
-	Requester  string `json:"requester,omitempty"`
+	Type        string `json:"type"`
+	Data        string `json:"data,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Message     string `json:"message,omitempty"`
+	ClientID    string `json:"clientID,omitempty"`
+	Controller  string `json:"controller,omitempty"`
+	Truncated   bool   `json:"truncated,omitempty"`
+	Requester   string `json:"requester,omitempty"`
+	ReplayFinal bool   `json:"replayFinal,omitempty"`
+	StreamID    string `json:"streamID,omitempty"`
+	Offset      uint64 `json:"offset,omitempty"`
+	HistorySize int    `json:"historySize,omitempty"`
+	Position    int    `json:"position,omitempty"`
+	Sequence    uint64 `json:"sequence,omitempty"`
+	DurationMS  int64  `json:"durationMs,omitempty"`
+	Error       string `json:"error,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	HostName    string `json:"hostName,omitempty"`
+	HostAddress string `json:"hostAddress,omitempty"`
 }
 
-func NewManager(s *store.Store, vault *security.Vault, deploymentID string) *Manager {
+type Replay struct {
+	StreamID  string
+	Offset    uint64
+	Segments  [][]byte
+	Truncated bool
+}
+
+func NewManager(s *store.Store, vault *security.Vault, deploymentID string, recordingDirs ...string) *Manager {
 	_ = s.EndStaleNormalSessions(ErrNormalSessionEnded.Error())
-	return &Manager{store: s, vault: vault, deploymentID: deploymentID, sessions: make(map[string]*Session)}
+	recordingDir := "data/recordings"
+	if len(recordingDirs) > 0 && recordingDirs[0] != "" {
+		recordingDir = recordingDirs[0]
+	}
+	return &Manager{store: s, vault: vault, deploymentID: deploymentID, recordingDir: recordingDir, ffmpegBinary: "ffmpeg", sessions: make(map[string]*Session)}
+}
+
+func NewManagerWithFFmpeg(s *store.Store, vault *security.Vault, deploymentID, recordingDir, ffmpegBinary string) *Manager {
+	manager := NewManager(s, vault, deploymentID, recordingDir)
+	if strings.TrimSpace(ffmpegBinary) != "" {
+		manager.ffmpegBinary = ffmpegBinary
+	}
+	return manager
+}
+
+func (m *Manager) tmuxLock(meta store.TerminalSession) *sync.Mutex {
+	key := meta.HostID + "\x00" + meta.TmuxSocket
+	lock, _ := m.tmuxLocks.LoadOrStore(key, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func (s *Session) runCommand(client *ssh.Client, command string) ([]byte, error) {
+	s.commandMu.Lock()
+	runner := s.commandRunner
+	if runner == nil && client != nil {
+		var err error
+		runner, err = newCommandRunner(client)
+		if err == nil {
+			s.commandRunner = runner
+		}
+	}
+	s.commandMu.Unlock()
+	if runner == nil {
+		return run(client, command)
+	}
+	out, err := runner.Run(command)
+	if err != nil {
+		s.commandMu.Lock()
+		if s.commandRunner == runner {
+			s.commandRunner = nil
+		}
+		s.commandMu.Unlock()
+		_ = runner.Close()
+	}
+	return out, err
 }
 
 func normalizeSessionMode(preferred, fallback string) string {
@@ -115,6 +229,18 @@ func (m *Manager) ActiveCount() int {
 	return len(m.sessions)
 }
 
+func (m *Manager) CloseAll() {
+	m.mu.RLock()
+	sessions := make([]*Session, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		sessions = append(sessions, session)
+	}
+	m.mu.RUnlock()
+	for _, session := range sessions {
+		session.close("background", "service operation")
+	}
+}
+
 func (m *Manager) Create(ctx context.Context, userID string, req CreateRequest) (store.TerminalSession, error) {
 	id := uuid.NewString()
 	mode := normalizeSessionMode(req.SessionMode, req.Host.SessionMode)
@@ -125,17 +251,28 @@ func (m *Manager) Create(ctx context.Context, userID string, req CreateRequest) 
 	if err := m.store.SaveTerminal(meta); err != nil {
 		return meta, err
 	}
-	sess := &Session{meta: meta, manager: m, subs: make(map[string]chan Event), buffer: newRingBuffer(2 << 20)}
+	sess := &Session{meta: meta, manager: m, subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(terminalOutputBufferMB << 20), streamID: uuid.NewString()}
+	connectCtx, cancel := context.WithCancel(context.Background())
+	sess.connectCancel = cancel
 	m.mu.Lock()
 	m.sessions[id] = sess
 	m.mu.Unlock()
-	if err := sess.connect(ctx, req.Host, req.Credential, req.Secret, req.Passphrase, req.TrustFingerprint, true); err != nil {
-		m.mu.Lock()
-		delete(m.sessions, id)
-		m.mu.Unlock()
-		_ = m.store.DeleteTerminal(userID, id)
-		return meta, err
-	}
+	go func() {
+		if err := sess.connect(connectCtx, req.Host, req.Credential, req.Secret, req.Passphrase, req.TrustFingerprint, true); err != nil {
+			if sess.Meta().Status == "ended" && errors.Is(err, context.Canceled) {
+				return
+			}
+			status := "unreachable"
+			var hostKeyErr *HostKeyError
+			switch {
+			case errors.As(err, &hostKeyErr):
+				status = "host_key_required"
+			case strings.Contains(strings.ToLower(err.Error()), "credential required"):
+				status = "auth_required"
+			}
+			sess.closeWithDetails(status, err.Error(), hostKeyErr)
+		}
+	}()
 	return sess.Meta(), nil
 }
 
@@ -190,7 +327,7 @@ func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, t
 			return nil, err
 		}
 	}
-	sess := &Session{meta: meta, manager: m, subs: make(map[string]chan Event), buffer: newRingBuffer(2 << 20)}
+	sess := &Session{meta: meta, manager: m, subs: make(map[string]*terminalSubscriber), buffer: newRingBuffer(terminalOutputBufferMB << 20), streamID: uuid.NewString()}
 	m.mu.Lock()
 	if prior := m.sessions[id]; prior != nil {
 		m.mu.Unlock()
@@ -220,6 +357,153 @@ func (m *Manager) Get(userID, id string) (*Session, error) {
 		return nil, sql.ErrNoRows
 	}
 	return s, nil
+}
+
+func (m *Manager) StartRecording(userID, id string) (store.TerminalRecording, error) {
+	s, err := m.Get(userID, id)
+	if err != nil {
+		return store.TerminalRecording{}, err
+	}
+	s.recordingMu.Lock()
+	defer s.recordingMu.Unlock()
+	if s.recording != nil {
+		return s.recording.meta, nil
+	}
+	if err = os.MkdirAll(m.recordingDir, 0o700); err != nil {
+		return store.TerminalRecording{}, err
+	}
+	recordingID := uuid.NewString()
+	path := filepath.Join(m.recordingDir, recordingID+".mp4")
+	meta := store.TerminalRecording{ID: recordingID, UserID: userID, SessionID: id, SessionName: s.Meta().Name, Path: path, Status: "recording", StartedAt: time.Now().UTC()}
+	if err = m.store.CreateRecording(meta); err != nil {
+		return store.TerminalRecording{}, err
+	}
+	s.recording = &activeRecording{meta: meta}
+	return meta, nil
+}
+
+func (m *Manager) StopRecording(userID, id string) (store.TerminalRecording, error) {
+	s, err := m.Get(userID, id)
+	if err != nil {
+		return store.TerminalRecording{}, err
+	}
+	return s.stopRecording("stopped"), nil
+}
+
+func (s *Session) stopRecording(status string) store.TerminalRecording {
+	s.recordingMu.Lock()
+	defer s.recordingMu.Unlock()
+	if s.recording == nil {
+		return store.TerminalRecording{}
+	}
+	active := s.recording
+	s.recording = nil
+	finished := time.Now().UTC()
+	active.meta.Status = status
+	active.meta.Bytes = active.bytes
+	active.meta.FinishedAt = &finished
+	_ = s.manager.store.FinishRecording(active.meta.UserID, active.meta.ID, status, active.bytes, finished)
+	return active.meta
+}
+
+func (s *Session) recordOutput(raw []byte) {
+	// Video recordings are captured by the browser and uploaded after stopping.
+	// Keep this hook so terminal output broadcasting remains independent of the
+	// recording transport.
+}
+
+const maxRecordingUploadBytes int64 = 1 << 30
+
+func (m *Manager) UploadRecording(ctx context.Context, userID, recordingID string, source io.Reader) (store.TerminalRecording, error) {
+	value, err := m.store.Recording(userID, recordingID)
+	if err != nil {
+		return store.TerminalRecording{}, err
+	}
+	if value.Status != "recording" {
+		return store.TerminalRecording{}, errors.New("录制已经结束")
+	}
+	s, err := m.Get(userID, value.SessionID)
+	if err != nil {
+		return store.TerminalRecording{}, err
+	}
+	s.recordingMu.Lock()
+	active := s.recording
+	if active == nil || active.meta.ID != recordingID {
+		s.recordingMu.Unlock()
+		return store.TerminalRecording{}, errors.New("当前录制已失效")
+	}
+	s.recording = nil
+	s.recordingMu.Unlock()
+
+	tempInput := value.Path + ".upload"
+	tempOutput := value.Path + ".transcode"
+	defer os.Remove(tempInput)
+	defer os.Remove(tempOutput)
+	file, err := os.OpenFile(tempInput, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return m.finishUploadedRecording(value, "error", 0, err)
+	}
+	written, copyErr := io.Copy(file, io.LimitReader(source, maxRecordingUploadBytes+1))
+	closeErr := file.Close()
+	if copyErr != nil {
+		return m.finishUploadedRecording(value, "error", 0, copyErr)
+	}
+	if closeErr != nil {
+		return m.finishUploadedRecording(value, "error", 0, closeErr)
+	}
+	if written == 0 || written > maxRecordingUploadBytes {
+		return m.finishUploadedRecording(value, "error", written, errors.New("录制文件大小无效"))
+	}
+
+	command := exec.CommandContext(ctx, m.ffmpegBinary,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-i", tempInput,
+		"-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+		"-f", "mp4",
+		tempOutput,
+	)
+	if output, commandErr := command.CombinedOutput(); commandErr != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = commandErr.Error()
+		}
+		return m.finishUploadedRecording(value, "error", written, fmt.Errorf("MP4 转码失败: %s", message))
+	}
+	if err = os.Rename(tempOutput, value.Path); err != nil {
+		return m.finishUploadedRecording(value, "error", written, err)
+	}
+	if err = os.Chmod(value.Path, 0o600); err != nil {
+		return m.finishUploadedRecording(value, "error", written, err)
+	}
+	info, err := os.Stat(value.Path)
+	if err != nil {
+		return m.finishUploadedRecording(value, "error", written, err)
+	}
+	finished := time.Now().UTC()
+	value.Status = "stopped"
+	value.Bytes = info.Size()
+	value.FinishedAt = &finished
+	if err = m.store.FinishRecording(userID, recordingID, value.Status, value.Bytes, finished); err != nil {
+		return store.TerminalRecording{}, err
+	}
+	return value, nil
+}
+
+func (m *Manager) finishUploadedRecording(value store.TerminalRecording, status string, bytes int64, cause error) (store.TerminalRecording, error) {
+	finished := time.Now().UTC()
+	_ = m.store.FinishRecording(value.UserID, value.ID, status, bytes, finished)
+	return store.TerminalRecording{}, cause
+}
+
+func (s *Session) WriteTask(data []byte) error {
+	s.mu.RLock()
+	w, closed := s.stdin, s.closed
+	s.mu.RUnlock()
+	if closed || w == nil {
+		return errors.New("terminal not attached")
+	}
+	_, err := w.Write(data)
+	return err
 }
 
 func (m *Manager) Rename(userID, id, name string) error {
@@ -267,10 +551,13 @@ func (m *Manager) Terminate(ctx context.Context, userID, id string, secret, pass
 	}
 	defer client.Close()
 	if err = validateOwnership(client, meta); err != nil {
+		if isTmuxTargetMissing(err.Error()) {
+			return m.store.UpdateTerminalStatus(userID, id, "ended", "Terminated by user")
+		}
 		return err
 	}
 	cmd := fmt.Sprintf("tmux -L %s kill-session -t %s", meta.TmuxSocket, meta.TmuxName)
-	if out, e := run(client, cmd); e != nil && !strings.Contains(string(out), "can't find session") {
+	if out, e := run(client, cmd); e != nil && !isTmuxTargetMissing(cleanOutput(out, e)) {
 		return fmt.Errorf("terminate tmux: %s", cleanOutput(out, e))
 	}
 	return m.store.UpdateTerminalStatus(userID, id, "ended", "Terminated by user")
@@ -294,11 +581,104 @@ func (s *Session) CurrentDirectory() (string, error) {
 	if meta.SessionMode == "normal" {
 		return "", errors.New("current directory is unavailable in normal SSH mode")
 	}
-	out, err := run(client, fmt.Sprintf("tmux -L %s display-message -p -t %s '#{pane_current_path}'", meta.TmuxSocket, meta.TmuxName))
+	out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s display-message -p -t %s '#{pane_current_path}'", meta.TmuxSocket, meta.TmuxName))
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func (s *Session) ForegroundCommand() (string, error) {
+	s.mu.RLock()
+	client, meta := s.sshClient, s.meta
+	s.mu.RUnlock()
+	if client == nil {
+		return "", errors.New("terminal connection is not available")
+	}
+	if meta.SessionMode == "normal" {
+		return "", errors.New("foreground command is unavailable in normal SSH mode")
+	}
+	out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s display-message -p -t %s '#{pane_current_command}'", meta.TmuxSocket, meta.TmuxName))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (s *Session) Snapshot(maxLines int) []byte {
+	if maxLines < 1 {
+		return nil
+	}
+	if maxLines > 500 {
+		maxLines = 500
+	}
+	s.mu.RLock()
+	client, meta, closed, captureSafe := s.sshClient, s.meta, s.closed, s.tmuxCaptureSafe
+	buffered := s.buffer.TailLines(maxLines, terminalOutputBufferMB<<20)
+	s.mu.RUnlock()
+	if len(buffered) > 0 {
+		return prepareTerminalSnapshot(buffered)
+	}
+	if closed || meta.SessionMode == "normal" {
+		return nil
+	}
+	if !captureSafe {
+		return nil
+	}
+	if client == nil {
+		return nil
+	}
+	cmd := fmt.Sprintf("tmux -L %s capture-pane -p -e -t %s -S -%d", meta.TmuxSocket, meta.TmuxName, maxLines)
+	lock := s.manager.tmuxLock(meta)
+	lock.Lock()
+	data, err := s.runCommand(client, cmd)
+	lock.Unlock()
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	return prepareTerminalSnapshot(data)
+}
+
+func prepareTerminalSnapshot(data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+	data = normalizeTerminalLines(data)
+	out := make([]byte, 0, len(data)+32)
+	out = append(out, []byte("\x1b[0m\x1b[2J\x1b[H")...)
+	out = append(out, data...)
+	out = append(out, []byte("\x1b[0m")...)
+	return out
+}
+
+func tailTerminalLines(data []byte, maxLines int) []byte {
+	if maxLines < 1 || len(data) == 0 {
+		return nil
+	}
+	end := len(data)
+	index := end - 1
+	if data[index] == '\n' {
+		index--
+		if index >= 0 && data[index] == '\r' {
+			index--
+		}
+	}
+	lines := 0
+	for ; index >= 0; index-- {
+		if data[index] != '\n' {
+			continue
+		}
+		lines++
+		if lines == maxLines {
+			return bytes.Clone(data[index+1 : end])
+		}
+	}
+	return bytes.Clone(data[:end])
+}
+
+func tmuxCaptureSupported(version string) bool {
+	version = strings.ToLower(strings.TrimSpace(version))
+	return strings.HasPrefix(version, "tmux ") && !strings.Contains(version, "next-")
 }
 
 func (s *Session) connect(ctx context.Context, host store.Host, cred store.Credential, secret, passphrase, trust string, create bool) error {
@@ -312,16 +692,26 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 	}
 	tmuxMode := s.meta.SessionMode != "normal"
 	if tmuxMode {
-		if out, err := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V"); err != nil {
+		// Startup restores several workspace tabs concurrently. Serialize tmux
+		// server mutations and capture-pane so older remote tmux versions do not
+		// process competing configuration and history requests.
+		lock := s.manager.tmuxLock(s.meta)
+		lock.Lock()
+		defer lock.Unlock()
+		out, versionErr := run(client, "command -v tmux >/dev/null 2>&1 && tmux -V")
+		if versionErr != nil {
 			client.Close()
-			return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, err))
+			return fmt.Errorf("tmux is required on the remote host: %s", cleanOutput(out, versionErr))
 		}
+		s.mu.Lock()
+		s.tmuxCaptureSafe = tmuxCaptureSupported(strings.TrimSpace(string(out)))
+		s.mu.Unlock()
 		if create {
 			startDir := ""
 			if strings.TrimSpace(host.InitialDir) != "" {
 				startDir = " -c " + shellQuote(strings.TrimSpace(host.InitialDir))
 			}
-			cmd := fmt.Sprintf("tmux -L %s new-session -d -s %s%s \\; set-option -t %s @velin_owner %s \\; set-option -t %s history-limit 50000 \\; set-option -t %s status off", s.meta.TmuxSocket, s.meta.TmuxName, startDir, s.meta.TmuxName, s.meta.OwnerMarker, s.meta.TmuxName, s.meta.TmuxName)
+			cmd := fmt.Sprintf("tmux -L %s new-session -d -s %s%s \\; set-option -t %s @velin_owner %s \\; set-option -t %s history-limit %d \\; set-option -t %s status off \\; set-window-option -t %s alternate-screen off", s.meta.TmuxSocket, s.meta.TmuxName, startDir, s.meta.TmuxName, s.meta.OwnerMarker, s.meta.TmuxName, tmuxHistoryLimit, s.meta.TmuxName, s.meta.TmuxName)
 			if out, err := run(client, cmd); err != nil {
 				client.Close()
 				return fmt.Errorf("create tmux session: %s", cleanOutput(out, err))
@@ -334,9 +724,22 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 			client.Close()
 			return fmt.Errorf("configure tmux session: %s", cleanOutput(out, err))
 		}
-		// Keep browser xterm.js on its normal buffer so scrollback and its viewport
-		// scrollbar remain available while tmux still manages alternate-screen apps.
-		if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -as terminal-overrides ',xterm-256color:smcup@:rmcup@'", s.meta.TmuxSocket)); err != nil {
+		if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -t %s history-limit %d", s.meta.TmuxSocket, s.meta.TmuxName, tmuxHistoryLimit)); err != nil {
+			client.Close()
+			return fmt.Errorf("configure tmux history: %s", cleanOutput(out, err))
+		}
+		// Full-screen TUIs such as Codex redraw their alternate buffer in place.
+		// Keeping them on tmux's normal buffer makes those lines part of history.
+		if out, err := run(client, fmt.Sprintf("tmux -L %s set-window-option -t %s alternate-screen off", s.meta.TmuxSocket, s.meta.TmuxName)); err != nil {
+			client.Close()
+			return fmt.Errorf("configure tmux scrollback: %s", cleanOutput(out, err))
+		}
+		// Keep browser xterm.js on its normal buffer so tmux history remains
+		// available through the browser viewport scrollbar.
+		// Do not expose the partial-scroll-region capability to full-screen TUIs.
+		// Lines that leave a partial region are overwritten in place and never
+		// enter terminal scrollback, which creates gaps in long Codex responses.
+		if out, err := run(client, fmt.Sprintf("tmux -L %s set-option -as terminal-overrides ',xterm-256color:smcup@:rmcup@:csr@'", s.meta.TmuxSocket)); err != nil {
 			client.Close()
 			return fmt.Errorf("configure tmux terminal: %s", cleanOutput(out, err))
 		}
@@ -384,6 +787,12 @@ func (s *Session) connect(ctx context.Context, host store.Host, cred store.Crede
 		return err
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		sshSess.Close()
+		client.Close()
+		return context.Canceled
+	}
 	s.sshClient = client
 	s.sshSession = sshSess
 	s.stdin = stdin
@@ -428,6 +837,12 @@ func (m *Manager) dialHost(ctx context.Context, userID string, host store.Host, 
 			if err != nil {
 				return nil, err
 			}
+		}
+	} else if secret == "" && host.PasswordEnc != "" {
+		var err error
+		secret, err = m.vault.Decrypt(host.PasswordEnc)
+		if err != nil {
+			return nil, err
 		}
 	}
 	if secret == "" {
@@ -481,12 +896,14 @@ func (m *Manager) dialHost(ctx context.Context, userID string, host store.Host, 
 		if loadErr != nil {
 			return nil, errors.New("跳板机不存在或无权访问")
 		}
-		if jumpHost.CredentialID == "" {
-			return nil, fmt.Errorf("跳板机“%s”需要绑定已保存的凭据", jumpHost.Name)
-		}
-		jumpCredential, loadErr := m.store.Credential(userID, jumpHost.CredentialID)
-		if loadErr != nil {
-			return nil, fmt.Errorf("读取跳板机“%s”的凭据失败: %w", jumpHost.Name, loadErr)
+		var jumpCredential store.Credential
+		if jumpHost.CredentialID != "" {
+			jumpCredential, loadErr = m.store.Credential(userID, jumpHost.CredentialID)
+			if loadErr != nil {
+				return nil, fmt.Errorf("读取跳板机“%s”的凭据失败: %w", jumpHost.Name, loadErr)
+			}
+		} else if jumpHost.PasswordEnc == "" {
+			return nil, fmt.Errorf("跳板机“%s”需要绑定已保存的凭据或主机密码", jumpHost.Name)
 		}
 		jumpClient, err = m.dialHost(dialCtx, userID, jumpHost, jumpCredential, "", "", trust, visited, depth+1)
 		if err != nil {
@@ -575,6 +992,13 @@ func validateOwnership(client *ssh.Client, meta store.TerminalSession) error {
 	return nil
 }
 
+func isTmuxTargetMissing(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "can't find session") ||
+		strings.Contains(message, "no such session") ||
+		strings.Contains(message, "no server running on")
+}
+
 func run(client *ssh.Client, cmd string) ([]byte, error) {
 	s, err := client.NewSession()
 	if err != nil {
@@ -582,6 +1006,23 @@ func run(client *ssh.Client, cmd string) ([]byte, error) {
 	}
 	defer s.Close()
 	return s.CombinedOutput(cmd)
+}
+
+func (s *Session) restoreTmuxHistory(client *ssh.Client) {
+	cmd := fmt.Sprintf("tmux -L %s capture-pane -p -e -t %s -S - -E -1", s.meta.TmuxSocket, s.meta.TmuxName)
+	data, err := run(client, cmd)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	data = normalizeTerminalLines(data)
+	s.mu.Lock()
+	s.buffer.Write(data)
+	s.mu.Unlock()
+}
+
+func normalizeTerminalLines(data []byte) []byte {
+	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	return bytes.ReplaceAll(data, []byte("\n"), []byte("\r\n"))
 }
 
 func detectHostSystem(client *ssh.Client) (string, string) {
@@ -677,7 +1118,7 @@ func (s *Session) readLoop(r io.Reader) {
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			s.broadcast(Event{Type: "output", Data: base64.StdEncoding.EncodeToString(buf[:n])})
+			s.broadcastOutput(buf[:n])
 		}
 		if err != nil {
 			status := "background"
@@ -689,37 +1130,71 @@ func (s *Session) readLoop(r io.Reader) {
 		}
 	}
 }
+func (s *Session) broadcastOutput(raw []byte) {
+	s.broadcastEvent(Event{Type: "output", Data: base64.StdEncoding.EncodeToString(raw)}, raw)
+}
 func (s *Session) broadcast(ev Event) {
+	var raw []byte
+	if ev.Type == "output" {
+		raw, _ = base64.StdEncoding.DecodeString(ev.Data)
+	}
+	s.broadcastEvent(ev, raw)
+}
+func (s *Session) broadcastEvent(ev Event, raw []byte) {
+	s.broadcastMu.Lock()
+	defer s.broadcastMu.Unlock()
 	s.mu.Lock()
 	if ev.Type == "output" {
-		raw, _ := base64.StdEncoding.DecodeString(ev.Data)
-		s.buffer.Write(raw)
+		ev.Offset = s.buffer.Write(raw)
 	}
-	for _, ch := range s.subs {
-		select {
-		case ch <- ev:
-		default:
-		}
+	subs := make([]*terminalSubscriber, 0, len(s.subs))
+	for _, sub := range s.subs {
+		subs = append(subs, sub)
 	}
 	s.mu.Unlock()
+	s.recordOutput(raw)
+	for _, sub := range subs {
+		select {
+		case sub.events <- ev:
+		case <-sub.done:
+		}
+	}
 }
-func (s *Session) Subscribe(clientID string) (<-chan Event, []byte, bool) {
+func (s *Session) Subscribe(clientID, resumeStreamID string, resumeOffset uint64, reconnectKeys ...string) (<-chan Event, <-chan struct{}, Replay) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := make(chan Event, 128)
-	s.subs[clientID] = ch
-	if s.controller == "" || time.Since(s.controllerSeen) > 20*time.Second {
+	if s.streamID == "" {
+		s.streamID = uuid.NewString()
+	}
+	reconnectKey := ""
+	if len(reconnectKeys) > 0 {
+		reconnectKey = reconnectKeys[0]
+	}
+	subscriber := newTerminalSubscriber(reconnectKey)
+	s.subs[clientID] = subscriber
+	controllerSubscriber := s.subs[s.controller]
+	if reconnectKey != "" && controllerSubscriber != nil && controllerSubscriber.reconnectKey == reconnectKey {
+		controllerSubscriber.close()
+		s.controller = clientID
+		s.controllerSeen = time.Now()
+		s.pendingControl = ""
+	} else if s.controller == "" || time.Since(s.controllerSeen) > 20*time.Second {
 		s.controller = clientID
 		s.controllerSeen = time.Now()
 	}
-	data, trunc := s.buffer.Bytes()
-	return ch, data, trunc
+	segments, truncated := s.buffer.Segments()
+	offset := s.buffer.End()
+	if resumeStreamID == s.streamID {
+		segments, offset, truncated = s.buffer.SegmentsFrom(resumeOffset)
+	}
+	replay := Replay{StreamID: s.streamID, Offset: offset, Segments: segments, Truncated: truncated}
+	return subscriber.events, subscriber.done, replay
 }
 func (s *Session) Unsubscribe(clientID string) {
 	s.mu.Lock()
-	if ch := s.subs[clientID]; ch != nil {
+	if subscriber := s.subs[clientID]; subscriber != nil {
 		delete(s.subs, clientID)
-		close(ch)
+		subscriber.close()
 	}
 	if s.pendingControl == clientID {
 		s.pendingControl = ""
@@ -754,11 +1229,12 @@ func (s *Session) RequestControl(clientID string) bool {
 		s.broadcast(Event{Type: "controller", Controller: clientID})
 		return true
 	}
-	controllerChannel := s.subs[s.controller]
+	controllerSubscriber := s.subs[s.controller]
 	s.pendingControl = clientID
-	if controllerChannel != nil {
+	if controllerSubscriber != nil {
 		select {
-		case controllerChannel <- Event{Type: "control_request", Requester: clientID}:
+		case controllerSubscriber.events <- Event{Type: "control_request", Requester: clientID}:
+		case <-controllerSubscriber.done:
 		default:
 		}
 	}
@@ -772,19 +1248,20 @@ func (s *Session) RespondControl(clientID, requester string, approved bool) bool
 		return false
 	}
 	s.pendingControl = ""
-	requesterChannel := s.subs[requester]
-	if approved && requesterChannel != nil {
+	requesterSubscriber := s.subs[requester]
+	if approved && requesterSubscriber != nil {
 		s.controller = requester
 		s.controllerSeen = time.Now()
 	}
-	if approved && requesterChannel != nil {
+	if approved && requesterSubscriber != nil {
 		s.mu.Unlock()
 		s.broadcast(Event{Type: "controller", Controller: requester})
 		return true
 	}
-	if requesterChannel != nil {
+	if requesterSubscriber != nil {
 		select {
-		case requesterChannel <- Event{Type: "control_denied"}:
+		case requesterSubscriber.events <- Event{Type: "control_denied"}:
+		case <-requesterSubscriber.done:
 		default:
 		}
 	}
@@ -831,6 +1308,9 @@ func (s *Session) Write(clientID string, data []byte) error {
 	if !s.IsController(clientID) {
 		return ErrNotController
 	}
+	if err := s.leaveTmuxHistoryMode(); err != nil {
+		return err
+	}
 	s.mu.RLock()
 	w := s.stdin
 	closed := s.closed
@@ -840,6 +1320,320 @@ func (s *Session) Write(clientID string, data []byte) error {
 	}
 	_, err := w.Write(data)
 	return err
+}
+
+func (s *Session) ScrollHistory(clientID string, lines int) error {
+	if !s.IsController(clientID) {
+		return ErrNotController
+	}
+	if lines < -100 || lines > 100 {
+		return errors.New("invalid history scroll distance")
+	}
+	s.mu.RLock()
+	mode := s.meta.SessionMode
+	s.mu.RUnlock()
+	if mode == "normal" {
+		return nil
+	}
+	lock := s.manager.tmuxLock(s.Meta())
+	lock.Lock()
+	defer lock.Unlock()
+	s.mu.RLock()
+	client, meta, closed, inHistory := s.sshClient, s.meta, s.closed, s.tmuxHistoryMode
+	s.mu.RUnlock()
+	if closed || client == nil {
+		return errors.New("terminal not attached")
+	}
+	if lines == 0 {
+		if !inHistory {
+			return nil
+		}
+		return s.leaveTmuxHistoryModeLocked(client, meta)
+	}
+	if lines < 0 {
+		if !inHistory {
+			if out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s copy-mode -t %s", meta.TmuxSocket, meta.TmuxName)); err != nil {
+				return fmt.Errorf("enter tmux history: %s", cleanOutput(out, err))
+			}
+			s.mu.Lock()
+			s.tmuxHistoryMode = true
+			s.mu.Unlock()
+		}
+		lines = -lines
+		if out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s send-keys -X -N %d -t %s scroll-up", meta.TmuxSocket, lines, meta.TmuxName)); err != nil {
+			return fmt.Errorf("scroll tmux history: %s", cleanOutput(out, err))
+		}
+		s.mu.Lock()
+		s.tmuxHistoryKnown = false
+		s.mu.Unlock()
+		return nil
+	}
+	if !inHistory {
+		return nil
+	}
+	if out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s send-keys -X -N %d -t %s scroll-down", meta.TmuxSocket, lines, meta.TmuxName)); err != nil {
+		if strings.Contains(strings.ToLower(cleanOutput(out, err)), "not in a mode") {
+			s.mu.Lock()
+			s.tmuxHistoryMode = false
+			s.tmuxHistoryPos = 0
+			s.tmuxHistoryKnown = false
+			s.mu.Unlock()
+			return nil
+		}
+		return fmt.Errorf("scroll tmux history: %s", cleanOutput(out, err))
+	}
+	s.mu.Lock()
+	s.tmuxHistoryKnown = false
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Session) HistorySize() int {
+	s.mu.RLock()
+	client, meta, closed := s.sshClient, s.meta, s.closed
+	cached, updated := s.historySize, s.historySizeUpdated
+	s.mu.RUnlock()
+	if closed || client == nil || meta.SessionMode == "normal" {
+		return 0
+	}
+	if !updated.IsZero() && time.Since(updated) < time.Second {
+		return cached
+	}
+	lock := s.manager.tmuxLock(meta)
+	lock.Lock()
+	defer lock.Unlock()
+	s.mu.RLock()
+	cached, updated = s.historySize, s.historySizeUpdated
+	s.mu.RUnlock()
+	if !updated.IsZero() && time.Since(updated) < time.Second {
+		return cached
+	}
+	out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s display-message -p -t %s '#{history_size}'", meta.TmuxSocket, meta.TmuxName))
+	if err != nil {
+		return 0
+	}
+	size, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || size < 0 {
+		return 0
+	}
+	s.mu.Lock()
+	s.historySize = size
+	s.historySizeUpdated = time.Now()
+	s.mu.Unlock()
+	return size
+}
+
+func (s *Session) CachedHistorySize() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed || s.meta.SessionMode == "normal" {
+		return 0
+	}
+	return s.historySize
+}
+
+func (s *Session) SendHistoryState(clientID string) {
+	size := s.HistorySize()
+	s.mu.RLock()
+	subscriber := s.subs[clientID]
+	s.mu.RUnlock()
+	if subscriber == nil {
+		return
+	}
+	select {
+	case subscriber.events <- Event{Type: "history_state", HistorySize: size, Position: size}:
+	case <-subscriber.done:
+	default:
+	}
+}
+
+func (s *Session) ScrollHistoryTo(clientID string, position, end int) error {
+	if !s.IsController(clientID) {
+		return ErrNotController
+	}
+	if position < 0 || end < 0 || position > tmuxHistoryLimit || end > tmuxHistoryLimit {
+		return errors.New("invalid history position")
+	}
+	if position >= end {
+		return s.leaveTmuxHistoryMode()
+	}
+	lock := s.manager.tmuxLock(s.Meta())
+	lock.Lock()
+	defer lock.Unlock()
+	s.mu.RLock()
+	client, meta, closed, inHistory := s.sshClient, s.meta, s.closed, s.tmuxHistoryMode
+	currentPosition, positionKnown := s.tmuxHistoryPos, s.tmuxHistoryKnown
+	s.mu.RUnlock()
+	if closed || client == nil {
+		return errors.New("terminal not attached")
+	}
+	if meta.SessionMode == "normal" {
+		return nil
+	}
+	if !inHistory {
+		return s.positionTmuxHistoryLocked(client, meta, position)
+	}
+	if !positionKnown {
+		command := fmt.Sprintf("tmux -L %s send-keys -X -t %s history-top", meta.TmuxSocket, meta.TmuxName)
+		if position > 0 {
+			command += fmt.Sprintf(" && tmux -L %s send-keys -X -N %d -t %s scroll-down", meta.TmuxSocket, position, meta.TmuxName)
+		}
+		if out, err := s.runCommand(client, command); err != nil {
+			if isTmuxModeMissing(cleanOutput(out, err)) {
+				return s.positionTmuxHistoryLocked(client, meta, position)
+			}
+			return fmt.Errorf("position tmux history: %s", cleanOutput(out, err))
+		}
+		s.mu.Lock()
+		s.tmuxHistoryPos = position
+		s.tmuxHistoryKnown = true
+		s.mu.Unlock()
+		return nil
+	}
+	delta := position - currentPosition
+	if delta == 0 {
+		s.mu.Lock()
+		s.tmuxHistoryPos = position
+		s.tmuxHistoryKnown = true
+		s.mu.Unlock()
+		return nil
+	}
+	direction := "scroll-down"
+	if delta < 0 {
+		direction = "scroll-up"
+		delta = -delta
+	}
+	if out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s send-keys -X -N %d -t %s %s", meta.TmuxSocket, delta, meta.TmuxName, direction)); err != nil {
+		if isTmuxModeMissing(cleanOutput(out, err)) {
+			return s.positionTmuxHistoryLocked(client, meta, position)
+		}
+		return fmt.Errorf("position tmux history: %s", cleanOutput(out, err))
+	}
+	s.mu.Lock()
+	s.tmuxHistoryPos = position
+	s.tmuxHistoryKnown = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Session) positionTmuxHistoryLocked(client *ssh.Client, meta store.TerminalSession, position int) error {
+	commands := []string{
+		fmt.Sprintf("tmux -L %s copy-mode -t %s", meta.TmuxSocket, meta.TmuxName),
+		fmt.Sprintf("tmux -L %s send-keys -X -t %s history-top", meta.TmuxSocket, meta.TmuxName),
+	}
+	if position > 0 {
+		commands = append(commands, fmt.Sprintf("tmux -L %s send-keys -X -N %d -t %s scroll-down", meta.TmuxSocket, position, meta.TmuxName))
+	}
+	if out, err := s.runCommand(client, strings.Join(commands, " && ")); err != nil {
+		s.mu.Lock()
+		s.tmuxHistoryMode = false
+		s.tmuxHistoryKnown = false
+		s.mu.Unlock()
+		return fmt.Errorf("enter tmux history: %s", cleanOutput(out, err))
+	}
+	s.mu.Lock()
+	s.tmuxHistoryMode = true
+	s.tmuxHistoryPos = position
+	s.tmuxHistoryKnown = true
+	s.mu.Unlock()
+	return nil
+}
+
+func isTmuxModeMissing(message string) bool {
+	return strings.Contains(strings.ToLower(message), "not in a mode")
+}
+
+func (s *Session) QueueHistoryPosition(clientID string, position, end int, sequence uint64) {
+	s.historyScrollMu.Lock()
+	s.historyScrollClient = clientID
+	s.historyScrollPosition = position
+	s.historyScrollEnd = end
+	s.historyScrollSequence = sequence
+	s.historyScrollPending = true
+	if s.historyScrollRunning {
+		s.historyScrollMu.Unlock()
+		return
+	}
+	s.historyScrollRunning = true
+	s.historyScrollMu.Unlock()
+	go s.runHistoryPositionQueue()
+}
+
+func (s *Session) runHistoryPositionQueue() {
+	for {
+		s.historyScrollMu.Lock()
+		if !s.historyScrollPending {
+			s.historyScrollRunning = false
+			s.historyScrollMu.Unlock()
+			return
+		}
+		clientID := s.historyScrollClient
+		position := s.historyScrollPosition
+		end := s.historyScrollEnd
+		sequence := s.historyScrollSequence
+		s.historyScrollPending = false
+		s.historyScrollMu.Unlock()
+		started := time.Now()
+		err := s.ScrollHistoryTo(clientID, position, end)
+		actual := position
+		if err != nil {
+			s.mu.RLock()
+			if s.tmuxHistoryKnown {
+				actual = s.tmuxHistoryPos
+			} else if !s.tmuxHistoryMode {
+				actual = end
+			}
+			s.mu.RUnlock()
+		}
+		s.sendHistoryPosition(clientID, Event{
+			Type:        "history_position",
+			HistorySize: end,
+			Position:    actual,
+			Sequence:    sequence,
+			DurationMS:  time.Since(started).Milliseconds(),
+			Error:       cleanOutput(nil, err),
+		})
+	}
+}
+
+func (s *Session) sendHistoryPosition(clientID string, event Event) {
+	s.mu.RLock()
+	subscriber := s.subs[clientID]
+	s.mu.RUnlock()
+	if subscriber == nil {
+		return
+	}
+	select {
+	case subscriber.events <- event:
+	case <-subscriber.done:
+	default:
+	}
+}
+
+func (s *Session) leaveTmuxHistoryMode() error {
+	s.mu.RLock()
+	inHistory, client, meta := s.tmuxHistoryMode, s.sshClient, s.meta
+	s.mu.RUnlock()
+	if !inHistory || client == nil || meta.SessionMode == "normal" {
+		return nil
+	}
+	lock := s.manager.tmuxLock(meta)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.leaveTmuxHistoryModeLocked(client, meta)
+}
+
+func (s *Session) leaveTmuxHistoryModeLocked(client *ssh.Client, meta store.TerminalSession) error {
+	out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s send-keys -X -t %s cancel", meta.TmuxSocket, meta.TmuxName))
+	if err != nil && !strings.Contains(strings.ToLower(cleanOutput(out, err)), "not in a mode") {
+		return fmt.Errorf("leave tmux history: %s", cleanOutput(out, err))
+	}
+	s.mu.Lock()
+	s.tmuxHistoryMode = false
+	s.tmuxHistoryPos = 0
+	s.tmuxHistoryKnown = false
+	s.mu.Unlock()
+	return nil
 }
 
 func validTerminalColor(value string) bool {
@@ -875,7 +1669,11 @@ func (s *Session) SetTerminalColors(clientID, foreground, background string) err
 		"tmux -L %s set-option -t %s window-style %s \\; set-option -t %s window-active-style %s",
 		meta.TmuxSocket, meta.TmuxName, style, meta.TmuxName, style,
 	)
-	if out, err := run(client, cmd); err != nil {
+	lock := s.manager.tmuxLock(meta)
+	lock.Lock()
+	out, err := s.runCommand(client, cmd)
+	lock.Unlock()
+	if err != nil {
 		return fmt.Errorf("configure terminal colors: %s", cleanOutput(out, err))
 	}
 	return nil
@@ -902,21 +1700,34 @@ func (s *Session) killRemote(ctx context.Context) error {
 	meta := s.meta
 	s.mu.RUnlock()
 	if client == nil {
+		if meta.Status == "creating" || meta.Status == "reconnecting" {
+			return nil
+		}
 		return errors.New("SSH connection unavailable")
 	}
 	if meta.SessionMode == "normal" {
 		return nil
 	}
 	if err := validateOwnership(client, meta); err != nil {
+		if isTmuxTargetMissing(err.Error()) {
+			return nil
+		}
 		return err
 	}
-	out, err := run(client, fmt.Sprintf("tmux -L %s kill-session -t %s", meta.TmuxSocket, meta.TmuxName))
-	if err != nil && !strings.Contains(string(out), "can't find session") {
+	lock := s.manager.tmuxLock(meta)
+	lock.Lock()
+	out, err := s.runCommand(client, fmt.Sprintf("tmux -L %s kill-session -t %s", meta.TmuxSocket, meta.TmuxName))
+	lock.Unlock()
+	if err != nil && !isTmuxTargetMissing(cleanOutput(out, err)) {
 		return fmt.Errorf("terminate tmux: %s", cleanOutput(out, err))
 	}
 	return nil
 }
 func (s *Session) close(status, msg string) {
+	s.closeWithDetails(status, msg, nil)
+}
+
+func (s *Session) closeWithDetails(status, msg string, hostKeyErr *HostKeyError) {
 	s.mu.Lock()
 	if s.closed {
 		if status == "ended" && s.meta.Status != "ended" {
@@ -935,6 +1746,13 @@ func (s *Session) close(status, msg string) {
 	s.closed = true
 	s.meta.Status = status
 	s.meta.LastError = msg
+	s.commandMu.Lock()
+	runner := s.commandRunner
+	s.commandRunner = nil
+	s.commandMu.Unlock()
+	if runner != nil {
+		_ = runner.Close()
+	}
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 	}
@@ -944,15 +1762,27 @@ func (s *Session) close(status, msg string) {
 	if s.sshClient != nil {
 		_ = s.sshClient.Close()
 	}
-	for id, ch := range s.subs {
+	if s.connectCancel != nil {
+		s.connectCancel()
+		s.connectCancel = nil
+	}
+	event := Event{Type: "status", Status: status, Message: msg}
+	if hostKeyErr != nil {
+		event.Fingerprint = hostKeyErr.Fingerprint
+		event.HostName = hostKeyErr.HostName
+		event.HostAddress = hostKeyErr.Address
+	}
+	for id, subscriber := range s.subs {
 		select {
-		case ch <- Event{Type: "status", Status: status, Message: msg}:
+		case subscriber.events <- event:
+		case <-subscriber.done:
 		default:
 		}
-		close(ch)
+		subscriber.close()
 		delete(s.subs, id)
 	}
 	s.mu.Unlock()
+	s.stopRecording(status)
 	_ = s.manager.store.UpdateTerminalStatus(s.meta.UserID, s.meta.ID, status, msg)
 	s.manager.mu.Lock()
 	delete(s.manager.sessions, s.meta.ID)
@@ -961,23 +1791,133 @@ func (s *Session) close(status, msg string) {
 
 type ringBuffer struct {
 	max       int
-	buf       []byte
+	segments  [][]byte
+	size      int
 	truncated bool
+	end       uint64
 }
 
 func newRingBuffer(max int) *ringBuffer { return &ringBuffer{max: max} }
-func (r *ringBuffer) Write(p []byte) {
-	if len(p) >= r.max {
-		r.buf = append(r.buf[:0], p[len(p)-r.max:]...)
-		r.truncated = true
-		return
+func (r *ringBuffer) Write(p []byte) uint64 {
+	const chunkSize = 64 << 10
+	r.end += uint64(len(p))
+	for len(p) > 0 {
+		take := len(p)
+		if take > chunkSize {
+			take = chunkSize
+		}
+		r.segments = append(r.segments, bytes.Clone(p[:take]))
+		r.size += take
+		p = p[take:]
 	}
-	overflow := len(r.buf) + len(p) - r.max
+	overflow := r.size - r.max
 	if overflow > 0 {
-		copy(r.buf, r.buf[overflow:])
-		r.buf = r.buf[:len(r.buf)-overflow]
 		r.truncated = true
+		for overflow > 0 && len(r.segments) > 0 {
+			first := r.segments[0]
+			if len(first) <= overflow {
+				overflow -= len(first)
+				r.size -= len(first)
+				r.segments[0] = nil
+				r.segments = r.segments[1:]
+				continue
+			}
+			r.segments[0] = first[overflow:]
+			r.size -= overflow
+			overflow = 0
+		}
 	}
-	r.buf = append(r.buf, p...)
+	return r.end
 }
-func (r *ringBuffer) Bytes() ([]byte, bool) { return bytes.Clone(r.buf), r.truncated }
+func (r *ringBuffer) Bytes() ([]byte, bool) {
+	return joinSegments(r.segments, r.size), r.truncated
+}
+func (r *ringBuffer) Segments() ([][]byte, bool) {
+	return append([][]byte(nil), r.segments...), r.truncated
+}
+func (r *ringBuffer) End() uint64 { return r.end }
+func (r *ringBuffer) BytesFrom(offset uint64) ([]byte, uint64, bool) {
+	segments, end, truncated := r.SegmentsFrom(offset)
+	size := 0
+	for _, segment := range segments {
+		size += len(segment)
+	}
+	return joinSegments(segments, size), end, truncated
+}
+func (r *ringBuffer) SegmentsFrom(offset uint64) ([][]byte, uint64, bool) {
+	start := r.end - uint64(r.size)
+	if offset < start || offset > r.end {
+		segments, _ := r.Segments()
+		return segments, r.end, true
+	}
+	skip := int(offset - start)
+	segments := make([][]byte, 0, len(r.segments))
+	for _, segment := range r.segments {
+		if skip >= len(segment) {
+			skip -= len(segment)
+			continue
+		}
+		segments = append(segments, segment[skip:])
+		skip = 0
+	}
+	return segments, r.end, false
+}
+func (r *ringBuffer) TailLines(maxLines, maxBytes int) []byte {
+	if maxLines < 1 || maxBytes < 1 || r.size == 0 {
+		return nil
+	}
+	remaining := maxLines
+	scanned := 0
+	startSegment, startOffset := 0, 0
+	found := false
+	skipTrailingNewline := len(r.segments) > 0 && len(r.segments[len(r.segments)-1]) > 0 && r.segments[len(r.segments)-1][len(r.segments[len(r.segments)-1])-1] == '\n'
+	for segmentIndex := len(r.segments) - 1; segmentIndex >= 0; segmentIndex-- {
+		segment := r.segments[segmentIndex]
+		for index := len(segment) - 1; index >= 0; index-- {
+			scanned++
+			if segment[index] != '\n' {
+				if scanned >= maxBytes {
+					startSegment, startOffset, found = segmentIndex, index, true
+					break
+				}
+				continue
+			}
+			if skipTrailingNewline {
+				skipTrailingNewline = false
+				continue
+			}
+			remaining--
+			if remaining == 0 {
+				startSegment, startOffset, found = segmentIndex, index+1, true
+				break
+			}
+			if scanned >= maxBytes {
+				startSegment, startOffset, found = segmentIndex, index, true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	segments := r.segments
+	if found {
+		segments = append([][]byte{r.segments[startSegment][startOffset:]}, r.segments[startSegment+1:]...)
+	}
+	size := 0
+	for _, segment := range segments {
+		size += len(segment)
+	}
+	return joinSegments(segments, size)
+}
+
+func joinSegments(segments [][]byte, size int) []byte {
+	if size == 0 {
+		return nil
+	}
+	out := make([]byte, 0, size)
+	for _, segment := range segments {
+		out = append(out, segment...)
+	}
+	return out
+}

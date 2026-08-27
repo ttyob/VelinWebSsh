@@ -13,7 +13,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +88,8 @@ type webProxySession struct {
 	routePrefix  string
 	stable       bool
 	rootProxy    bool
+	cookieMu     sync.Mutex
+	cookies      map[string]*http.Cookie
 	onProxyError func()
 }
 
@@ -224,6 +228,7 @@ func (m *webProxyManager) create(ctx context.Context, userID string, in webProxy
 		token: token, userID: userID, hostID: in.HostID, target: target,
 		upstream: upstream, client: client, transport: transport,
 		createdAt: now, lastUsedAt: now,
+		cookies: make(map[string]*http.Cookie),
 	}
 	session.proxy = session.reverseProxy()
 	m.mu.Lock()
@@ -551,7 +556,7 @@ func (s *webProxySession) reverseProxy() *httputil.ReverseProxy {
 				request.Header.Del("If-Modified-Since")
 				request.Header.Del("If-None-Match")
 			}
-			request.Header.Set("Cookie", upstreamCookies(request))
+			request.Header.Set("Cookie", s.upstreamCookieHeader(request))
 			request.Header.Set("X-Forwarded-Host", forwardedHost)
 			request.Header.Set("X-Forwarded-Proto", forwardedProto)
 			if prefix == "" {
@@ -577,15 +582,16 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	response.Header.Del("Content-Security-Policy")
 	response.Header.Del("Content-Security-Policy-Report-Only")
 	response.Header.Del("Clear-Site-Data")
-	response.Header.Set("Referrer-Policy", "no-referrer")
+	response.Header.Set("Referrer-Policy", "same-origin")
 	response.Header.Set("Service-Worker-Allowed", prefix+"/")
 	if location := response.Header.Get("Location"); location != "" {
-		response.Header.Set("Location", rewriteProxyURL(location, prefix, s.target))
+		response.Header.Set("Location", rewriteProxyResponseURL(location, prefix, s.target, response.Request))
 	}
 	if refresh := response.Header.Get("Refresh"); refresh != "" {
 		response.Header.Set("Refresh", rewriteRefresh(refresh, prefix, s.target))
 	}
 	setCookies := response.Header.Values("Set-Cookie")
+	s.captureUpstreamCookies(setCookies)
 	response.Header.Del("Set-Cookie")
 	for _, raw := range setCookies {
 		if cookie, err := http.ParseSetCookie(raw); err == nil {
@@ -618,7 +624,11 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	}
 	_ = response.Body.Close()
 	if mediaType == "text/html" {
-		body = rewriteHTML(body, prefix, s.target)
+		documentPath := "/"
+		if response.Request != nil && response.Request.URL != nil {
+			documentPath = proxyDocumentPath(response.Request.URL.Path, s.target)
+		}
+		body = rewriteHTMLAtPath(body, prefix, s.target, documentPath)
 	} else {
 		body = rewriteCSS(body, prefix, s.target)
 	}
@@ -664,6 +674,52 @@ func upstreamCookies(request *http.Request) string {
 	return strings.Join(values, "; ")
 }
 
+func (s *webProxySession) upstreamCookieHeader(request *http.Request) string {
+	values := make(map[string]string)
+	for _, cookie := range request.Cookies() {
+		if cookie.Name != cookieName && cookie.Name != csrfCookieName && !strings.HasPrefix(cookie.Name, hostPortAccessCookie) {
+			values[cookie.Name] = cookie.Value
+		}
+	}
+	s.cookieMu.Lock()
+	for name, cookie := range s.cookies {
+		if _, present := values[name]; !present {
+			values[name] = cookie.Value
+		}
+	}
+	s.cookieMu.Unlock()
+	parts := make([]string, 0, len(values))
+	for name, value := range values {
+		parts = append(parts, name+"="+value)
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, "; ")
+}
+
+func (s *webProxySession) captureUpstreamCookies(rawCookies []string) {
+	if len(rawCookies) == 0 {
+		return
+	}
+	now := time.Now()
+	s.cookieMu.Lock()
+	defer s.cookieMu.Unlock()
+	if s.cookies == nil {
+		s.cookies = make(map[string]*http.Cookie)
+	}
+	for _, raw := range rawCookies {
+		cookie, err := http.ParseSetCookie(raw)
+		if err != nil || cookie.Name == "" || cookie.Name == cookieName || cookie.Name == csrfCookieName || strings.HasPrefix(cookie.Name, hostPortAccessCookie) {
+			continue
+		}
+		if cookie.MaxAge < 0 || (!cookie.Expires.IsZero() && cookie.Expires.Before(now)) {
+			delete(s.cookies, cookie.Name)
+			continue
+		}
+		copy := *cookie
+		s.cookies[cookie.Name] = &copy
+	}
+}
+
 func rewriteRequestOrigin(request *http.Request, prefix string, target *url.URL, upstreamHost string) {
 	if origin := request.Header.Get("Origin"); origin != "" {
 		parsed, err := url.Parse(origin)
@@ -693,11 +749,15 @@ func requestProto(request *http.Request) string {
 }
 
 func rewriteHTML(body []byte, prefix string, target *url.URL) []byte {
+	return rewriteHTMLAtPath(body, prefix, target, "/")
+}
+
+func rewriteHTMLAtPath(body []byte, prefix string, target *url.URL, documentPath string) []byte {
 	document, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
 		return body
 	}
-	injectWebProxyBootstrap(document, prefix, target)
+	injectWebProxyBootstrap(document, prefix, target, documentPath)
 	var rewrite func(*html.Node)
 	rewrite = func(node *html.Node) {
 		if node.Type == html.ElementNode {
@@ -728,7 +788,7 @@ func rewriteHTML(body []byte, prefix string, target *url.URL) []byte {
 	return output.Bytes()
 }
 
-func injectWebProxyBootstrap(document *html.Node, prefix string, target *url.URL) {
+func injectWebProxyBootstrap(document *html.Node, prefix string, target *url.URL, documentPath string) {
 	var head *html.Node
 	var findHead func(*html.Node)
 	findHead = func(node *html.Node) {
@@ -757,9 +817,28 @@ func injectWebProxyBootstrap(document *html.Node, prefix string, target *url.URL
 	base := &html.Node{
 		Type: html.ElementNode,
 		Data: "base",
-		Attr: []html.Attribute{{Key: "href", Val: prefix + "/"}, {Key: "data-velin-web-proxy", Val: "base"}},
+		Attr: []html.Attribute{{Key: "href", Val: proxyDocumentBase(prefix, documentPath)}, {Key: "data-velin-web-proxy", Val: "base"}},
 	}
 	head.InsertBefore(base, script.NextSibling)
+}
+
+func proxyDocumentPath(requestPath string, target *url.URL) string {
+	documentPath := requestPath
+	if target != nil && target.Path != "" && target.Path != "/" {
+		documentPath = strings.TrimPrefix(documentPath, target.Path)
+	}
+	if documentPath == "" || documentPath[0] != '/' {
+		documentPath = "/" + documentPath
+	}
+	return documentPath
+}
+
+func proxyDocumentBase(prefix, documentPath string) string {
+	directory := path.Dir(ensureLeadingSlash(documentPath))
+	if directory == "." || directory == "/" {
+		return prefix + "/"
+	}
+	return prefix + ensureLeadingSlash(directory) + "/"
 }
 
 func webProxyBootstrap(prefix string, target *url.URL) string {
@@ -770,14 +849,22 @@ func webProxyBootstrap(prefix string, target *url.URL) string {
 	serviceID := serviceIDFromPrefix(prefix)
 	return `(function(){
   "use strict";
-  const prefix=` + strconv.Quote(prefix) + `;
-  const targetHost=` + strconv.Quote(target.Host) + `;
-  const targetPath=` + strconv.Quote(targetPath) + `;
+	const prefix=` + strconv.Quote(prefix) + `;
+	const targetHost=` + strconv.Quote(target.Host) + `;
+	const targetPort=` + strconv.Quote(effectiveURLPort(target)) + `;
+	const targetPath=` + strconv.Quote(targetPath) + `;
   const serviceID=` + strconv.Quote(serviceID) + `;
-  const serviceQuery=` + strconv.Quote(webServiceQuery) + `;
+	const serviceQuery=` + strconv.Quote(webServiceQuery) + `;
   const pageHost=location.host;
   const nativePushState=history.pushState.bind(history);
-  const nativeReplaceState=history.replaceState.bind(history);
+	const nativeReplaceState=history.replaceState.bind(history);
+	function targetHostMatches(value){
+	 if(value.host===targetHost) return true;
+	 const host=value.hostname.toLowerCase();
+	 const port=value.port||(value.protocol==="https:"||value.protocol==="wss:"?"443":"80");
+	 const loopback=host==="localhost"||host==="::1"||host==="[::1]"||host.startsWith("127.");
+	 return loopback&&port===targetPort;
+	}
   function browserRoute(value){
     if(!serviceID || value==null) return value;
     let parsed;
@@ -800,7 +887,7 @@ func webProxyBootstrap(prefix string, target *url.URL) string {
     try{parsed=new URL(original,location.href);}catch(_){return value;}
     if(!/^(https?|wss?):$/.test(parsed.protocol)) return value;
     const fromPage=parsed.host===pageHost;
-    const fromTarget=parsed.host===targetHost;
+	    const fromTarget=targetHostMatches(parsed);
     if(!fromPage && !fromTarget) return value;
     if(fromPage && (parsed.pathname===prefix || parsed.pathname.startsWith(prefix+"/"))) return original;
     if(fromTarget && targetPath!=="/" && (parsed.pathname===targetPath || parsed.pathname.startsWith(targetPath+"/"))){
@@ -876,11 +963,30 @@ func serviceIDFromPrefix(prefix string) string {
 	return strings.TrimPrefix(prefix, "/web-service-proxy/")
 }
 
+func serviceIDFromReferer(r *http.Request) string {
+	referer, err := url.Parse(strings.TrimSpace(r.Referer()))
+	if err != nil || referer.Host == "" || !strings.EqualFold(referer.Host, r.Host) {
+		return ""
+	}
+	if serviceID := strings.TrimSpace(referer.Query().Get(webServiceQuery)); serviceID != "" {
+		return serviceID
+	}
+	const prefix = "/web-service-proxy/"
+	if !strings.HasPrefix(referer.Path, prefix) {
+		return ""
+	}
+	rest := strings.TrimPrefix(referer.Path, prefix)
+	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+		rest = rest[:slash]
+	}
+	return strings.TrimSpace(rest)
+}
+
 func rewriteBrowserRouteURL(value, prefix string, target *url.URL) string {
-	serviceID := serviceIDFromPrefix(prefix)
-	if serviceID == "" {
+	if serviceIDFromPrefix(prefix) == "" {
 		return rewriteProxyURL(value, prefix, target)
 	}
+	serviceID := serviceIDFromPrefix(prefix)
 	rewritten := rewriteProxyURL(value, prefix, target)
 	parsed, err := url.Parse(rewritten)
 	if err != nil || (!strings.HasPrefix(parsed.Path, prefix+"/") && parsed.Path != prefix) {
@@ -945,13 +1051,13 @@ func rewriteProxyURL(value, prefix string, target *url.URL) string {
 		return value
 	}
 	if parsed.IsAbs() {
-		if !strings.EqualFold(parsed.Host, target.Host) || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "ws" && parsed.Scheme != "wss") {
+		if !isProxyTargetHost(parsed, target) || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "ws" && parsed.Scheme != "wss") {
 			return value
 		}
 		return prefix + ensureLeadingSlash(strings.TrimPrefix(parsed.Path, target.Path)) + queryAndFragment(parsed)
 	}
 	if strings.HasPrefix(trimmed, "//") {
-		if !strings.EqualFold(parsed.Host, target.Host) {
+		if !isProxyTargetHost(parsed, target) {
 			return value
 		}
 		return prefix + ensureLeadingSlash(strings.TrimPrefix(parsed.Path, target.Path)) + queryAndFragment(parsed)
@@ -960,6 +1066,59 @@ func rewriteProxyURL(value, prefix string, target *url.URL) string {
 		return prefix + parsed.Path + queryAndFragment(parsed)
 	}
 	return value
+}
+
+func rewriteProxyResponseURL(value, prefix string, target *url.URL, request *http.Request) string {
+	rewritten := rewriteProxyURL(value, prefix, target)
+	if rewritten != value || request == nil {
+		return rewritten
+	}
+	proxyHost := strings.TrimSpace(strings.Split(request.Header.Get("X-Forwarded-Host"), ",")[0])
+	if proxyHost == "" {
+		proxyHost = request.Host
+	}
+	if proxyHost == "" {
+		return value
+	}
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || !parsed.IsAbs() || !strings.EqualFold(parsed.Host, proxyHost) {
+		return value
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return value
+	}
+	return prefix + ensureLeadingSlash(strings.TrimPrefix(parsed.Path, target.Path)) + queryAndFragment(parsed)
+}
+
+func isProxyTargetHost(candidate, target *url.URL) bool {
+	if strings.EqualFold(candidate.Host, target.Host) {
+		return true
+	}
+	if candidate.Port() == "" && strings.EqualFold(candidate.Hostname(), target.Hostname()) {
+		return true
+	}
+	if !isLoopbackHost(candidate.Hostname()) {
+		return false
+	}
+	return effectiveURLPort(candidate) == effectiveURLPort(target)
+}
+
+func effectiveURLPort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	if value.Scheme == "https" || value.Scheme == "wss" {
+		return "443"
+	}
+	return "80"
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func queryAndFragment(value *url.URL) string {
@@ -1027,7 +1186,6 @@ func (a *API) createWebProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "web_proxy_create_failed", err.Error())
 		return
 	}
-	a.store.Audit(user.ID, "web_proxy_created", "host", in.HostID, ipOf(r), map[string]string{"target": session.target.Redacted()})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"token":     session.token,
 		"url":       session.prefix() + "/",
@@ -1127,7 +1285,6 @@ func (a *API) saveWebService(w http.ResponseWriter, r *http.Request) {
 		a.webProxies.deleteHostPort(value.ID)
 	}
 	saved, _ := a.store.WebService(user.ID, value.ID)
-	a.store.Audit(user.ID, "web_service_saved", "web_service", value.ID, ipOf(r), map[string]string{"name": value.Name})
 	writeJSON(w, http.StatusOK, saved)
 }
 
@@ -1138,7 +1295,6 @@ func (a *API) openWebService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "web_service_not_found", "内网 Web 服务不存在")
 		return
 	}
-	a.store.Audit(user.ID, "web_service_opened", "web_service", value.ID, ipOf(r), map[string]string{"name": value.Name, "mode": value.ProxyMode})
 	openURL := "/?" + url.Values{webServiceQuery: []string{value.ID}}.Encode()
 	if value.ProxyMode == "host_port" {
 		access, accessErr := a.webProxies.issueHostPortAccess(user.ID, value.ID, currentAuthTokenHash(r))
@@ -1166,7 +1322,6 @@ func (a *API) deleteWebService(w http.ResponseWriter, r *http.Request) {
 	}
 	a.webProxies.deleteStable(user.ID, id)
 	a.webProxies.deleteHostPort(id)
-	a.store.Audit(user.ID, "web_service_deleted", "web_service", id, ipOf(r), nil)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1196,6 +1351,9 @@ func (a *API) serveStableWebService(w http.ResponseWriter, r *http.Request, user
 func (a *API) markedWebServiceProxy(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serviceID := strings.TrimSpace(r.URL.Query().Get(webServiceQuery))
+		if serviceID == "" {
+			serviceID = serviceIDFromReferer(r)
+		}
 		if serviceID == "" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 			next.ServeHTTP(w, r)
 			return
@@ -1216,7 +1374,9 @@ func (a *API) markedWebServiceProxy(next http.Handler) http.Handler {
 		query := r.URL.Query()
 		query.Del(webServiceQuery)
 		request := r.Clone(context.WithValue(context.WithValue(r.Context(), userKey, user), authTokenHashKey, tokenHash))
-		request.URL.RawQuery = query.Encode()
+		if strings.TrimSpace(r.URL.Query().Get(webServiceQuery)) != "" {
+			request.URL.RawQuery = query.Encode()
+		}
 		a.serveStableWebService(w, request, user, serviceID)
 	})
 }
@@ -1316,8 +1476,6 @@ func (a *API) deleteWebProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "web_proxy_not_found", "Web 代理不存在或已过期")
 		return
 	}
-	tokenHash := security.TokenHash(token)
-	a.store.Audit(user.ID, "web_proxy_closed", "web_proxy", tokenHash[:12], ipOf(r), nil)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1336,7 +1494,7 @@ func serveWebProxySession(w http.ResponseWriter, r *http.Request, session *webPr
 	w.Header().Del("Content-Security-Policy")
 	w.Header().Del("X-Frame-Options")
 	w.Header().Set("Content-Security-Policy", webProxyCSP(r.Host, session.prefix()))
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Referrer-Policy", "same-origin")
 	session.proxy.ServeHTTP(w, r)
 }
 

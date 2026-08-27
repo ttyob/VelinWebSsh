@@ -13,7 +13,7 @@ import {
   Upload,
 } from "@lucide/vue";
 import { ElMessage, ElMessageBox } from "element-plus";
-import { api, json } from "../api";
+import { api, csrfHeaders, json } from "../api";
 import type { Host } from "../types";
 
 const TextFileEditorDialog = defineAsyncComponent(
@@ -41,6 +41,8 @@ const currentPath = ref(".");
 const entries = ref<FileEntry[]>([]);
 const showHidden = ref(false);
 const loading = ref(false);
+const uploadQueue = ref<Array<{ name: string; progress: number; status: string }>>([]);
+const uploading = ref(false);
 const fileInput = ref<HTMLInputElement>();
 const editorOpen = ref(false);
 const editingFile = ref<FileEntry>();
@@ -204,35 +206,57 @@ function formatBytes(size: number) {
   return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${unit}`;
 }
 
+function uploadChunk(pathname: string, file: Blob, offset: number, overwrite: boolean) {
+	return new Promise<number>((resolve, reject) => {
+		const request = new XMLHttpRequest();
+		request.open("PUT", `/api/sftp/${props.host!.id}/upload?path=${encodeURIComponent(pathname)}&offset=${offset}&overwrite=${overwrite}${sessionQuery.value}`);
+		void csrfHeaders().then((headers) => { Object.entries(headers).forEach(([key, value]) => request.setRequestHeader(key, value)); request.send(file); }).catch(reject);
+		request.onload = () => {
+			if (request.status < 200 || request.status >= 300) { reject(new Error("分块上传失败")); return; }
+			try { resolve(Number(JSON.parse(request.responseText).offset) || offset + file.size); } catch { resolve(offset + file.size); }
+		};
+		request.onerror = () => reject(new Error("网络连接中断"));
+	});
+}
+
+async function uploadOne(file: File, queueItem: { name: string; progress: number; status: string }) {
+	if (!props.host) return;
+	const target = `${currentPath.value}/${file.name}`;
+	let offset = 0;
+	let overwrite = false;
+	const status = await api<{ size: number; exists: boolean }>(`/api/sftp/${props.host.id}/transfer-status?path=${encodeURIComponent(target)}${sessionQuery.value}`);
+	if (status.exists && status.size >= file.size) {
+		await ElMessageBox.confirm("同名远程文件已存在，是否覆盖？", "覆盖文件", { type: "warning" });
+		offset = 0; overwrite = true;
+	} else if (status.exists) {
+		offset = status.size; overwrite = true; queueItem.status = `续传 ${Math.floor(offset / file.size * 100)}%`;
+	}
+	const chunkSize = 8 * 1024 * 1024;
+	while (offset < file.size) {
+		const end = Math.min(file.size, offset + chunkSize);
+		offset = await uploadChunk(target, file.slice(offset, end), offset, overwrite);
+		queueItem.progress = Math.min(100, Math.round(offset / file.size * 100));
+		queueItem.status = `${queueItem.progress}%`;
+	}
+	queueItem.progress = 100; queueItem.status = "完成";
+}
+
 async function uploadFile(event: Event) {
-  if (!props.host) return;
-  const file = (event.target as HTMLInputElement).files?.[0];
-  if (!file) return;
-  const target = `${currentPath.value}/${file.name}`;
-  let overwrite = false;
-  try {
-    if (entries.value.some((item) => item.name === file.name)) {
-      await ElMessageBox.confirm("同名远程文件已存在，是否覆盖？", "覆盖文件", {
-        type: "warning",
-      });
-      overwrite = true;
-    }
-    const response = await fetch(
-      `/api/sftp/${props.host.id}/upload?path=${encodeURIComponent(target)}&overwrite=${overwrite}${sessionQuery.value}`,
-      { method: "PUT", body: file, credentials: "same-origin" },
-    );
-    if (!response.ok) {
-      const body = await response.json();
-      throw new Error(body.message || "上传失败");
-    }
-    ElMessage.success("上传完成");
-    await listFiles();
-  } catch (error: any) {
-    if (error !== "cancel" && error !== "close")
-      ElMessage.error(error instanceof Error ? error.message : "上传失败");
-  } finally {
-    if (fileInput.value) fileInput.value.value = "";
-  }
+	if (!props.host) return;
+	const files = Array.from((event.target as HTMLInputElement).files || []);
+	if (!files.length) return;
+	uploading.value = true;
+	uploadQueue.value = files.map((file) => ({ name: file.name, progress: 0, status: "等待" }));
+	try {
+		for (let index = 0; index < files.length; index++) {
+			try { await uploadOne(files[index], uploadQueue.value[index]); }
+			catch (error) { uploadQueue.value[index].status = "失败"; ElMessage.error(`${files[index].name}：${error instanceof Error ? error.message : "上传失败"}`); }
+		}
+		await listFiles();
+	} finally {
+		uploading.value = false;
+		if (fileInput.value) fileInput.value.value = "";
+	}
 }
 </script>
 
@@ -258,10 +282,10 @@ async function uploadFile(event: Event) {
       <el-button class="file-mkdir" :icon="FolderPlus" @click="mkdir"
         >新建目录</el-button
       >
-      <el-button class="file-upload" :icon="Upload" @click="fileInput?.click()"
+      <el-button class="file-upload" :icon="Upload" :loading="uploading" @click="fileInput?.click()"
         >上传</el-button
       >
-      <input ref="fileInput" hidden type="file" @change="uploadFile" />
+      <input ref="fileInput" hidden type="file" multiple @change="uploadFile" />
     </div>
     <div class="file-options">
       <el-checkbox v-model="showHidden">显示隐藏文件</el-checkbox>
@@ -312,6 +336,9 @@ async function uploadFile(event: Event) {
           </el-dropdown>
         </div>
       </div>
+    </div>
+    <div v-if="uploadQueue.length" class="file-upload-queue">
+      <div v-for="item in uploadQueue" :key="item.name" class="file-upload-item"><span>{{ item.name }}</span><el-progress :percentage="item.progress" :status="item.status === '失败' ? 'exception' : item.status === '完成' ? 'success' : undefined" /><small>{{ item.status }}</small></div>
     </div>
     <TextFileEditorDialog
       v-model="editorOpen"

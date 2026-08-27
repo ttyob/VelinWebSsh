@@ -22,4 +22,13 @@ assert.equal(tmuxInstallGuide('linux', 'alpine').command, 'sudo apk add tmux')
 assert.equal(tmuxInstallGuide('windows', '').supported, false)
 assert.match(tmuxInstallGuide('linux', 'unknown').command, /command -v apt-get/)
 
+const { resolveTabAttention, terminalOutputSettleDelay } = await loadModule(new URL('../src/terminalAttention.ts', import.meta.url))
+assert.equal(terminalOutputSettleDelay, 5000)
+assert.equal(resolveTabAttention([{ name: 'server', status: 'ended', notice: 'settled' }]).kind, 'ended')
+assert.equal(resolveTabAttention([{ name: 'server', status: 'attached', notice: 'bell' }]).kind, 'bell')
+assert.equal(resolveTabAttention([{ name: 'server', status: 'auth_required', notice: 'bell' }]).kind, 'required')
+assert.equal(resolveTabAttention([{ name: 'server', status: 'attached', notice: 'settled' }]).kind, 'settled')
+assert.equal(resolveTabAttention([{ name: 'one', status: 'ended' }, { name: 'two', status: 'attached', notice: 'settled' }]).count, 2)
+assert.equal(resolveTabAttention([{ name: 'server', status: 'attached' }]), undefined)
+
 console.log('frontend unit checks passed')

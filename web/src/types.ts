@@ -23,6 +23,12 @@ export interface SecurityPolicy {
   rememberDays: number;
   forceChangeOnCreate: boolean;
 }
+export interface AIModelConfig {
+  baseURL: string;
+  model: string;
+  apiKeyConfigured: boolean;
+  configured: boolean;
+}
 export interface Snippet {
   id: string;
   userID?: string;
@@ -33,14 +39,6 @@ export interface Snippet {
   description: string;
   createdAt?: string;
   updatedAt?: string;
-}
-export interface AppNotification {
-  id: string;
-  sessionID: string;
-  title: string;
-  kind: string;
-  read: boolean;
-  createdAt: string;
 }
 export interface PortForward {
   id: string;
@@ -76,7 +74,9 @@ export interface Host {
   port: number;
   username: string;
   credentialID: string;
+  hasPassword?: boolean;
   groupName: string;
+  sortOrder?: number;
   tags: string;
   notes: string;
   initialDirectory: string;
@@ -93,6 +93,59 @@ export interface Host {
   lastConnectedAt?: string;
   createdAt?: string;
   updatedAt?: string;
+}
+export interface AgentStatus {
+  hostID: string;
+  state: "disconnected" | "connecting" | "connected" | "error";
+  backend: "velin";
+  aiConfigured: boolean;
+  model?: string;
+  hostname?: string;
+  os?: string;
+  arch?: string;
+  kernel?: string;
+  connectedAt?: string;
+  lastSeenAt?: string;
+  lastError?: string;
+}
+export interface AgentModel {
+  id: string;
+  ownedBy?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+}
+export interface AgentSnapshot {
+  system: {
+    hostname: string;
+    os: string;
+    arch: string;
+    kernel: string;
+  };
+  uptimeSeconds: number;
+  load1: number;
+  load5: number;
+  load15: number;
+  memory: {
+    totalBytes: number;
+    availableBytes: number;
+    usedBytes: number;
+    usedPercent: number;
+  };
+  disks: Array<{
+    path: string;
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+    usedPercent: number;
+  }>;
+  collectedAt: string;
+}
+export interface AgentProcess {
+  pid: number;
+  user: string;
+  state: string;
+  memoryBytes: number;
+  command: string;
 }
 export interface Credential {
   id: string;
@@ -142,8 +195,7 @@ export interface Preferences {
   pasteGuard: boolean;
   visualBell: boolean;
   soundBell: boolean;
-  browserNotifications: boolean;
-  lockEnabled: boolean;
+	lockEnabled: boolean;
   autoLockMinutes: number;
   lockOnShortcut: boolean;
 }
@@ -172,8 +224,7 @@ export interface WorkspaceLayout {
   maximized?: Record<string, string>;
   panes?: string[];
   split?: "single" | "horizontal" | "vertical" | "grid";
-  watchedSessionIDs?: string[];
-  pinnedSessionIDs?: string[];
+	pinnedSessionIDs?: string[];
 }
 export interface ApiErrorBody {
   code: string;
