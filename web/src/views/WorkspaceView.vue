@@ -1061,8 +1061,8 @@ function openPaneAgent() {
   contextMenu.open = false;
   if (!session || !host)
     return ElMessage.warning("当前终端没有可用的主机信息");
-  if (!host.credentialID)
-    return ElMessage.warning("请先为当前主机配置 SSH 凭据");
+  if (!host.credentialID && !host.hasPassword)
+    return ElMessage.warning("请先为当前主机保存 SSH 密码或配置 SSH 凭据");
   agentHost.value = host;
   agentTabID.value = layout.active;
   agentOpen.value = true;
@@ -1076,8 +1076,8 @@ function openPaneDocker() {
   contextMenu.open = false;
   if (!session || !host)
     return ElMessage.warning("当前终端没有可用的主机信息");
-  if (!host.credentialID)
-    return ElMessage.warning("请先为当前主机配置 SSH 凭据");
+  if (!host.credentialID && !host.hasPassword)
+    return ElMessage.warning("请先为当前主机保存 SSH 密码或配置 SSH 凭据");
   dockerHost.value = host;
   dockerSessionID.value = session.id;
   dockerOpen.value = true;

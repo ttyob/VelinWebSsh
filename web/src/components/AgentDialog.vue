@@ -175,7 +175,7 @@ watch(
     const loadedStatus = status.value as AgentStatus | undefined;
     if (!selectedModel.value) selectedModel.value = loadedStatus?.model || "";
     void loadAgentModels();
-    if (!connected.value && props.host.credentialID) {
+    if (!connected.value && (props.host.credentialID || props.host.hasPassword)) {
       await connect();
     }
   },
@@ -187,7 +187,7 @@ watch(
     if (suspended || previous === undefined || !props.modelValue) return;
     const wasConnected =
       status.value?.state === "connected" || status.value?.state === "connecting";
-    if (!wasConnected || !props.host?.credentialID) return;
+    if (!wasConnected || (!props.host?.credentialID && !props.host?.hasPassword)) return;
     await loadStatus();
     if (status.value?.state !== "connected") await connect();
   },
@@ -836,7 +836,7 @@ function resultCommand(content: string) {
               text
               :icon="PlugZap"
               :loading="busy === 'connect'"
-              :disabled="Boolean(busy) || !host?.credentialID"
+              :disabled="Boolean(busy) || (!host?.credentialID && !host?.hasPassword)"
               title="连接 Agent"
               aria-label="连接 Agent"
               @pointerdown.stop

@@ -77,12 +77,12 @@ func (m *Manager) DialSaved(ctx context.Context, userID, hostID string) (*ssh.Cl
 	if err != nil {
 		return nil, host, err
 	}
-	if host.CredentialID == "" {
-		return nil, host, errors.New("saved credential required")
-	}
-	credential, err := m.store.Credential(userID, host.CredentialID)
-	if err != nil {
-		return nil, host, err
+	var credential store.Credential
+	if host.CredentialID != "" {
+		credential, err = m.store.Credential(userID, host.CredentialID)
+		if err != nil {
+			return nil, host, err
+		}
 	}
 	client, err := m.dial(ctx, userID, host, credential, "", "", "")
 	return client, host, err

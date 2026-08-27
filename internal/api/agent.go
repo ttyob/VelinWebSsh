@@ -191,7 +191,7 @@ func writeAgentError(w http.ResponseWriter, err error) {
 	code := "agent_operation_failed"
 	status := http.StatusBadGateway
 	message := err.Error()
-	if strings.Contains(message, "saved credential required") {
+	if strings.Contains(message, "credential required") {
 		code = "saved_credential_required"
 		status = http.StatusConflict
 	}
