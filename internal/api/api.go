@@ -61,6 +61,7 @@ type API struct {
 	http5xx    atomic.Uint64
 	wsTotal    atomic.Uint64
 	taskQueue  chan commandTaskRequest
+	backupMu   sync.Mutex
 }
 
 type contextKey string
@@ -1752,7 +1753,7 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	if info, err := os.Stat(a.cfg.DatabasePath); err == nil {
 		dbSize = info.Size()
 	}
-	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db"))
+	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db.enc"))
 	latestBackup := ""
 	for _, file := range entries {
 		if info, err := os.Stat(file); err == nil && (latestBackup == "" || info.ModTime().Format(time.RFC3339) > latestBackup) {
@@ -1762,26 +1763,55 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"users": users, "activeUsers": activeUsers, "hosts": hosts, "sessions": sessions, "websockets": a.websockets.Load(), "httpRequests": a.requests.Load(), "databaseBytes": dbSize, "backups": len(entries), "latestBackupAt": latestBackup, "uptimeSeconds": int(time.Since(a.started).Seconds()), "deploymentID": a.cfg.DeploymentID, "goVersion": runtime.Version()})
 }
 func (a *API) backup(w http.ResponseWriter, r *http.Request) {
-	name := "velin-" + time.Now().UTC().Format("20060102-150405") + ".db"
+	a.backupMu.Lock()
+	defer a.backupMu.Unlock()
+	var input struct {
+		Key string `json:"key"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if err := security.ValidateBackupKey(input.Key); err != nil {
+		writeError(w, 400, "invalid_backup_key", "备份密钥至少 12 个字符且不能超过 256 个字符")
+		return
+	}
+	name := "velin-" + time.Now().UTC().Format("20060102-150405") + "-" + uuid.NewString()[:8] + ".db.enc"
 	path := filepath.Join(a.cfg.DataDir, name)
-	if err := a.store.Backup(r.Context(), path); err != nil {
+	temp, err := os.CreateTemp(a.cfg.DataDir, ".velin-backup-*.db")
+	if err != nil {
 		writeError(w, 500, "backup_failed", err.Error())
 		return
 	}
-	if err := store.VerifyBackup(path); err != nil {
-		_ = os.Remove(path)
+	tempPath := temp.Name()
+	if err = temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		writeError(w, 500, "backup_failed", err.Error())
+		return
+	}
+	defer os.Remove(tempPath)
+	if err = a.store.Backup(r.Context(), tempPath); err != nil {
+		writeError(w, 500, "backup_failed", err.Error())
+		return
+	}
+	if err = store.VerifyBackup(tempPath); err != nil {
 		writeError(w, 500, "backup_verify_failed", err.Error())
+		return
+	}
+	if err = security.EncryptBackupBundle(tempPath, a.cfg.MasterKeyPath, path, input.Key); err != nil {
+		_ = os.Remove(path)
+		writeError(w, 500, "backup_encrypt_failed", "备份加密失败")
 		return
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		_ = os.Remove(path)
 		writeError(w, 500, "backup_read_failed", err.Error())
 		return
 	}
 	sum := sha256.Sum256(raw)
 	checksum := hex.EncodeToString(sum[:])
 	_ = os.WriteFile(path+".sha256", []byte(checksum+"  "+name+"\n"), 0o600)
-	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db"))
+	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db.enc"))
 	if len(entries) > 10 {
 		sort.Strings(entries)
 		for _, old := range entries[:len(entries)-10] {
@@ -1789,10 +1819,10 @@ func (a *API) backup(w http.ResponseWriter, r *http.Request) {
 			_ = os.Remove(old + ".sha256")
 		}
 	}
-	writeJSON(w, 201, map[string]any{"file": name, "sha256": checksum, "verified": true, "schemaVersion": 13})
+	writeJSON(w, 201, map[string]any{"file": name, "sha256": checksum, "verified": true, "encrypted": true, "schemaVersion": 13})
 }
 func (a *API) backups(w http.ResponseWriter, r *http.Request) {
-	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db"))
+	entries, _ := filepath.Glob(filepath.Join(a.cfg.DataDir, "velin-*.db.enc"))
 	sort.Sort(sort.Reverse(sort.StringSlice(entries)))
 	out := make([]map[string]any, 0, len(entries))
 	for _, file := range entries {

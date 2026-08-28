@@ -71,7 +71,9 @@ const tab = ref("terminal"),
   users = ref<User[]>([]),
   devices = ref<LoginDevice[]>([]),
   stats = ref<any>({}),
-  backups = ref<any[]>([]);
+  backups = ref<any[]>([]),
+  backupKey = ref(""),
+  backupBusy = ref<"backup" | "restore">();
 const userDialogOpen = ref(false),
   userPasswordDialogOpen = ref(false),
   savingUser = ref(false),
@@ -522,25 +524,51 @@ async function testAIModel() {
   }
 }
 async function backup() {
-  const result = await api<{ file: string; sha256: string; verified: boolean }>(
-    "/api/admin/backup",
-    { method: "POST" },
-  );
-	ElMessage.success(
-		`备份已创建并通过完整性验证：${result.file} · ${result.sha256.slice(0, 12)}…`,
-	);
-	backups.value = await api<any[]>("/api/admin/backups");
+  if (backupKey.value.length < 12)
+    return ElMessage.warning("备份密钥至少需要 12 个字符");
+  backupBusy.value = "backup";
+  try {
+    const result = await api<{ file: string; sha256: string; verified: boolean }>(
+      "/api/admin/backup",
+      { method: "POST", body: json({ key: backupKey.value }) },
+    );
+    ElMessage.success(
+      `加密备份已创建并通过完整性验证：${result.file} · ${result.sha256.slice(0, 12)}…`,
+    );
+    backups.value = await api<any[]>("/api/admin/backups");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "备份创建失败");
+  } finally {
+    backupBusy.value = undefined;
+  }
 }
 function downloadBackup(file: string) {
-	const link = document.createElement("a"); link.href = `/api/admin/backups/${encodeURIComponent(file)}/download`; link.click();
+	const link = document.createElement("a");
+	link.href = `/api/admin/backups/${encodeURIComponent(file)}/download`;
+	link.click();
 }
 async function restoreBackup(file: string) {
+	if (backupKey.value.length < 12)
+		return ElMessage.warning("请输入创建该备份时使用的密钥");
 	try {
-		await ElMessageBox.confirm(`恢复后当前数据库会被替换，现有登录会话会失效。系统会先自动创建恢复前备份。确认恢复“${file}”？`, "恢复数据库", { type: "warning", confirmButtonText: "确认恢复", cancelButtonText: "取消" });
-		await api(`/api/admin/backups/${encodeURIComponent(file)}/restore`, { method: "POST" });
+		await ElMessageBox.confirm(
+			`恢复后当前数据库会被替换，现有登录会话会失效。系统会先自动创建恢复前备份。确认恢复“${file}”？`,
+			"恢复数据库",
+			{ type: "warning", confirmButtonText: "确认恢复", cancelButtonText: "取消" },
+		);
+		backupBusy.value = "restore";
+		await api(`/api/admin/backups/${encodeURIComponent(file)}/restore`, {
+			method: "POST",
+			body: json({ key: backupKey.value }),
+		});
 		ElMessage.success("恢复完成，请重新登录");
 		emit("logout");
-	} catch (error: any) { if (error !== "cancel" && error !== "close") ElMessage.error(error instanceof Error ? error.message : "恢复失败"); }
+	} catch (error: any) {
+		if (error !== "cancel" && error !== "close")
+			ElMessage.error(error instanceof Error ? error.message : "恢复失败");
+	} finally {
+		backupBusy.value = undefined;
+	}
 }
 async function changePassword() {
   const p = passwordForm.value;
@@ -1258,11 +1286,52 @@ function forwardBatch(text: string, sessionIDs: string[]) {
                 >保存安全策略</el-button
               >
             </div>
-            <div class="backup-tools">
-              <el-button :icon="HardDriveDownload" @click="backup">创建数据库备份</el-button>
+            <div class="settings-section backup-section">
+              <div class="security-heading">
+                <div>
+                  <h3>加密备份与恢复</h3>
+                  <p>备份包含应用数据库和主密钥，使用输入的密钥整体加密。密钥不会保存到服务器。</p>
+                </div>
+                <span class="security-state">AES-GCM</span>
+              </div>
+              <div class="backup-key-form">
+                <el-input
+                  v-model="backupKey"
+                  type="password"
+                  show-password
+                  autocomplete="new-password"
+                  placeholder="备份密钥，至少 12 个字符"
+                />
+                <el-button
+                  :icon="HardDriveDownload"
+                  type="primary"
+                  :loading="backupBusy === 'backup'"
+                  :disabled="backupBusy === 'restore'"
+                  @click="backup"
+                >创建加密备份</el-button>
+              </div>
+              <p class="setting-note">
+                恢复时请输入创建该备份时使用的密钥。忘记密钥无法恢复备份；建议通过 HTTPS 使用此功能。
+              </p>
               <div v-for="item in backups" :key="item.file" class="data-row backup-row">
-                <div><strong>{{ item.file }}</strong><small>{{ formatBytes(item.size) }} · {{ new Date(item.createdAt).toLocaleString() }} · {{ item.sha256?.slice(0, 12) }}</small></div>
-                <div class="row-actions"><el-button text :icon="Download" @click="downloadBackup(item.file)">下载</el-button><el-button text type="warning" :icon="RefreshCw" @click="restoreBackup(item.file)">恢复</el-button></div>
+                <div>
+                  <strong>{{ item.file }}</strong>
+                  <small>{{ formatBytes(item.size) }} · {{ new Date(item.createdAt).toLocaleString() }} · {{ item.sha256?.slice(0, 12) }}</small>
+                </div>
+                <div class="row-actions">
+                  <el-button text :icon="Download" @click="downloadBackup(item.file)">下载</el-button>
+                  <el-button
+                    text
+                    type="warning"
+                    :icon="RefreshCw"
+                    :loading="backupBusy === 'restore'"
+                    :disabled="backupBusy === 'backup'"
+                    @click="restoreBackup(item.file)"
+                  >恢复</el-button>
+                </div>
+              </div>
+              <div v-if="!backups.length" class="empty-small backup-empty">
+                <Database :size="24" /><span>暂无加密备份</span>
               </div>
             </div>
           </el-tab-pane>

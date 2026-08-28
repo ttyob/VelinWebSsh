@@ -311,7 +311,9 @@ docker compose up -d --build
 - <code>data/crush/</code>：Crush 运行数据
 - <code>data/deployment_id</code>：部署实例标识，用于隔离 tmux session
 
-备份时应整体备份 <code>data/</code>，尤其不能遗漏 <code>master.key</code>。只有数据库没有主密钥时，已加密凭据无法恢复。备份文件本身也应限制权限。
+管理员可在设置的“管理”页创建加密备份。备份包含应用数据库和 <code>master.key</code>，使用输入的密钥整体加密。备份密钥至少 12 个字符，通过 Argon2id 派生密钥并使用 AES-GCM 加密；密钥不会写入数据库、环境变量或备份文件。恢复时只需输入创建备份时使用的密钥，恢复前系统会自动生成一份同样加密的当前备份。
+
+备份文件包含恢复数据库所需的 <code>master.key</code>，可以用于跨服务器恢复数据库和已保存凭据。终端录制视频、<code>data/crush/</code> 和 <code>.env</code> 仍不在该备份中；备份文件本身应限制权限。
 
 公网部署建议：
 

@@ -12,6 +12,7 @@ import {
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
+  Activity,
   Archive,
   BellRing,
   Box,
@@ -24,6 +25,7 @@ import {
   Columns2,
   Copy,
   FolderOpen,
+  GitBranch,
   KeyRound,
   LockKeyhole,
   LogOut,
@@ -87,8 +89,14 @@ const WebProxyDialog = defineAsyncComponent(
 const AgentDialog = defineAsyncComponent(
   () => import("../components/AgentDialog.vue"),
 );
+const HostMonitorDialog = defineAsyncComponent(
+  () => import("../components/HostMonitorDialog.vue"),
+);
 const DockerDialog = defineAsyncComponent(
   () => import("../components/DockerDialog.vue"),
+);
+const GitDialog = defineAsyncComponent(
+  () => import("../components/GitDialog.vue"),
 );
 
 const router = useRouter(),
@@ -125,9 +133,15 @@ const hostDialog = ref(false),
   agentOpen = ref(false),
   agentHost = ref<Host>(),
   agentTabID = ref(""),
+  hostMonitorOpen = ref(false),
+  hostMonitorHost = ref<Host>(),
   dockerOpen = ref(false),
   dockerHost = ref<Host>(),
   dockerSessionID = ref(""),
+  gitOpen = ref(false),
+  gitHost = ref<Host>(),
+  gitSessionID = ref(""),
+  gitPath = ref(""),
   tmuxInstallOpen = ref(false),
   tmuxInstallHost = ref<Host>(),
   editingWebService = ref<WebService>(),
@@ -861,7 +875,7 @@ function openContext(event: MouseEvent, leafID: string) {
   contextMenu.x = Math.min(event.clientX, window.innerWidth - 188);
   contextMenu.y = Math.max(
     6,
-    Math.min(event.clientY, window.innerHeight - 405),
+    Math.min(event.clientY, window.innerHeight - 445),
   );
   const request = ++dockerContextRequest;
   if (session?.sessionMode === "tmux") {
@@ -1067,6 +1081,20 @@ function openPaneAgent() {
   agentTabID.value = layout.active;
   agentOpen.value = true;
 }
+function openPaneMonitor() {
+  if (!layout.active) return;
+  const tree = layout.trees?.[layout.active];
+  const session = tree && sessionForLeaf(tree, contextMenu.leafID);
+  const host =
+    session && hosts.value.find((item) => item.id === session.hostID);
+  contextMenu.open = false;
+  if (!session || !host)
+    return ElMessage.warning("当前终端没有可用的主机信息");
+  if (!host.credentialID && !host.hasPassword)
+    return ElMessage.warning("请先为当前主机保存 SSH 密码或配置 SSH 凭据");
+  hostMonitorHost.value = host;
+  hostMonitorOpen.value = true;
+}
 function openPaneDocker() {
   if (dockerMenuDisabled.value || !layout.active) return;
   const tree = layout.trees?.[layout.active];
@@ -1081,6 +1109,32 @@ function openPaneDocker() {
   dockerHost.value = host;
   dockerSessionID.value = session.id;
   dockerOpen.value = true;
+}
+async function openPaneGit() {
+  if (dockerMenuDisabled.value || !layout.active) return;
+  const tree = layout.trees?.[layout.active];
+  const session = tree && sessionForLeaf(tree, contextMenu.leafID);
+  const host =
+    session && hosts.value.find((item) => item.id === session.hostID);
+  contextMenu.open = false;
+  if (!session || !host)
+    return ElMessage.warning("当前终端没有可用的主机信息");
+  if (!host.credentialID && !host.hasPassword)
+    return ElMessage.warning("请先为当前主机保存 SSH 密码或配置 SSH 凭据");
+  let current = sessionDirectories[session.id];
+  if (!current) {
+    try {
+      const result = await api<{ path: string }>(
+        `/api/sessions/${session.id}/directory`,
+      );
+      current = result.path;
+      sessionDirectories[session.id] = current;
+    } catch {}
+  }
+  gitHost.value = host;
+  gitSessionID.value = session.id;
+  gitPath.value = current || host.initialDirectory || ".";
+  gitOpen.value = true;
 }
 function sendSnippet(text: string, execute = false) {
   if (!layout.active) return;
@@ -2155,6 +2209,20 @@ onBeforeUnmount(() => {
           <FolderOpen :size="16" /><span>打开当前目录</span></button
         ><button @click="openPaneAgent">
           <Bot :size="16" /><span>打开 Agent</span></button
+        ><button @click="openPaneMonitor">
+          <Activity :size="16" /><span>主机监控</span></button
+        ><button
+          :disabled="dockerMenuDisabled"
+          :title="
+            dockerContext.checking
+              ? '正在确认当前终端状态'
+              : dockerContext.conversation
+                ? '对话式终端暂不支持 Git 管理'
+                : 'Git 管理'
+          "
+          @click="openPaneGit"
+        >
+          <GitBranch :size="16" /><span>Git 管理</span></button
         ><button
           :disabled="dockerMenuDisabled"
           :title="
@@ -2450,11 +2518,21 @@ onBeforeUnmount(() => {
       :host="agentHost"
       :suspended="Boolean(agentTabID && agentTabID !== layout.active)"
     />
+    <HostMonitorDialog
+      v-model="hostMonitorOpen"
+      :host="hostMonitorHost"
+    />
     <DockerDialog
       v-model="dockerOpen"
       :host="dockerHost"
       :session-id="dockerSessionID"
       @terminal="openDockerTerminal"
+    />
+    <GitDialog
+      v-model="gitOpen"
+      :host="gitHost"
+      :session-id="gitSessionID"
+      :initial-path="gitPath"
     />
     <Transition name="workspace-lock">
       <section v-if="locked" class="workspace-lock" aria-modal="true" role="dialog">

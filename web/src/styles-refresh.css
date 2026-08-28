@@ -2043,11 +2043,22 @@ body {
 .task-status.failed { color: var(--danger); }
 .danger-text { color: var(--danger) !important; }
 .backup-tools { display: grid; gap: 10px; margin-top: 16px; }
+.backup-section { margin-top: 18px; }
+.backup-key-form {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 8px;
+	align-items: center;
+}
+.backup-key-form .el-input { min-width: 0; }
+.backup-empty { height: 96px; }
 .backup-row { align-items: center; }
 .file-upload-queue { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--line); background: var(--surface-2); }
 .file-upload-item { display: grid; grid-template-columns: minmax(100px, .8fr) minmax(160px, 1.4fr) 52px; align-items: center; gap: 10px; font-size: 12px; }
 .file-upload-item small { color: var(--muted); text-align: right; }
 @media (max-width: 760px) {
+	.backup-key-form { grid-template-columns: 1fr; }
+	.backup-key-form .el-button { width: 100%; }
 	.file-upload-item { grid-template-columns: 1fr 52px; }
 	.file-upload-item .el-progress { grid-column: 1 / -1; grid-row: 2; }
 }

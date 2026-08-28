@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
 )
 
@@ -190,7 +193,7 @@ func (a *API) downloadRecording(w http.ResponseWriter, r *http.Request) {
 
 func safeBackupFile(dataDir, name string) (string, error) {
 	name = filepath.Base(name)
-	if !strings.HasPrefix(name, "velin-") || !strings.HasSuffix(name, ".db") {
+	if !strings.HasPrefix(name, "velin-") || !strings.HasSuffix(name, ".db.enc") {
 		return "", errors.New("invalid backup name")
 	}
 	path := filepath.Join(dataDir, name)
@@ -228,24 +231,107 @@ func (a *API) downloadBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) restoreBackup(w http.ResponseWriter, r *http.Request) {
+	a.backupMu.Lock()
+	defer a.backupMu.Unlock()
+	var input struct {
+		Key string `json:"key"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if err := security.ValidateBackupKey(input.Key); err != nil {
+		writeError(w, 400, "invalid_backup_key", "备份密钥至少 12 个字符且不能超过 256 个字符")
+		return
+	}
 	path, err := safeBackupFile(a.cfg.DataDir, chi.URLParam(r, "file"))
 	if err != nil {
 		writeError(w, 404, "backup_not_found", "备份不存在")
 		return
 	}
-	if err = store.VerifyBackup(path); err != nil {
+	temp, err := os.CreateTemp(a.cfg.DataDir, ".velin-restore-*.db")
+	if err != nil {
+		writeError(w, 500, "restore_failed", "无法创建恢复临时文件")
+		return
+	}
+	tempPath := temp.Name()
+	if err = temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		writeError(w, 500, "restore_failed", "无法创建恢复临时文件")
+		return
+	}
+	defer os.Remove(tempPath)
+	masterTemp, err := os.CreateTemp(a.cfg.DataDir, ".velin-restore-master-*")
+	if err != nil {
+		writeError(w, 500, "restore_failed", "无法创建主密钥临时文件")
+		return
+	}
+	masterTempPath := masterTemp.Name()
+	if err = masterTemp.Close(); err != nil {
+		_ = os.Remove(masterTempPath)
+		writeError(w, 500, "restore_failed", "无法创建主密钥临时文件")
+		return
+	}
+	defer os.Remove(masterTempPath)
+	if err = security.DecryptBackupBundle(path, tempPath, masterTempPath, input.Key); err != nil {
+		writeError(w, 400, "backup_decrypt_failed", "备份密钥错误或备份文件已损坏")
+		return
+	}
+	if err = store.VerifyBackup(tempPath); err != nil {
 		writeError(w, 400, "backup_invalid", "备份完整性校验失败")
 		return
 	}
-	pre := filepath.Join(a.cfg.DataDir, "velin-pre-restore-"+time.Now().UTC().Format("20060102-150405")+".db")
-	if err = a.store.Backup(r.Context(), pre); err != nil {
+	oldMasterKey, err := os.ReadFile(a.cfg.MasterKeyPath)
+	if err != nil || len(oldMasterKey) != 32 {
+		writeError(w, 500, "restore_failed", "当前主密钥不可用，无法安全恢复")
+		return
+	}
+	preRaw, err := os.CreateTemp(a.cfg.DataDir, ".velin-pre-restore-*.db")
+	if err != nil {
 		writeError(w, 500, "backup_failed", "无法创建恢复前备份")
 		return
 	}
+	preRawPath := preRaw.Name()
+	if err = preRaw.Close(); err != nil {
+		_ = os.Remove(preRawPath)
+		writeError(w, 500, "backup_failed", "无法创建恢复前备份")
+		return
+	}
+	defer os.Remove(preRawPath)
+	if err = a.store.Backup(r.Context(), preRawPath); err != nil {
+		writeError(w, 500, "backup_failed", "无法创建恢复前备份")
+		return
+	}
+	preName := "velin-pre-restore-" + time.Now().UTC().Format("20060102-150405") + "-" + uuid.NewString()[:8] + ".db.enc"
+	pre := filepath.Join(a.cfg.DataDir, preName)
+	if err = security.EncryptBackupBundle(preRawPath, a.cfg.MasterKeyPath, pre, input.Key); err != nil {
+		_ = os.Remove(pre)
+		writeError(w, 500, "backup_encrypt_failed", "无法加密恢复前备份")
+		return
+	}
+	if raw, readErr := os.ReadFile(pre); readErr == nil {
+		sum := sha256.Sum256(raw)
+		checksum := hex.EncodeToString(sum[:])
+		_ = os.WriteFile(pre+".sha256", []byte(checksum+"  "+preName+"\n"), 0o600)
+	}
 	a.terminals.CloseAll()
-	if err = a.store.Restore(r.Context(), path); err != nil {
+	if err = a.store.Restore(r.Context(), tempPath); err != nil {
+		_ = os.Remove(pre)
+		_ = os.Remove(pre + ".sha256")
 		writeError(w, 500, "restore_failed", err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "preRestore": filepath.Base(pre), "requiresLogin": true})
+	if err = os.Rename(masterTempPath, a.cfg.MasterKeyPath); err != nil {
+		_ = a.store.Restore(r.Context(), preRawPath)
+		writeError(w, 500, "restore_failed", "数据库已恢复，但主密钥替换失败")
+		return
+	}
+	if err = a.vault.Reload(a.cfg.MasterKeyPath); err != nil {
+		_ = a.store.Restore(r.Context(), preRawPath)
+		_ = os.WriteFile(a.cfg.MasterKeyPath, oldMasterKey, 0o600)
+		_ = a.vault.Reload(a.cfg.MasterKeyPath)
+		writeError(w, 500, "restore_failed", "恢复后的主密钥无法加载")
+		return
+	}
+	a.restoreAIModelConfig()
+	writeJSON(w, 200, map[string]any{"ok": true, "preRestore": preName, "requiresLogin": true})
 }
