@@ -30,8 +30,8 @@ func TestCrushChatUsesIsolatedControlledProcess(t *testing.T) {
 	if result.Commands[0].ID == "" || result.Commands[0].Command != "df -h" {
 		t.Fatalf("unexpected command proposal: %#v", result.Commands[0])
 	}
-	if result.Commands[0].RequiresApproval {
-		t.Fatalf("read-only command unexpectedly requires approval: %#v", result.Commands[0])
+	if !result.Commands[0].RequiresApproval {
+		t.Fatalf("command did not require approval: %#v", result.Commands[0])
 	}
 
 	args := readTestCapture(t, captureDir, "args")

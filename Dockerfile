@@ -21,7 +21,7 @@ RUN apk add --no-cache ca-certificates \
     && tar -xzf /tmp/crush.tar.gz -C /usr/local/bin --strip-components=1 "crush_${CRUSH_VERSION}_Linux_${archive_arch}/crush" \
     && chmod 0755 /usr/local/bin/crush
 
-FROM golang:1.24-alpine AS go-build
+FROM golang:1.25.13-alpine AS go-build
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
 WORKDIR /src
@@ -39,7 +39,7 @@ COPY --from=web-build /src/web/dist /app/web/dist
 COPY --from=crush-download /usr/local/bin/crush /usr/local/bin/crush
 RUN mkdir /app/data && chown -R velin:velin /app
 USER velin
-ENV VELIN_ADDR=:8377 VELIN_DATA_DIR=/app/data VELIN_WEB_DIST=/app/web/dist VELIN_HOST_PORT_ADDR=127.0.0.1
+ENV VELIN_ADDR=0.0.0.0:8377 VELIN_DATA_DIR=/app/data VELIN_WEB_DIST=/app/web/dist VELIN_HOST_PORT_ADDR=127.0.0.1
 VOLUME ["/app/data"]
 EXPOSE 8377
 ENTRYPOINT ["/app/velin"]

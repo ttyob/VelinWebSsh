@@ -508,19 +508,10 @@ async function requestAIOnce(conversationID: string) {
       });
     if (assistantContent)
       chatHistory.value.push({ role: "assistant", content: assistantContent });
-    const approvalCommands = response.commands.filter(
-      (item) => item.requiresApproval !== false,
-    );
-    const automaticCommands = response.commands.filter(
-      (item) => item.requiresApproval === false,
-    );
     commandProposals.value.push(
-      ...approvalCommands.map((item) => ({ ...item, requiresApproval: true })),
+      ...response.commands.map((item) => ({ ...item, requiresApproval: true })),
     );
     persistCurrentConversation();
-    for (const proposal of automaticCommands) {
-      void executeProposal({ ...proposal, requiresApproval: false });
-    }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : "Agent 请求失败");
   } finally {
@@ -932,7 +923,7 @@ function resultCommand(content: string) {
           <div class="agent-composer-dock">
             <div v-if="commandProposals.length" class="agent-command-pending">
               <ShieldAlert :size="15" />
-              <span>等待处理 {{ commandProposals.length }} 条敏感命令</span>
+              <span>等待确认 {{ commandProposals.length }} 条命令</span>
             </div>
             <div class="agent-chat-input">
               <el-input
@@ -1037,7 +1028,7 @@ function resultCommand(content: string) {
               <span class="agent-command-approval-count">1 / {{ commandProposals.length }}</span>
             </div>
             <div class="agent-command-approval-reason">
-              {{ approvalProposal.reason || "该命令可能修改主机状态或访问敏感数据" }}
+              {{ approvalProposal.reason || "请检查命令内容后决定是否执行" }}
             </div>
             <pre class="agent-command-approval-command">{{ approvalProposal.command }}</pre>
             <div class="agent-command-approval-actions">

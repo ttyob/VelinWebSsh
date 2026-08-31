@@ -120,7 +120,7 @@ Velin 默认读取运行目录中的 `.env`，同名系统环境变量优先。
 | `VELIN_AI_API_KEY` | 空 | AI API Key |
 | `VELIN_FFMPEG_BINARY` | `ffmpeg` | 终端录制使用的 FFmpeg 路径 |
 
-公网部署请使用 Caddy、Nginx 等反向代理提供 HTTPS，并设置 `VELIN_COOKIE_SECURE=true`。
+公网部署请使用 Caddy、Nginx 等反向代理提供 HTTPS，并设置 `VELIN_COOKIE_SECURE=true`；同时通过防火墙限制外部直接访问 `8377` 端口。
 
 ## 数据与备份
 
@@ -135,7 +135,7 @@ Velin 默认读取运行目录中的 `.env`，同名系统环境变量优先。
 
 ## 开发
 
-需要 Go 1.24、Node.js 18.20.4 或更高版本，以及 npm。
+需要 Go 1.25.13、Node.js 18.20.4 或更高版本，以及 npm。
 
 ```bash
 cd web

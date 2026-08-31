@@ -12,6 +12,7 @@ func TestLoadReadsDotEnvAndPreservesEnvironment(t *testing.T) {
 	changeWorkingDirectory(t, workDir)
 	preserveAndUnsetEnv(t, "VELIN_DATA_DIR")
 	preserveAndUnsetEnv(t, "VELIN_ADMIN_USER")
+	preserveAndUnsetEnv(t, "VELIN_ADDR")
 	t.Setenv("VELIN_ADMIN_USER", "environment-admin")
 
 	content := "VELIN_DATA_DIR=state\nVELIN_ADMIN_USER=file-admin\n"
@@ -27,6 +28,9 @@ func TestLoadReadsDotEnvAndPreservesEnvironment(t *testing.T) {
 	}
 	if cfg.AdminUser != "environment-admin" {
 		t.Fatalf("admin user=%q", cfg.AdminUser)
+	}
+	if cfg.Addr != "0.0.0.0:8377" {
+		t.Fatalf("listen address=%q", cfg.Addr)
 	}
 }
 

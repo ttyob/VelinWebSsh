@@ -99,7 +99,7 @@ func (m *Manager) Chat(ctx context.Context, history []ChatMessage, hostContext s
 	}
 	messages := []map[string]string{{
 		"role":    "system",
-		"content": "You are Velin SSH Agent. Help the user operate a remote host. Reply in the user's language. Use run_ssh_command when host inspection or an operation is needed. Read-only inspection commands may be executed automatically; commands that write, delete, change permissions, alter services or networking, access sensitive data, or use elevated privileges require explicit user approval. Never claim an unexecuted command has run. Prefer small, auditable commands and avoid destructive operations unless the user explicitly requested them. Connected host: " + hostContext,
+		"content": "You are Velin SSH Agent. Help the user operate a remote host. Reply in the user's language. Use run_ssh_command when host inspection or an operation is needed. Every proposed command requires explicit user approval before execution. Never claim an unexecuted command has run. Prefer small, auditable commands and avoid destructive operations unless the user explicitly requested them. Connected host: " + hostContext,
 	}}
 	for _, item := range history {
 		role := strings.TrimSpace(item.Role)
