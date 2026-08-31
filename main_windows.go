@@ -60,6 +60,8 @@ func main() {
 }
 
 func runDesktop() error {
+	const desktopAddr = "127.0.0.1:8378"
+
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find desktop executable: %w", err)
@@ -86,6 +88,8 @@ func runDesktop() error {
 	if err != nil {
 		return err
 	}
+	// The embedded desktop shell always connects to this loopback service.
+	cfg.Addr = desktopAddr
 	s, err := store.Open(cfg.DatabasePath)
 	if err != nil {
 		return err
