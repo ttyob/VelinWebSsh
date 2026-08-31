@@ -4,7 +4,8 @@ package main
 
 import (
 	"context"
-	"embed"
+	_ "embed"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -12,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -29,8 +32,8 @@ import (
 	"velin-webssh/internal/terminal"
 )
 
-//go:embed desktop/dist
-var desktopAssets embed.FS
+//go:embed desktop/dist/index.html
+var desktopIndexHTML string
 
 type desktopServer struct {
 	server *http.Server
@@ -60,7 +63,7 @@ func main() {
 }
 
 func runDesktop() error {
-	const desktopAddr = "127.0.0.1:8378"
+	const defaultDesktopAddr = "127.0.0.1:8378"
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -69,6 +72,9 @@ func runDesktop() error {
 	executableDir := filepath.Dir(executable)
 	if err = os.Chdir(executableDir); err != nil {
 		return fmt.Errorf("set desktop working directory: %w", err)
+	}
+	if err = godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load desktop .env: %w", err)
 	}
 	configDir, err := os.UserConfigDir()
 	if err != nil {
@@ -81,15 +87,13 @@ func runDesktop() error {
 		_ = os.Setenv("VELIN_WEB_DIST", filepath.Join(executableDir, "web", "dist"))
 	}
 	if os.Getenv("VELIN_ADDR") == "" {
-		_ = os.Setenv("VELIN_ADDR", "127.0.0.1:8378")
+		_ = os.Setenv("VELIN_ADDR", defaultDesktopAddr)
 	}
 
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	// The embedded desktop shell always connects to this loopback service.
-	cfg.Addr = desktopAddr
 	s, err := store.Open(cfg.DatabasePath)
 	if err != nil {
 		return err
@@ -144,6 +148,11 @@ func runDesktop() error {
 		}
 	}()
 	defer appServer.close(context.Background())
+	serviceURL, err := desktopServiceURL(cfg.Addr)
+	if err != nil {
+		return err
+	}
+	page := []byte(strings.Replace(desktopIndexHTML, "__VELIN_DESKTOP_URL__", serviceURL, 1))
 
 	return wails.Run(&options.App{
 		Title:            "Velin Web SSH",
@@ -152,10 +161,28 @@ func runDesktop() error {
 		MinWidth:         980,
 		MinHeight:        640,
 		BackgroundColour: options.NewRGB(16, 20, 24),
-		AssetServer:      &assetserver.Options{Assets: desktopAssets},
+		AssetServer: &assetserver.Options{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || (r.URL.Path != "/" && r.URL.Path != "/index.html") {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write(page)
+		})},
 		Windows:          &windows.Options{Theme: windows.Dark},
 		OnShutdown: func(ctx context.Context) {
 			appServer.close(ctx)
 		},
 	})
+}
+
+func desktopServiceURL(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid desktop service address %q: %w", addr, err)
+	}
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/", nil
 }
