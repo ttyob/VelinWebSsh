@@ -7,7 +7,6 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -260,10 +259,15 @@ func showDesktopCredentialNotice(ctx context.Context, notice *desktopCredentialN
 		title = "Administrator password reset"
 		messagePrefix = "The administrator password was reset."
 	}
+	clipboardMessage := "The password has been copied to the clipboard. Paste it into the login form with Ctrl+V."
+	if err := wailsruntime.ClipboardSetText(ctx, notice.password); err != nil {
+		clipboardMessage = "The password could not be copied automatically. Read it from velin-gui.log."
+		slog.Error("copy desktop administrator password", "error", err)
+	}
 	_, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
 		Type:          wailsruntime.WarningDialog,
 		Title:         title,
-		Message:       fmt.Sprintf("%s\n\nUsername: %s\nPassword: %s\n\nSave this password, then change it after login. It is also recorded in velin-gui.log.", messagePrefix, notice.username, notice.password),
+		Message:       fmt.Sprintf("%s\n\nUsername: %s\nPassword: %s\n\n%s\nIt is also recorded in velin-gui.log. Save it, then change it after login.", messagePrefix, notice.username, notice.password, clipboardMessage),
 		Buttons:       []string{"OK"},
 		DefaultButton: "OK",
 	})
@@ -306,8 +310,10 @@ func configureDesktopLogging(logDir string) (func(), error) {
 	if err != nil {
 		return func() {}, err
 	}
-	output := io.MultiWriter(os.Stderr, file)
-	log.SetOutput(output)
-	slog.SetDefault(slog.New(slog.NewTextHandler(output, nil)))
-	return func() { _ = file.Close() }, nil
+	log.SetOutput(file)
+	slog.SetDefault(slog.New(slog.NewTextHandler(file, nil)))
+	return func() {
+		_ = file.Sync()
+		_ = file.Close()
+	}, nil
 }
