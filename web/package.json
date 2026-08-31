@@ -11,7 +11,8 @@
     "build": "vue-tsc -b && vite build",
     "typecheck": "vue-tsc -b",
     "test": "node scripts/unit.mjs",
-    "test:e2e": "node scripts/smoke.mjs"
+    "test:e2e": "node scripts/smoke.mjs",
+    "screenshot:readme": "node scripts/readme-screenshot.mjs"
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.1",

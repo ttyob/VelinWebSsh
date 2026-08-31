@@ -64,7 +64,7 @@ func main() {
 	}
 }
 
-func runDesktop() error {
+func runDesktop() (runErr error) {
 	const defaultDesktopAddr = "127.0.0.1:0"
 
 	executable, err := os.Executable()
@@ -72,24 +72,27 @@ func runDesktop() error {
 		return fmt.Errorf("find desktop executable: %w", err)
 	}
 	executableDir := filepath.Dir(executable)
+	logPath := filepath.Join(executableDir, "velin-gui.log")
+	closeLog, err := configureDesktopLogging(executableDir)
+	if err != nil {
+		return fmt.Errorf("configure desktop logging: %w", err)
+	}
+	defer func() {
+		if runErr != nil {
+			slog.Error("desktop initialization failed", "error", runErr)
+		}
+		closeLog()
+	}()
+	slog.Info("Velin GUI starting", "executable", executable, "log_file", logPath)
+
 	if err = os.Chdir(executableDir); err != nil {
 		return fmt.Errorf("set desktop working directory: %w", err)
 	}
 	if err = godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("load desktop .env: %w", err)
 	}
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		return fmt.Errorf("find Windows application data directory: %w", err)
-	}
-	closeLog, logErr := configureDesktopLogging(configDir)
-	if logErr != nil {
-		log.Printf("configure desktop logging: %v", logErr)
-	} else {
-		defer closeLog()
-	}
 	if os.Getenv("VELIN_DATA_DIR") == "" {
-		_ = os.Setenv("VELIN_DATA_DIR", filepath.Join(configDir, "Velin", "data"))
+		_ = os.Setenv("VELIN_DATA_DIR", executableDir)
 	}
 	if os.Getenv("VELIN_WEB_DIST") == "" {
 		_ = os.Setenv("VELIN_WEB_DIST", filepath.Join(executableDir, "web", "dist"))
@@ -102,6 +105,7 @@ func runDesktop() error {
 	if err != nil {
 		return err
 	}
+	slog.Info("desktop configuration loaded", "data_dir", cfg.DataDir, "database", cfg.DatabasePath, "log_file", logPath)
 	s, err := store.Open(cfg.DatabasePath)
 	if err != nil {
 		return err
@@ -134,7 +138,7 @@ func runDesktop() error {
 			_ = s.Close()
 			return err
 		}
-		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "change this password after login")
+		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "save this password and change it after login")
 	}
 	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary)
 	forwardManager := forward.NewManager(s, manager)
@@ -222,8 +226,7 @@ func waitForDesktopServer(serviceURL string) error {
 	return fmt.Errorf("desktop web service did not become ready at %s", serviceURL)
 }
 
-func configureDesktopLogging(configDir string) (func(), error) {
-	logDir := filepath.Join(configDir, "Velin")
+func configureDesktopLogging(logDir string) (func(), error) {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		return func() {}, err
 	}

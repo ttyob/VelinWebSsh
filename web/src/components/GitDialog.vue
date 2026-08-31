@@ -162,7 +162,7 @@ async function refresh() {
     repoRoot.value = (await command(gitCommand("rev-parse --show-toplevel"))).trim();
     const [statusOutput, commitOutput, branchOutput, remoteOutput] = await Promise.all([
       command(gitCommand("status --porcelain=v1 -z --branch --untracked-files=all")),
-      command(gitCommand("log -50 --date=iso-str --pretty=format:'%H%x09%h%x09%an%x09%ad%x09%s' || true")),
+      command(gitCommand("log -50 --date=iso-strict --pretty=format:'%H%x09%h%x09%an%x09%ad%x09%s'")),
       command(gitCommand("for-each-ref --format='%(HEAD)%09%(refname)%09%(objectname:short)%09%(upstream:short)%09%(upstream:track)%09%(subject)' refs/heads refs/remotes")),
       command(gitCommand("remote -v")),
     ]);
