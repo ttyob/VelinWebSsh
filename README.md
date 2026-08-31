@@ -140,6 +140,17 @@ chmod +x velin
 
 默认访问地址为 <code>http://127.0.0.1:8377</code>。生产环境建议使用 systemd 或其他进程管理器，并在前面配置 HTTPS 反向代理。
 
+Windows 发布包使用本地 <code>velin.exe</code> 启动 Web 服务，不需要安装 Go 或 Node.js。下载 <code>velin-windows-amd64.zip</code> 并解压后，在 PowerShell 中执行：
+
+~~~powershell
+cd .\velin-windows-amd64
+Copy-Item .env.example .env
+notepad .env
+.\velin.exe
+~~~
+
+然后访问 <code>http://127.0.0.1:8377</code>。Windows 包包含核心服务和前端文件；终端录制需要另外安装 FFmpeg，并在 <code>.env</code> 中设置 <code>VELIN_FFMPEG_BINARY</code>。可选的 Crush AI 后端也需要单独安装 Windows 版本并设置 <code>VELIN_CRUSH_BINARY</code>。
+
 ## 源码开发
 
 要求：

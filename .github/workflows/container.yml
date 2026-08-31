@@ -112,8 +112,15 @@ jobs:
             cp .env.example README.md "release/${package}/"
             tar -C release -czf "release/${package}.tar.gz" "${package}"
           done
+          package="velin-windows-amd64"
+          mkdir -p "release/${package}/web"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
+            -trimpath -ldflags="-s -w" -o "release/${package}/velin.exe" ./cmd/velin
+          cp -R web/dist "release/${package}/web/dist"
+          cp .env.example README.md "release/${package}/"
+          (cd release && zip -qr "${package}.zip" "${package}")
           cd release
-          sha256sum velin-linux-*.tar.gz > checksums.txt
+          sha256sum velin-linux-*.tar.gz velin-windows-*.zip > checksums.txt
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -121,4 +128,5 @@ jobs:
           files: |
             release/velin-linux-amd64.tar.gz
             release/velin-linux-arm64.tar.gz
+            release/velin-windows-amd64.zip
             release/checksums.txt
