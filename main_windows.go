@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -213,7 +214,10 @@ func runDesktop() (runErr error) {
 		return err
 	}
 	slog.Info("desktop web service ready", "service_url", serviceURL)
-	page := []byte(strings.Replace(desktopIndexHTML, "__VELIN_DESKTOP_URL__", serviceURL, 1))
+	page, err := buildDesktopPage(serviceURL, credentialNotice)
+	if err != nil {
+		return err
+	}
 
 	return wails.Run(&options.App{
 		Title:            "Velin Web SSH",
@@ -232,7 +236,7 @@ func runDesktop() (runErr error) {
 		})},
 		Windows: &windows.Options{Theme: windows.Dark},
 		OnStartup: func(ctx context.Context) {
-			showDesktopCredentialNotice(ctx, credentialNotice)
+			copyDesktopCredential(ctx, credentialNotice)
 		},
 		OnShutdown: func(ctx context.Context) {
 			appServer.close(ctx)
@@ -249,30 +253,33 @@ func desktopArgumentPresent(name string) bool {
 	return false
 }
 
-func showDesktopCredentialNotice(ctx context.Context, notice *desktopCredentialNotice) {
+func buildDesktopPage(serviceURL string, notice *desktopCredentialNotice) ([]byte, error) {
+	serviceJSON, err := json.Marshal(serviceURL)
+	if err != nil {
+		return nil, fmt.Errorf("encode desktop service URL: %w", err)
+	}
+	credentialsJSON := []byte("null")
+	if notice != nil {
+		credentialsJSON, err = json.Marshal(map[string]any{
+			"reset":    notice.reset,
+			"username": notice.username,
+			"password": notice.password,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("encode desktop credentials: %w", err)
+		}
+	}
+	page := strings.Replace(desktopIndexHTML, "__VELIN_DESKTOP_URL_JSON__", string(serviceJSON), 1)
+	page = strings.Replace(page, "__VELIN_DESKTOP_CREDENTIALS_JSON__", string(credentialsJSON), 1)
+	return []byte(page), nil
+}
+
+func copyDesktopCredential(ctx context.Context, notice *desktopCredentialNotice) {
 	if notice == nil {
 		return
 	}
-	title := "Initial administrator credentials"
-	messagePrefix := "The initial administrator account was created."
-	if notice.reset {
-		title = "Administrator password reset"
-		messagePrefix = "The administrator password was reset."
-	}
-	clipboardMessage := "The password has been copied to the clipboard. Paste it into the login form with Ctrl+V."
 	if err := wailsruntime.ClipboardSetText(ctx, notice.password); err != nil {
-		clipboardMessage = "The password could not be copied automatically. Read it from velin-gui.log."
 		slog.Error("copy desktop administrator password", "error", err)
-	}
-	_, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
-		Type:          wailsruntime.WarningDialog,
-		Title:         title,
-		Message:       fmt.Sprintf("%s\n\nUsername: %s\nPassword: %s\n\n%s\nIt is also recorded in velin-gui.log. Save it, then change it after login.", messagePrefix, notice.username, notice.password, clipboardMessage),
-		Buttons:       []string{"OK"},
-		DefaultButton: "OK",
-	})
-	if err != nil {
-		slog.Error("show desktop administrator credentials", "error", err)
 	}
 }
 

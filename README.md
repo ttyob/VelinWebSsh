@@ -159,7 +159,7 @@ go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
 wails build -platform windows/amd64 -clean -m -s -skipbindings
 ```
 
-Windows GUI 默认为便携模式。数据库、主密钥、终端录制和 `velin-gui.log` 均保存在 `Velin-GUI.exe` 所在目录。首次启动会通过原生弹窗显示管理员账号和随机密码、自动复制密码到剪贴板，并同时写入 `velin-gui.log`。
+Windows GUI 默认为便携模式。数据库、主密钥、终端录制和 `velin-gui.log` 均保存在 `Velin-GUI.exe` 所在目录。首次启动会显示管理员凭据对话框，密码可通过按钮复制并同时写入 `velin-gui.log`。
 
 如果初始密码已经丢失，在 PowerShell 中执行以下命令。程序会保留现有数据、重置 `admin` 密码、清除旧登录会话，并通过弹窗和日志显示新密码：
 

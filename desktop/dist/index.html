@@ -1,17 +1,126 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Velin</title>
     <style>
+      :root { color-scheme: dark; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+      * { box-sizing: border-box; }
       html, body { width: 100%; height: 100%; margin: 0; }
-      body { background: #101418; }
+      body {
+        display: grid;
+        place-items: center;
+        background: #101418;
+        color: #edf2f5;
+      }
+      .credential-dialog {
+        width: min(440px, calc(100vw - 32px));
+        padding: 28px;
+        border: 1px solid #343c43;
+        border-radius: 8px;
+        background: #191f24;
+        box-shadow: 0 18px 52px rgba(0, 0, 0, 0.42);
+      }
+      .credential-dialog[hidden] { display: none; }
+      .brand { margin: 0 0 18px; color: #78d6a6; font-size: 13px; font-weight: 700; }
+      h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: 0; }
+      .description { margin: 8px 0 22px; color: #aab5bd; font-size: 14px; line-height: 1.55; }
+      .field { margin-top: 14px; }
+      label { display: block; margin-bottom: 7px; color: #aab5bd; font-size: 12px; }
+      input {
+        width: 100%;
+        height: 42px;
+        padding: 0 12px;
+        border: 1px solid #3b454d;
+        border-radius: 6px;
+        outline: none;
+        background: #11161a;
+        color: #f4f7f8;
+        font: 14px Consolas, "Courier New", monospace;
+        letter-spacing: 0;
+      }
+      input:focus { border-color: #5dbb8d; box-shadow: 0 0 0 2px rgba(93, 187, 141, 0.18); }
+      .notice { min-height: 20px; margin: 12px 0 4px; color: #9aa6ae; font-size: 12px; }
+      .notice.success { color: #78d6a6; }
+      .notice.error { color: #ff8b82; }
+      .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+      button {
+        min-width: 104px;
+        height: 38px;
+        padding: 0 16px;
+        border: 1px solid #414b53;
+        border-radius: 6px;
+        background: #252d33;
+        color: #edf2f5;
+        font: 600 13px "Segoe UI", "Microsoft YaHei", sans-serif;
+        letter-spacing: 0;
+        cursor: pointer;
+      }
+      button:hover { background: #303941; }
+      button.primary { border-color: #62c394; background: #62c394; color: #0d2117; }
+      button.primary:hover { background: #78d6a6; }
     </style>
   </head>
   <body>
+    <section id="credential-dialog" class="credential-dialog" role="dialog" aria-modal="true" hidden>
+      <p class="brand">Velin GUI</p>
+      <h1 id="credential-title">初始管理员凭据</h1>
+      <p id="credential-description" class="description"></p>
+      <div class="field">
+        <label for="credential-username">用户名</label>
+        <input id="credential-username" readonly />
+      </div>
+      <div class="field">
+        <label for="credential-password">密码</label>
+        <input id="credential-password" readonly />
+      </div>
+      <p id="copy-notice" class="notice" aria-live="polite">点击“复制密码”后可直接粘贴到登录页。</p>
+      <div class="actions">
+        <button id="copy-password" type="button">复制密码</button>
+        <button id="continue-login" class="primary" type="button">进入登录</button>
+      </div>
+    </section>
     <script>
-      window.location.replace("__VELIN_DESKTOP_URL__");
+      const serviceURL = __VELIN_DESKTOP_URL_JSON__;
+      const credentials = __VELIN_DESKTOP_CREDENTIALS_JSON__;
+
+      if (!credentials) {
+        window.location.replace(serviceURL);
+      } else {
+        const dialog = document.getElementById("credential-dialog");
+        const passwordInput = document.getElementById("credential-password");
+        const notice = document.getElementById("copy-notice");
+        document.getElementById("credential-title").textContent = credentials.reset ? "管理员密码已重置" : "初始管理员凭据";
+        document.getElementById("credential-description").textContent = credentials.reset
+          ? "管理员密码已重置，旧登录会话已失效。"
+          : "首次启动已创建管理员账号，请保存密码并在登录后修改。";
+        document.getElementById("credential-username").value = credentials.username;
+        passwordInput.value = credentials.password;
+        dialog.hidden = false;
+
+        async function copyPassword() {
+          try {
+            if (navigator.clipboard?.writeText) {
+              await navigator.clipboard.writeText(credentials.password);
+            } else {
+              passwordInput.focus();
+              passwordInput.select();
+              if (!document.execCommand("copy")) throw new Error("copy failed");
+            }
+            notice.textContent = "密码已复制，可在登录页按 Ctrl+V 粘贴。";
+            notice.className = "notice success";
+          } catch {
+            passwordInput.focus();
+            passwordInput.select();
+            notice.textContent = "自动复制失败，已选中密码，请按 Ctrl+C。";
+            notice.className = "notice error";
+          }
+        }
+
+        document.getElementById("copy-password").addEventListener("click", copyPassword);
+        document.getElementById("continue-login").addEventListener("click", () => window.location.replace(serviceURL));
+      }
     </script>
   </body>
 </html>
