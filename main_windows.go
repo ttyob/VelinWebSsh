@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -63,7 +65,7 @@ func main() {
 }
 
 func runDesktop() error {
-	const defaultDesktopAddr = "127.0.0.1:8378"
+	const defaultDesktopAddr = "127.0.0.1:0"
 
 	executable, err := os.Executable()
 	if err != nil {
@@ -79,6 +81,12 @@ func runDesktop() error {
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return fmt.Errorf("find Windows application data directory: %w", err)
+	}
+	closeLog, logErr := configureDesktopLogging(configDir)
+	if logErr != nil {
+		log.Printf("configure desktop logging: %v", logErr)
+	} else {
+		defer closeLog()
 	}
 	if os.Getenv("VELIN_DATA_DIR") == "" {
 		_ = os.Setenv("VELIN_DATA_DIR", filepath.Join(configDir, "Velin", "data"))
@@ -138,6 +146,10 @@ func runDesktop() error {
 	appServer := &desktopServer{store: s, agent: agentManager}
 	appServer.server = &http.Server{Addr: cfg.Addr, Handler: api.New(cfg, s, vault, manager, forwardManager, agentManager).Router(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp4", cfg.Addr)
+	if err != nil && errors.Is(err, syscall.EADDRINUSE) {
+		slog.Warn("configured desktop port is in use, selecting a free loopback port", "addr", cfg.Addr)
+		listener, err = net.Listen("tcp4", "127.0.0.1:0")
+	}
 	if err != nil {
 		appServer.close(context.Background())
 		return err
@@ -148,10 +160,18 @@ func runDesktop() error {
 		}
 	}()
 	defer appServer.close(context.Background())
-	serviceURL, err := desktopServiceURL(cfg.Addr)
+	// Use the address assigned by the listener. This is important when the
+	// configured port is 0, and also avoids pointing the WebView at a stale
+	// configured port after address normalization.
+	serviceURL, err := desktopServiceURL(listener.Addr().String())
 	if err != nil {
 		return err
 	}
+	slog.Info("desktop web service listening", "configured_addr", cfg.Addr, "service_url", serviceURL)
+	if err = waitForDesktopServer(serviceURL); err != nil {
+		return err
+	}
+	slog.Info("desktop web service ready", "service_url", serviceURL)
 	page := []byte(strings.Replace(desktopIndexHTML, "__VELIN_DESKTOP_URL__", serviceURL, 1))
 
 	return wails.Run(&options.App{
@@ -169,7 +189,7 @@ func runDesktop() error {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write(page)
 		})},
-		Windows:          &windows.Options{Theme: windows.Dark},
+		Windows: &windows.Options{Theme: windows.Dark},
 		OnShutdown: func(ctx context.Context) {
 			appServer.close(ctx)
 		},
@@ -181,8 +201,38 @@ func desktopServiceURL(addr string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid desktop service address %q: %w", addr, err)
 	}
-	if host == "" || host == "0.0.0.0" {
+	if host == "" || host == "0.0.0.0" || strings.EqualFold(host, "localhost") {
 		host = "127.0.0.1"
 	}
 	return "http://" + net.JoinHostPort(host, port) + "/", nil
+}
+
+func waitForDesktopServer(serviceURL string) error {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	for attempt := 0; attempt < 40; attempt++ {
+		response, err := client.Get(serviceURL + "api/health/live")
+		if err == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("desktop web service did not become ready at %s", serviceURL)
+}
+
+func configureDesktopLogging(configDir string) (func(), error) {
+	logDir := filepath.Join(configDir, "Velin")
+	if err := os.MkdirAll(logDir, 0o700); err != nil {
+		return func() {}, err
+	}
+	file, err := os.OpenFile(filepath.Join(logDir, "velin-gui.log"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return func() {}, err
+	}
+	output := io.MultiWriter(os.Stderr, file)
+	log.SetOutput(output)
+	slog.SetDefault(slog.New(slog.NewTextHandler(output, nil)))
+	return func() { _ = file.Close() }, nil
 }
