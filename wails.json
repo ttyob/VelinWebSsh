@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "Velin",
-  "outputfilename": "Velin",
+  "outputfilename": "Velin-GUI",
   "frontend:dir": "desktop",
   "build:dir": "build",
   "author": {

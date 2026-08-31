@@ -125,8 +125,8 @@ docker compose down
 从 [GitHub Releases](https://github.com/ttyob/VelinWebSsh/releases) 下载对应架构的运行包。Release 包包含 Go 二进制、构建后的前端和配置示例，不需要安装 Go 或 Node.js。
 
 ~~~bash
-tar -xzf velin-linux-amd64.tar.gz
-cd velin-linux-amd64
+tar -xzf velin-linux-web-amd64.tar.gz
+cd velin-linux-web-amd64
 cp .env.example .env
 chmod 600 .env
 ~~~
@@ -134,19 +134,19 @@ chmod 600 .env
 编辑 <code>.env</code> 后启动：
 
 ~~~bash
-chmod +x velin
-./velin
+chmod +x velin-web
+./velin-web
 ~~~
 
 默认访问地址为 <code>http://127.0.0.1:8377</code>。生产环境建议使用 systemd 或其他进程管理器，并在前面配置 HTTPS 反向代理。
 
-Windows 桌面发布包使用 Wails 打开原生桌面窗口，内部运行本地 Velin Web 服务，不需要安装 Go 或 Node.js。Windows 需要 WebView2 运行时；系统缺少时程序会提示安装。下载 <code>velin-windows-amd64.zip</code> 并解压后，在 PowerShell 中执行：
+Windows GUI 发布包使用 Wails 打开原生桌面窗口，内部运行本地 Velin Web 服务，不需要安装 Go 或 Node.js。Windows 需要 WebView2 运行时；系统缺少时程序会提示安装。下载 <code>velin-windows-gui-amd64.zip</code> 并解压后，在 PowerShell 中执行：
 
 ~~~powershell
-cd .\velin-windows-amd64
+cd .\velin-windows-gui-amd64
 Copy-Item .env.example .env
 notepad .env
-.\velin.exe
+.\Velin-GUI.exe
 ~~~
 
 程序会直接打开 Velin 桌面窗口。Windows 包包含核心服务和前端文件；终端录制需要另外安装 FFmpeg，并在 <code>.env</code> 中设置 <code>VELIN_FFMPEG_BINARY</code>。可选的 Crush AI 后端也需要单独安装 Windows 版本并设置 <code>VELIN_CRUSH_BINARY</code>。
@@ -176,6 +176,15 @@ npm run typecheck
 npm run test
 npm run build
 ~~~
+
+Windows 原生 GUI 开发构建需要安装 Wails CLI，并使用 Wails 构建命令生成正确的桌面构建标签：
+
+~~~powershell
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
+wails build -platform windows/amd64 -clean -m -s
+~~~
+
+不要直接对 Windows Wails 入口执行 <code>go build</code>；该命令不会注入 Wails 所需的构建标签。
 
 完整容器开发流程：
 
