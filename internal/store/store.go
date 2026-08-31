@@ -410,6 +410,29 @@ func (s *Store) ChangePassword(userID, currentPassword, newPassword, currentToke
 	return err
 }
 
+func (s *Store) ResetUserPassword(userID, newHash string, forceChange bool) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE users SET password_hash=?,force_password_change=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, newHash, forceChange, userID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return sql.ErrNoRows
+	}
+	if _, err = tx.Exec(`DELETE FROM auth_sessions WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) LoginLock(identity, ip string) (time.Time, error) {
 	var locked sql.NullTime
 	err := s.DB.QueryRow(`SELECT locked_until FROM login_attempts WHERE identity=? AND ip=?`, strings.ToLower(identity), ip).Scan(&locked)

@@ -2,6 +2,8 @@
 import { computed, defineAsyncComponent, ref, watch } from "vue";
 import {
   Download,
+  Eye,
+  EyeOff,
   File,
   FilePenLine,
   Folder,
@@ -288,7 +290,14 @@ async function uploadFile(event: Event) {
       <input ref="fileInput" hidden type="file" multiple @change="uploadFile" />
     </div>
     <div class="file-options">
-      <el-checkbox v-model="showHidden">显示隐藏文件</el-checkbox>
+      <el-button
+        class="file-hidden-toggle"
+        :type="showHidden ? 'primary' : 'default'"
+        :icon="showHidden ? Eye : EyeOff"
+        @click="showHidden = !showHidden"
+      >
+        {{ showHidden ? "隐藏文件" : "显示隐藏文件" }}
+      </el-button>
       <button @click="listFiles(parentPath())">返回上级</button>
     </div>
     <div v-loading="loading" class="file-manager-list">

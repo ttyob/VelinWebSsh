@@ -25,6 +25,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"velin-webssh/internal/agent"
 	"velin-webssh/internal/api"
 	"velin-webssh/internal/config"
@@ -42,6 +43,12 @@ type desktopServer struct {
 	store  *store.Store
 	agent  *agent.Manager
 	once   sync.Once
+}
+
+type desktopCredentialNotice struct {
+	username string
+	password string
+	reset    bool
 }
 
 func (d *desktopServer) close(ctx context.Context) {
@@ -120,6 +127,7 @@ func runDesktop() (runErr error) {
 		_ = s.Close()
 		return err
 	}
+	var credentialNotice *desktopCredentialNotice
 	if count == 0 {
 		password := cfg.AdminPassword
 		if password == "" {
@@ -138,7 +146,37 @@ func runDesktop() (runErr error) {
 			_ = s.Close()
 			return err
 		}
-		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "save this password and change it after login")
+		credentialNotice = &desktopCredentialNotice{username: cfg.AdminUser, password: password}
+		slog.Warn("GUI ADMIN CREDENTIALS", "username", cfg.AdminUser, "password", password, "notice", "save this password and change it after login")
+	} else if desktopArgumentPresent("--reset-admin-password") {
+		user, _, lookupErr := s.UserByUsername(cfg.AdminUser)
+		if lookupErr != nil {
+			_ = s.Close()
+			return fmt.Errorf("find desktop administrator %q: %w", cfg.AdminUser, lookupErr)
+		}
+		if user.Role != "admin" {
+			_ = s.Close()
+			return fmt.Errorf("desktop user %q is not an administrator", cfg.AdminUser)
+		}
+		password := cfg.AdminPassword
+		if password == "" {
+			password, err = security.RandomToken(12)
+			if err != nil {
+				_ = s.Close()
+				return err
+			}
+		}
+		hash, hashErr := security.HashPassword(password)
+		if hashErr != nil {
+			_ = s.Close()
+			return hashErr
+		}
+		if err = s.ResetUserPassword(user.ID, hash, true); err != nil {
+			_ = s.Close()
+			return fmt.Errorf("reset desktop administrator password: %w", err)
+		}
+		credentialNotice = &desktopCredentialNotice{username: user.Username, password: password, reset: true}
+		slog.Warn("GUI ADMIN PASSWORD RESET", "username", user.Username, "password", password, "notice", "save this password and change it after login")
 	}
 	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary)
 	forwardManager := forward.NewManager(s, manager)
@@ -194,10 +232,44 @@ func runDesktop() (runErr error) {
 			_, _ = w.Write(page)
 		})},
 		Windows: &windows.Options{Theme: windows.Dark},
+		OnStartup: func(ctx context.Context) {
+			showDesktopCredentialNotice(ctx, credentialNotice)
+		},
 		OnShutdown: func(ctx context.Context) {
 			appServer.close(ctx)
 		},
 	})
+}
+
+func desktopArgumentPresent(name string) bool {
+	for _, argument := range os.Args[1:] {
+		if argument == name {
+			return true
+		}
+	}
+	return false
+}
+
+func showDesktopCredentialNotice(ctx context.Context, notice *desktopCredentialNotice) {
+	if notice == nil {
+		return
+	}
+	title := "Initial administrator credentials"
+	messagePrefix := "The initial administrator account was created."
+	if notice.reset {
+		title = "Administrator password reset"
+		messagePrefix = "The administrator password was reset."
+	}
+	_, err := wailsruntime.MessageDialog(ctx, wailsruntime.MessageDialogOptions{
+		Type:          wailsruntime.WarningDialog,
+		Title:         title,
+		Message:       fmt.Sprintf("%s\n\nUsername: %s\nPassword: %s\n\nSave this password, then change it after login. It is also recorded in velin-gui.log.", messagePrefix, notice.username, notice.password),
+		Buttons:       []string{"OK"},
+		DefaultButton: "OK",
+	})
+	if err != nil {
+		slog.Error("show desktop administrator credentials", "error", err)
+	}
 }
 
 func desktopServiceURL(addr string) (string, error) {

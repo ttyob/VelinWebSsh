@@ -152,6 +152,33 @@ func TestAuthSessionLockState(t *testing.T) {
 	}
 }
 
+func TestResetUserPasswordInvalidatesSessions(t *testing.T) {
+	s := testStore(t)
+	if err := s.CreateUser("u1", "admin", "old-hash", "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateAuthSession("session", "u1", "token-hash", "test", "127.0.0.1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	newHash, err := security.HashPassword("new-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ResetUserPassword("u1", newHash, true); err != nil {
+		t.Fatal(err)
+	}
+	user, storedHash, err := s.UserByUsername("admin")
+	if err != nil || !user.ForcePasswordChange || !security.VerifyPassword(storedHash, "new-password") {
+		t.Fatalf("reset user=%+v hash_valid=%v err=%v", user, security.VerifyPassword(storedHash, "new-password"), err)
+	}
+	if _, err = s.UserByToken("token-hash"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("reset session still exists: %v", err)
+	}
+	if err = s.ResetUserPassword("missing", newHash, true); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing user reset error=%v", err)
+	}
+}
+
 func TestUserLockPINLifecycle(t *testing.T) {
 	s := testStore(t)
 	if err := s.CreateUser("u1", "user", "hash", "user"); err != nil {
