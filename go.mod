@@ -10,6 +10,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/pkg/sftp v1.13.7
 	github.com/pquerna/otp v1.4.0
+	github.com/wailsapp/wails/v2 v2.10.2
 	golang.org/x/crypto v0.41.0
 	golang.org/x/net v0.42.0
 	modernc.org/sqlite v1.38.2

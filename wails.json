@@ -1,0 +1,10 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Velin",
+  "outputfilename": "Velin",
+  "frontend:dir": "desktop",
+  "build:dir": "build",
+  "author": {
+    "name": "Velin"
+  }
+}
