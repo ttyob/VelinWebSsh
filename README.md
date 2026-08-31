@@ -181,7 +181,7 @@ Windows 原生 GUI 开发构建需要安装 Wails CLI，并使用 Wails 构建�
 
 ~~~powershell
 go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
-wails build -platform windows/amd64 -clean -m -s
+wails build -platform windows/amd64 -clean -m -s -skipbindings
 ~~~
 
 不要直接对 Windows Wails 入口执行 <code>go build</code>；该命令不会注入 Wails 所需的构建标签。
