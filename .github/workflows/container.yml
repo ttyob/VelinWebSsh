@@ -102,9 +102,11 @@ jobs:
         run: |
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-          go mod download
+          go mod tidy
       - name: Build Windows desktop application
         shell: bash
+        env:
+          GOFLAGS: -mod=mod
         run: wails build -platform windows/amd64 -s -m -clean
       - name: Package Windows desktop release
         shell: pwsh
