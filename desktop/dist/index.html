@@ -5,11 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Velin</title>
     <style>
-      html, body, iframe { width: 100%; height: 100%; margin: 0; border: 0; }
-      body { overflow: hidden; background: #101418; }
+      html, body { width: 100%; height: 100%; margin: 0; }
+      body { background: #101418; }
     </style>
   </head>
   <body>
-    <iframe src="__VELIN_DESKTOP_URL__" title="Velin"></iframe>
+    <script>
+      window.location.replace("__VELIN_DESKTOP_URL__");
+    </script>
   </body>
 </html>
