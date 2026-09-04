@@ -1,0 +1,44 @@
+#!/bin/sh
+
+APP_ROOT="${TRIM_APPDEST:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}"
+DATA_ROOT="${TRIM_PKGVAR:-$APP_ROOT/var}"
+RUN_ROOT="$DATA_ROOT/run"
+LOG_ROOT="$DATA_ROOT/log"
+ENV_FILE="$DATA_ROOT/velin.env"
+
+load_config() {
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    . "$ENV_FILE"
+    set +a
+  fi
+}
+
+quote_env() {
+  escaped=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "$escaped"
+}
+
+write_config() {
+  mkdir -p "$DATA_ROOT"
+  umask 077
+  temp_file="$ENV_FILE.tmp.$$"
+  admin_user="${wizard_admin_user:-${VELIN_ADMIN_USER:-admin}}"
+  admin_password="${wizard_admin_password:-${VELIN_ADMIN_PASSWORD:-}}"
+  ai_base_url="${wizard_ai_base_url:-${VELIN_AI_BASE_URL:-}}"
+  ai_model="${wizard_ai_model:-${VELIN_AI_MODEL:-}}"
+  ai_api_key="${wizard_ai_api_key:-${VELIN_AI_API_KEY:-}}"
+  {
+    printf 'VELIN_ADMIN_USER=%s\n' "$(quote_env "$admin_user")"
+    printf 'VELIN_ADMIN_PASSWORD=%s\n' "$(quote_env "$admin_password")"
+    printf 'VELIN_AI_BASE_URL=%s\n' "$(quote_env "$ai_base_url")"
+    printf 'VELIN_AI_MODEL=%s\n' "$(quote_env "$ai_model")"
+    printf 'VELIN_AI_API_KEY=%s\n' "$(quote_env "$ai_api_key")"
+  } > "$temp_file"
+  mv "$temp_file" "$ENV_FILE"
+}
+
+pid_alive() {
+  pid="$1"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}

@@ -2,27 +2,74 @@
 set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-VERSION="${VELIN_FNOS_VERSION:-0.3.17}"
+REPO_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
+VERSION="${VELIN_FNOS_VERSION:-0.3.18}"
 VERSION="${VERSION#v}"
-IMAGE="${VELIN_FNOS_IMAGE:-ghcr.io/ttyob/velinwebssh:${VERSION}}"
-OUTPUT_DIR="${VELIN_FNOS_OUTPUT_DIR:-$SCRIPT_DIR/../../dist/fnos}"
+ARCH="${VELIN_FNOS_ARCH:-$(uname -m)}"
+GUACD_IMAGE="${VELIN_FNOS_GUACD_IMAGE:-guacamole/guacd:1.6.0}"
+CRUSH_VERSION="${VELIN_FNOS_CRUSH_VERSION:-0.91.0}"
+OUTPUT_DIR="${VELIN_FNOS_OUTPUT_DIR:-$REPO_DIR/dist/fnos}"
+PREBUILT_BINARY="${VELIN_FNOS_BINARY:-}"
 FNPACK_BIN="${FNPACK_BIN:-}"
-FN_PACK_TMP=""
+TMP_DIR=""
 STAGE_DIR=""
+CONTAINER_ID=""
+
+case "$ARCH" in
+  x86_64|amd64)
+    ARCH=amd64
+    GOARCH=amd64
+    FNOS_PLATFORM=x86
+    CRUSH_ARCH=x86_64
+    CRUSH_CHECKSUM=74afc41d03243894b5221f03b1bbc4032f1a219671ec9116148946dc2af4c708
+    ;;
+  aarch64|arm64)
+    ARCH=arm64
+    GOARCH=arm64
+    FNOS_PLATFORM=arm
+    CRUSH_ARCH=arm64
+    CRUSH_CHECKSUM=bd9a88dba0c694bf63f679da3e7f0adef86125d35b466c8e30fadfe8bd9548f6
+    ;;
+  *)
+    echo "Unsupported fnOS architecture: $ARCH" >&2
+    exit 1
+    ;;
+esac
+
+cleanup() {
+  if [ -n "$CONTAINER_ID" ]; then
+    docker rm "$CONTAINER_ID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$TMP_DIR" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+  if [ -n "$STAGE_DIR" ]; then
+    rm -rf "$STAGE_DIR"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Required command is missing: $1" >&2
+    exit 1
+  fi
+}
+
+require_command docker
+require_command tar
 
 if [ -z "$FNPACK_BIN" ] && command -v fnpack >/dev/null 2>&1; then
   FNPACK_BIN="$(command -v fnpack)"
 fi
-
 if [ -z "$FNPACK_BIN" ]; then
   case "$(uname -m)" in
     x86_64|amd64) FN_PACK_ARCH=amd64 ;;
     aarch64|arm64) FN_PACK_ARCH=arm64 ;;
-    *) echo "Unsupported fnpack architecture: $(uname -m)" >&2; exit 1 ;;
+    *) echo "Unsupported fnpack builder architecture: $(uname -m)" >&2; exit 1 ;;
   esac
-  FN_PACK_TMP="$(mktemp -d)"
-  trap 'rm -rf "$FN_PACK_TMP" "$STAGE_DIR"' EXIT INT TERM
-  FNPACK_BIN="$FN_PACK_TMP/fnpack"
+  TMP_DIR="$(mktemp -d)"
+  FNPACK_BIN="$TMP_DIR/fnpack"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-${FN_PACK_ARCH}" -o "$FNPACK_BIN"
   elif command -v wget >/dev/null 2>&1; then
@@ -32,18 +79,87 @@ if [ -z "$FNPACK_BIN" ]; then
     exit 1
   fi
   chmod 755 "$FNPACK_BIN"
-else
-  trap 'rm -rf "$STAGE_DIR"' EXIT INT TERM
+fi
+
+WEB_DIST="${VELIN_FNOS_WEB_DIST:-$REPO_DIR/web/dist}"
+if [ ! -f "$WEB_DIST/index.html" ]; then
+  require_command npm
+  (
+    cd "$REPO_DIR/web"
+    npm ci
+    npm run build
+  )
 fi
 
 STAGE_DIR="$(mktemp -d)"
 cp -R "$SCRIPT_DIR"/. "$STAGE_DIR/"
 rm -f "$STAGE_DIR/build.sh"
-rm -rf "$STAGE_DIR/dist"
+mkdir -p "$STAGE_DIR/app/bin" "$STAGE_DIR/app/web/dist" "$STAGE_DIR/app/native/guacd-root"
+cp -R "$WEB_DIST"/. "$STAGE_DIR/app/web/dist/"
+
+if [ -n "$PREBUILT_BINARY" ]; then
+  if [ ! -f "$PREBUILT_BINARY" ]; then
+    echo "Prebuilt Velin binary was not found: $PREBUILT_BINARY" >&2
+    exit 1
+  fi
+  cp "$PREBUILT_BINARY" "$STAGE_DIR/app/bin/velin"
+else
+  require_command go
+  (
+    cd "$REPO_DIR"
+    CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build \
+      -trimpath -ldflags="-s -w" -o "$STAGE_DIR/app/bin/velin" ./cmd/velin
+  )
+fi
+
+docker pull --platform "linux/$ARCH" "$GUACD_IMAGE" >/dev/null
+CONTAINER_ID="$(docker create --platform "linux/$ARCH" "$GUACD_IMAGE")"
+docker export "$CONTAINER_ID" | tar -xpf - -C "$STAGE_DIR/app/native/guacd-root" \
+  opt/guacamole lib usr/lib etc/fonts etc/ssl/certs usr/share/fonts usr/share/fontconfig
+docker rm "$CONTAINER_ID" >/dev/null
+CONTAINER_ID=""
+
+LOADER="$(find "$STAGE_DIR/app/native/guacd-root/lib" -maxdepth 1 -name 'ld-musl-*.so.1' -type f -print -quit)"
+if [ -z "$LOADER" ]; then
+  echo "guacd runtime loader was not found in $GUACD_IMAGE" >&2
+  exit 1
+fi
+
+TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+CRUSH_ARCHIVE="$TMP_DIR/crush.tar.gz"
+CRUSH_URL="https://github.com/charmbracelet/crush/releases/download/v${CRUSH_VERSION}/crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}.tar.gz"
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$CRUSH_URL" -o "$CRUSH_ARCHIVE"
+elif command -v wget >/dev/null 2>&1; then
+  wget -qO "$CRUSH_ARCHIVE" "$CRUSH_URL"
+else
+  echo "curl or wget is required to download Crush" >&2
+  exit 1
+fi
+printf '%s  %s\n' "$CRUSH_CHECKSUM" "$CRUSH_ARCHIVE" | sha256sum -c -
+tar -xzf "$CRUSH_ARCHIVE" -C "$STAGE_DIR/app/bin" --strip-components=1 \
+  "crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}/crush"
+chmod 755 "$STAGE_DIR/app/bin/velin" "$STAGE_DIR/app/bin/crush"
+
+cat > "$STAGE_DIR/app/bin/guacd" <<'EOF'
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../native/guacd-root" && pwd)"
+LOADER="$(find "$ROOT/lib" -maxdepth 1 -name 'ld-musl-*.so.1' -type f -print -quit)"
+if [ -z "$LOADER" ]; then
+  echo "guacd runtime loader is missing" >&2
+  exit 1
+fi
+LIBRARY_PATH="$ROOT/opt/guacamole/lib:$ROOT/lib:$ROOT/usr/lib"
+exec "$LOADER" --library-path "$LIBRARY_PATH" \
+  "$ROOT/opt/guacamole/sbin/guacd" -f -b 127.0.0.1 \
+  -l "${VELIN_GUACD_PORT:-4822}" -L "${GUACD_LOG_LEVEL:-info}" "$@"
+EOF
+chmod 755 "$STAGE_DIR/app/bin/guacd"
 
 sed -i "s/^version=.*/version=${VERSION}/" "$STAGE_DIR/manifest"
-sed -i "s|image: ghcr.io/ttyob/velinwebssh:latest|image: ${IMAGE}|" \
-  "$STAGE_DIR/app/docker/docker-compose.yaml"
+sed -i "s/^platform=.*/platform=${FNOS_PLATFORM}/" "$STAGE_DIR/manifest"
 
 mkdir -p "$OUTPUT_DIR"
 (
@@ -56,6 +172,6 @@ if [ -z "$PACKAGE_FILE" ]; then
   exit 1
 fi
 
-OUTPUT_FILE="$OUTPUT_DIR/velin-fnos-${VERSION}.fpk"
+OUTPUT_FILE="$OUTPUT_DIR/velin-fnos-native-${ARCH}-${VERSION}.fpk"
 cp "$PACKAGE_FILE" "$OUTPUT_FILE"
 printf '%s\n' "$OUTPUT_FILE"

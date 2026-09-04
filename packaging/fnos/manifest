@@ -1,8 +1,8 @@
 appname=velin
-version=0.3.17
+version=0.3.18
 display_name=Velin Web SSH
-desc=Self-hosted browser SSH workspace with remote desktop and private networking.
-platform=all
+desc=Native browser SSH workspace with remote desktop and private networking.
+platform=x86
 source=thirdparty
 maintainer=Velin Web SSH
 distributor=Velin Web SSH
