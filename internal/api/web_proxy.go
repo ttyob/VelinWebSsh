@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -88,6 +89,7 @@ type webProxySession struct {
 	routePrefix  string
 	stable       bool
 	rootProxy    bool
+	viteDevMode  atomic.Bool
 	cookieMu     sync.Mutex
 	cookies      map[string]*http.Cookie
 	onProxyError func()
@@ -611,7 +613,8 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	response.Header.Del("ETag")
 	response.Header.Del("Last-Modified")
 	mediaType, inferredMediaType := proxyRewriteMediaType(response)
-	if mediaType == "" || response.Body == nil || response.ContentLength > maxRewriteBody {
+	rewriteJavaScript := s.viteDevMode.Load() && isJavaScriptMediaType(response.Header.Get("Content-Type"))
+	if mediaType == "" && !rewriteJavaScript || response.Body == nil || response.ContentLength > maxRewriteBody {
 		return nil
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxRewriteBody+1))
@@ -624,13 +627,18 @@ func (s *webProxySession) modifyResponse(response *http.Response) error {
 	}
 	_ = response.Body.Close()
 	if mediaType == "text/html" {
+		if isViteDevelopmentHTML(body) {
+			s.viteDevMode.Store(true)
+		}
 		documentPath := "/"
 		if response.Request != nil && response.Request.URL != nil {
 			documentPath = proxyDocumentPath(response.Request.URL.Path, s.target)
 		}
 		body = rewriteHTMLAtPath(body, prefix, s.target, documentPath)
-	} else {
+	} else if mediaType == "text/css" {
 		body = rewriteCSS(body, prefix, s.target)
+	} else if rewriteJavaScript {
+		body = rewriteViteJavaScript(body, prefix, s.target)
 	}
 	response.Body = io.NopCloser(bytes.NewReader(body))
 	response.ContentLength = int64(len(body))
@@ -786,6 +794,38 @@ func rewriteHTMLAtPath(body []byte, prefix string, target *url.URL, documentPath
 		return body
 	}
 	return output.Bytes()
+}
+
+func isViteDevelopmentHTML(body []byte) bool {
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "@vite/client")
+}
+
+func isJavaScriptMediaType(value string) bool {
+	mediaType, _, _ := mime.ParseMediaType(value)
+	switch strings.ToLower(mediaType) {
+	case "application/javascript", "application/x-javascript", "text/javascript", "application/ecmascript", "text/ecmascript":
+		return true
+	default:
+		return false
+	}
+}
+
+var viteImportPattern = regexp.MustCompile(`(?s)(\bfrom\s*|\bimport\s*(?:\(\s*)?)(["'])([^"']+)(["'])`)
+
+func rewriteViteJavaScript(body []byte, prefix string, target *url.URL) []byte {
+	rewritten := viteImportPattern.ReplaceAllStringFunc(string(body), func(match string) string {
+		groups := viteImportPattern.FindStringSubmatch(match)
+		if len(groups) != 5 || groups[2] != groups[4] {
+			return match
+		}
+		rewritten := rewriteProxyURL(groups[3], prefix, target)
+		if rewritten == groups[3] {
+			return match
+		}
+		return groups[1] + groups[2] + rewritten + groups[4]
+	})
+	return []byte(rewritten)
 }
 
 func injectWebProxyBootstrap(document *html.Node, prefix string, target *url.URL, documentPath string) {

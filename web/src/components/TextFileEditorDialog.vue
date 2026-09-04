@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { basicSetup } from "codemirror";
 import { json } from "@codemirror/lang-json";
 import { markdown } from "@codemirror/lang-markdown";
@@ -15,12 +15,16 @@ import { editorTheme } from "../editorTheme";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { ApiError, api } from "../api";
 import type { Host } from "../types";
+import DOMPurify from "dompurify";
+import { marked } from "marked";
+import { Eye, FilePenLine } from "@lucide/vue";
 
 const props = defineProps<{
   modelValue: boolean;
   host?: Host;
   sessionId?: string;
   file?: { name: string; path: string };
+  initialMode?: "edit" | "preview";
 }>();
 const emit = defineEmits<{
   "update:modelValue": [boolean];
@@ -34,8 +38,20 @@ const ready = ref(false);
 const dirty = ref(false);
 const version = ref("");
 const byteSize = ref(0);
+const markdownContent = ref("");
+const mode = ref<"edit" | "preview">("edit");
 let editor: EditorView | undefined;
 let originalContent = "";
+
+const isMarkdown = computed(() => {
+  const name = props.file?.name.toLowerCase() || "";
+  return name.endsWith(".md") || name.endsWith(".markdown");
+});
+
+function renderMarkdown(value: string) {
+  const html = marked.parse(value, { gfm: true, breaks: true, async: false });
+  return DOMPurify.sanitize(String(html));
+}
 
 function languageFor(name: string) {
   const lower = name.toLowerCase();
@@ -55,6 +71,7 @@ function destroyEditor() {
   ready.value = false;
   dirty.value = false;
   version.value = "";
+  markdownContent.value = "";
   originalContent = "";
 }
 
@@ -74,6 +91,8 @@ async function loadFile() {
       `/api/sftp/${props.host.id}/text?path=${encodeURIComponent(props.file.path)}${session}`,
     );
     originalContent = result.content;
+    markdownContent.value = result.content;
+    mode.value = isMarkdown.value ? props.initialMode || "edit" : "edit";
     version.value = result.version;
     byteSize.value = result.size;
     editor = new EditorView({
@@ -88,8 +107,9 @@ async function loadFile() {
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
-              dirty.value = update.state.doc.toString() !== originalContent;
-              byteSize.value = new TextEncoder().encode(update.state.doc.toString()).length;
+              markdownContent.value = update.state.doc.toString();
+              dirty.value = markdownContent.value !== originalContent;
+              byteSize.value = new TextEncoder().encode(markdownContent.value).length;
             }
           }),
         ],
@@ -138,6 +158,7 @@ async function saveFile() {
       },
     );
     originalContent = content;
+    markdownContent.value = content;
     version.value = result.version;
     byteSize.value = result.bytes;
     dirty.value = false;
@@ -207,8 +228,23 @@ onBeforeUnmount(destroyEditor);
         <small>{{ file?.path }}</small>
       </div>
     </template>
+    <div v-if="isMarkdown" class="text-editor-mode">
+      <el-radio-group v-model="mode" size="small">
+        <el-radio-button label="edit"><FilePenLine :size="14" /> 编辑</el-radio-button>
+        <el-radio-button label="preview"><Eye :size="14" /> 预览</el-radio-button>
+      </el-radio-group>
+    </div>
     <div v-loading="loading" class="text-editor-shell">
-      <div ref="editorElement" class="text-editor-mount" />
+      <div
+        ref="editorElement"
+        class="text-editor-mount"
+        :class="{ 'is-hidden': isMarkdown && mode === 'preview' }"
+      />
+      <article
+        v-if="isMarkdown && mode === 'preview'"
+        class="markdown-preview"
+        v-html="renderMarkdown(markdownContent)"
+      />
       <div v-if="!loading && !ready" class="text-editor-unavailable">无法加载文本内容</div>
     </div>
     <template #footer>

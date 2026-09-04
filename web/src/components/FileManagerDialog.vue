@@ -21,6 +21,9 @@ import type { Host } from "../types";
 const TextFileEditorDialog = defineAsyncComponent(
   () => import("./TextFileEditorDialog.vue"),
 );
+const ImagePreviewDialog = defineAsyncComponent(
+  () => import("./ImagePreviewDialog.vue"),
+);
 
 interface FileEntry {
   name: string;
@@ -48,6 +51,9 @@ const uploading = ref(false);
 const fileInput = ref<HTMLInputElement>();
 const editorOpen = ref(false);
 const editingFile = ref<FileEntry>();
+const editorMode = ref<"edit" | "preview">("edit");
+const imagePreviewOpen = ref(false);
+const previewingImage = ref<FileEntry>();
 const sessionQuery = computed(() =>
   props.sessionId ? `&session=${encodeURIComponent(props.sessionId)}` : "",
 );
@@ -171,6 +177,9 @@ const editableExtensions = new Set([
   "css", "scss", "less", "html", "htm", "vue", "go", "py", "rb", "php",
   "java", "c", "h", "cpp", "hpp", "rs", "sql",
 ]);
+const imageExtensions = new Set([
+  "avif", "bmp", "gif", "jpe", "jpeg", "jpg", "png", "webp",
+]);
 
 function isEditable(entry: FileEntry) {
   if (entry.directory || entry.symlink || entry.size > 2 * 1024 * 1024) return false;
@@ -180,14 +189,34 @@ function isEditable(entry: FileEntry) {
   return dot >= 0 && editableExtensions.has(lower.slice(dot + 1));
 }
 
-function editEntry(entry: FileEntry) {
+function isMarkdown(entry: FileEntry) {
+  const lower = entry.name.toLowerCase();
+  return !entry.directory && !entry.symlink &&
+    (lower.endsWith(".md") || lower.endsWith(".markdown"));
+}
+
+function isImage(entry: FileEntry) {
+  if (entry.directory || entry.symlink || entry.size <= 0 || entry.size > 32 * 1024 * 1024)
+    return false;
+  const dot = entry.name.lastIndexOf(".");
+  return dot >= 0 && imageExtensions.has(entry.name.toLowerCase().slice(dot + 1));
+}
+
+function editEntry(entry: FileEntry, mode: "edit" | "preview" = "edit") {
   editingFile.value = entry;
+  editorMode.value = mode;
   editorOpen.value = true;
+}
+
+function previewImage(entry: FileEntry) {
+  previewingImage.value = entry;
+  imagePreviewOpen.value = true;
 }
 
 function activateEntry(entry: FileEntry) {
   if (entry.directory) listFiles(entry.path);
   else if (isEditable(entry)) editEntry(entry);
+  else if (isImage(entry)) previewImage(entry);
 }
 
 function activateRow(entry: FileEntry, event: MouseEvent, doubleClick = false) {
@@ -336,7 +365,9 @@ async function uploadFile(event: Event) {
             <template #dropdown>
               <el-dropdown-menu>
                 <el-dropdown-item v-if="entry.directory" :icon="Folder" @click="listFiles(entry.path)">打开</el-dropdown-item>
+                <el-dropdown-item v-if="isMarkdown(entry)" :icon="Eye" @click="editEntry(entry, 'preview')">Markdown 预览</el-dropdown-item>
                 <el-dropdown-item v-if="isEditable(entry)" :icon="FilePenLine" @click="editEntry(entry)">在线编辑</el-dropdown-item>
+                <el-dropdown-item v-if="isImage(entry)" :icon="Eye" @click="previewImage(entry)">预览图片</el-dropdown-item>
                 <el-dropdown-item v-if="!entry.directory" :icon="Download" @click="downloadEntry(entry)">下载</el-dropdown-item>
                 <el-dropdown-item :icon="Pencil" @click="renameEntry(entry)">重命名</el-dropdown-item>
                 <el-dropdown-item divided :icon="Trash2" @click="deleteEntry(entry)">删除</el-dropdown-item>
@@ -354,7 +385,14 @@ async function uploadFile(event: Event) {
       :host="host"
       :session-id="sessionId"
       :file="editingFile"
+      :initial-mode="editorMode"
       @saved="listFiles()"
+    />
+    <ImagePreviewDialog
+      v-model="imagePreviewOpen"
+      :host="host"
+      :session-id="sessionId"
+      :file="previewingImage"
     />
   </el-dialog>
 </template>

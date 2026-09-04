@@ -21,6 +21,7 @@ import (
 	"velin-webssh/internal/forward"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
+	"velin-webssh/internal/tailnet"
 	"velin-webssh/internal/terminal"
 )
 
@@ -59,7 +60,19 @@ func main() {
 		}
 		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "change this password after login")
 	}
-	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary)
+	tailscaleSettings, err := tailnet.LoadSettings(s, vault)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tailscaleManager, err := tailnet.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err = tailscaleManager.Apply(tailscaleSettings); err != nil {
+		log.Fatal(err)
+	}
+	defer tailscaleManager.Close()
+	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary, tailscaleManager)
 	forwardManager := forward.NewManager(s, manager)
 	agentManager := agent.NewManager(
 		manager,
@@ -67,7 +80,7 @@ func main() {
 		agent.CrushConfig{Binary: cfg.CrushBinary, DataDir: cfg.CrushDataDir},
 	)
 	defer agentManager.Close()
-	handler := api.New(cfg, s, vault, manager, forwardManager, agentManager).Router()
+	handler := api.NewWithTailnet(cfg, s, vault, manager, forwardManager, agentManager, tailscaleManager).Router()
 	server := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp4", cfg.Addr)
 	if err != nil {

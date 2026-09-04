@@ -29,6 +29,7 @@ type Host struct {
 	UserID            string     `json:"userID"`
 	Name              string     `json:"name"`
 	Address           string     `json:"address"`
+	Protocol          string     `json:"protocol"`
 	Username          string     `json:"username"`
 	GroupName         string     `json:"groupName"`
 	SortOrder         int        `json:"sortOrder"`
@@ -45,6 +46,17 @@ type Host struct {
 	TerminalType      string     `json:"terminalType"`
 	SessionMode       string     `json:"sessionMode"`
 	JumpHostID        string     `json:"jumpHostID"`
+	RDPMode           string     `json:"rdpMode"`
+	RDPQuality        string     `json:"rdpQuality"`
+	RDPClipboard      bool       `json:"rdpClipboard"`
+	RDPAudio          bool       `json:"rdpAudio"`
+	RDPDrive          bool       `json:"rdpDrive"`
+	RDPPrinting       bool       `json:"rdpPrinting"`
+	RDPMultiMonitor   bool       `json:"rdpMultiMonitor"`
+	DesktopDomain     string     `json:"desktopDomain"`
+	DesktopSecurity   string     `json:"desktopSecurity"`
+	IgnoreCertificate bool       `json:"ignoreCertificate"`
+	DesktopReadOnly   bool       `json:"desktopReadOnly"`
 	Platform          string     `json:"platform"`
 	Distribution      string     `json:"distribution"`
 	LastStatus        string     `json:"lastStatus"`
@@ -164,7 +176,7 @@ CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UN
 CREATE TABLE IF NOT EXISTS auth_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT NOT NULL UNIQUE, user_agent TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', expires_at DATETIME NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_auth_token ON auth_sessions(token_hash);
 CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, kind TEXT NOT NULL, secret_enc TEXT NOT NULL, passphrase_enc TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, password_enc TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', session_mode TEXT NOT NULL DEFAULT 'tmux', jump_host_id TEXT NOT NULL DEFAULT '', platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL, protocol TEXT NOT NULL DEFAULT 'ssh', rdp_mode TEXT NOT NULL DEFAULT 'web', rdp_quality TEXT NOT NULL DEFAULT 'crisp', rdp_clipboard INTEGER NOT NULL DEFAULT 1, rdp_audio INTEGER NOT NULL DEFAULT 0, rdp_drive INTEGER NOT NULL DEFAULT 0, rdp_printing INTEGER NOT NULL DEFAULT 0, rdp_multi_monitor INTEGER NOT NULL DEFAULT 0, credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL, password_enc TEXT NOT NULL DEFAULT '', group_name TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, tags TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '', favorite INTEGER NOT NULL DEFAULT 0, initial_directory TEXT NOT NULL DEFAULT '', connect_timeout INTEGER NOT NULL DEFAULT 12, keepalive_interval INTEGER NOT NULL DEFAULT 30, max_retries INTEGER NOT NULL DEFAULT 5, terminal_type TEXT NOT NULL DEFAULT 'xterm-256color', session_mode TEXT NOT NULL DEFAULT 'tmux', jump_host_id TEXT NOT NULL DEFAULT '', desktop_domain TEXT NOT NULL DEFAULT '', desktop_security TEXT NOT NULL DEFAULT 'any', desktop_ignore_certificate INTEGER NOT NULL DEFAULT 0, desktop_read_only INTEGER NOT NULL DEFAULT 0, platform TEXT NOT NULL DEFAULT '', distribution TEXT NOT NULL DEFAULT '', last_status TEXT NOT NULL DEFAULT '', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_connected_at DATETIME, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_hosts_user ON hosts(user_id, name);
 CREATE TABLE IF NOT EXISTS known_host_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, fingerprint TEXT NOT NULL, public_key TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,address,port));
 CREATE TABLE IF NOT EXISTS terminal_sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, host_id TEXT NOT NULL, credential_id TEXT NOT NULL DEFAULT '', name TEXT NOT NULL, remote_user TEXT NOT NULL, session_mode TEXT NOT NULL DEFAULT 'tmux', tmux_socket TEXT NOT NULL, tmux_name TEXT NOT NULL, owner_marker TEXT NOT NULL, status TEXT NOT NULL, last_error TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -200,6 +212,15 @@ CREATE TABLE IF NOT EXISTS user_preferences (user_id TEXT PRIMARY KEY REFERENCES
 		{"terminal_type", "TEXT NOT NULL DEFAULT 'xterm-256color'"}, {"password_enc", "TEXT NOT NULL DEFAULT ''"}, {"sort_order", "INTEGER NOT NULL DEFAULT 0"}, {"last_status", "TEXT NOT NULL DEFAULT ''"},
 		{"session_mode", "TEXT NOT NULL DEFAULT 'tmux'"},
 		{"jump_host_id", "TEXT NOT NULL DEFAULT ''"},
+		{"protocol", "TEXT NOT NULL DEFAULT 'ssh'"},
+		{"rdp_mode", "TEXT NOT NULL DEFAULT 'web'"},
+		{"rdp_quality", "TEXT NOT NULL DEFAULT 'crisp'"}, {"rdp_clipboard", "INTEGER NOT NULL DEFAULT 1"},
+		{"rdp_audio", "INTEGER NOT NULL DEFAULT 0"}, {"rdp_drive", "INTEGER NOT NULL DEFAULT 0"},
+		{"rdp_printing", "INTEGER NOT NULL DEFAULT 0"}, {"rdp_multi_monitor", "INTEGER NOT NULL DEFAULT 0"},
+		{"desktop_domain", "TEXT NOT NULL DEFAULT ''"},
+		{"desktop_security", "TEXT NOT NULL DEFAULT 'any'"},
+		{"desktop_ignore_certificate", "INTEGER NOT NULL DEFAULT 0"},
+		{"desktop_read_only", "INTEGER NOT NULL DEFAULT 0"},
 		{"platform", "TEXT NOT NULL DEFAULT ''"},
 		{"distribution", "TEXT NOT NULL DEFAULT ''"},
 		{"last_latency_ms", "INTEGER NOT NULL DEFAULT 0"}, {"last_connected_at", "DATETIME"},
@@ -468,12 +489,12 @@ func (s *Store) SaveSystemSetting(key string, value any) error {
 	return err
 }
 
-const hostCols = `id,user_id,name,address,port,username,COALESCE(credential_id,''),COALESCE(password_enc,''),group_name,COALESCE(sort_order,0),tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id,platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
+const hostCols = `id,user_id,name,address,port,username,COALESCE(protocol,'ssh'),COALESCE(rdp_mode,'web'),COALESCE(rdp_quality,'crisp'),COALESCE(rdp_clipboard,1),COALESCE(rdp_audio,0),COALESCE(rdp_drive,0),COALESCE(rdp_printing,0),COALESCE(rdp_multi_monitor,0),COALESCE(credential_id,''),COALESCE(password_enc,''),group_name,COALESCE(sort_order,0),tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id,COALESCE(desktop_domain,''),COALESCE(desktop_security,'any'),COALESCE(desktop_ignore_certificate,0),COALESCE(desktop_read_only,0),platform,distribution,last_status,last_latency_ms,last_connected_at,created_at,updated_at`
 
 func scanHost(row interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var connected sql.NullTime
-	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.CredentialID, &h.PasswordEnc, &h.GroupName, &h.SortOrder, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.SessionMode, &h.JumpHostID, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
+	err := row.Scan(&h.ID, &h.UserID, &h.Name, &h.Address, &h.Port, &h.Username, &h.Protocol, &h.RDPMode, &h.RDPQuality, &h.RDPClipboard, &h.RDPAudio, &h.RDPDrive, &h.RDPPrinting, &h.RDPMultiMonitor, &h.CredentialID, &h.PasswordEnc, &h.GroupName, &h.SortOrder, &h.Tags, &h.Notes, &h.InitialDir, &h.ConnectTimeout, &h.KeepaliveInterval, &h.MaxRetries, &h.TerminalType, &h.SessionMode, &h.JumpHostID, &h.DesktopDomain, &h.DesktopSecurity, &h.IgnoreCertificate, &h.DesktopReadOnly, &h.Platform, &h.Distribution, &h.LastStatus, &h.LastLatency, &connected, &h.CreatedAt, &h.UpdatedAt)
 	h.HasPassword = h.PasswordEnc != ""
 	if connected.Valid {
 		h.LastConnectedAt = &connected.Time
@@ -500,10 +521,22 @@ func (s *Store) Host(userID, id string) (Host, error) {
 	return scanHost(s.DB.QueryRow(`SELECT `+hostCols+` FROM hosts WHERE user_id=? AND id=?`, userID, id))
 }
 func (s *Store) SaveHost(h Host) error {
+	if h.Protocol == "" {
+		h.Protocol = "ssh"
+	}
 	if h.SessionMode == "" {
 		h.SessionMode = "tmux"
 	}
-	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,credential_id,password_enc,group_name,sort_order,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id) VALUES(?,?,?,?,?,?,NULLIF(?,''),?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,credential_id=excluded.credential_id,password_enc=excluded.password_enc,group_name=excluded.group_name,sort_order=excluded.sort_order,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,session_mode=excluded.session_mode,jump_host_id=excluded.jump_host_id,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.CredentialID, h.PasswordEnc, h.GroupName, h.SortOrder, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType, h.SessionMode, h.JumpHostID)
+	if h.DesktopSecurity == "" {
+		h.DesktopSecurity = "any"
+	}
+	if h.RDPMode == "" {
+		h.RDPMode = "web"
+	}
+	if h.RDPQuality == "" {
+		h.RDPQuality = "crisp"
+	}
+	_, err := s.DB.Exec(`INSERT INTO hosts(id,user_id,name,address,port,username,protocol,rdp_mode,rdp_quality,rdp_clipboard,rdp_audio,rdp_drive,rdp_printing,rdp_multi_monitor,credential_id,password_enc,group_name,sort_order,tags,notes,initial_directory,connect_timeout,keepalive_interval,max_retries,terminal_type,session_mode,jump_host_id,desktop_domain,desktop_security,desktop_ignore_certificate,desktop_read_only) VALUES(?,?,?,?,?,?,?, ?,?,?,?,?,?, ?,NULLIF(?,''),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,address=excluded.address,port=excluded.port,username=excluded.username,protocol=excluded.protocol,rdp_mode=excluded.rdp_mode,rdp_quality=excluded.rdp_quality,rdp_clipboard=excluded.rdp_clipboard,rdp_audio=excluded.rdp_audio,rdp_drive=excluded.rdp_drive,rdp_printing=excluded.rdp_printing,rdp_multi_monitor=excluded.rdp_multi_monitor,credential_id=excluded.credential_id,password_enc=excluded.password_enc,group_name=excluded.group_name,sort_order=excluded.sort_order,tags=excluded.tags,notes=excluded.notes,initial_directory=excluded.initial_directory,connect_timeout=excluded.connect_timeout,keepalive_interval=excluded.keepalive_interval,max_retries=excluded.max_retries,terminal_type=excluded.terminal_type,session_mode=excluded.session_mode,jump_host_id=excluded.jump_host_id,desktop_domain=excluded.desktop_domain,desktop_security=excluded.desktop_security,desktop_ignore_certificate=excluded.desktop_ignore_certificate,desktop_read_only=excluded.desktop_read_only,updated_at=CURRENT_TIMESTAMP WHERE user_id=excluded.user_id`, h.ID, h.UserID, h.Name, h.Address, h.Port, h.Username, h.Protocol, h.RDPMode, h.RDPQuality, h.RDPClipboard, h.RDPAudio, h.RDPDrive, h.RDPPrinting, h.RDPMultiMonitor, h.CredentialID, h.PasswordEnc, h.GroupName, h.SortOrder, h.Tags, h.Notes, h.InitialDir, h.ConnectTimeout, h.KeepaliveInterval, h.MaxRetries, h.TerminalType, h.SessionMode, h.JumpHostID, h.DesktopDomain, h.DesktopSecurity, h.IgnoreCertificate, h.DesktopReadOnly)
 	return err
 }
 

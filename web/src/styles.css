@@ -2109,6 +2109,76 @@ button {
   background: #101b2d;
 }
 
+.text-editor-mode {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 0 8px;
+}
+
+.text-editor-mode .el-radio-button__inner {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.text-editor-mount.is-hidden {
+  display: none;
+}
+
+.markdown-preview {
+  height: 100%;
+  box-sizing: border-box;
+  overflow: auto;
+  padding: 24px 30px;
+  color: #f1e3cc;
+  background: #101b2d;
+  font-size: 14px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+
+.markdown-preview :first-child { margin-top: 0; }
+.markdown-preview :last-child { margin-bottom: 0; }
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4 { color: #fff4df; line-height: 1.3; }
+.markdown-preview h1 { padding-bottom: 8px; border-bottom: 1px solid #604735; }
+.markdown-preview blockquote { margin-inline: 0; padding-left: 14px; border-left: 3px solid #a87545; color: #c3a98b; }
+.markdown-preview code,
+.markdown-preview pre { font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace; }
+.markdown-preview code { padding: 2px 5px; border-radius: 3px; background: #2a211d; }
+.markdown-preview pre { padding: 13px; overflow: auto; border: 1px solid #604735; border-radius: 4px; background: #0b1422; }
+.markdown-preview pre code { padding: 0; background: transparent; }
+.markdown-preview a { color: #7fc8b0; }
+.markdown-preview img { max-width: 100%; height: auto; }
+.markdown-preview table { width: 100%; border-collapse: collapse; }
+.markdown-preview th,
+.markdown-preview td { padding: 6px 9px; border: 1px solid #604735; text-align: left; }
+
+.image-preview-heading {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.image-preview-heading strong { color: var(--text); font-size: 14px; }
+.image-preview-heading small { max-width: min(760px, 75vw); overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.image-preview-stage {
+  min-height: min(66vh, 650px);
+  display: grid;
+  place-items: center;
+  gap: 10px;
+  overflow: auto;
+  padding: 18px;
+  border-block: 1px solid #604735;
+  background: #101b2d;
+  color: var(--muted);
+}
+.image-preview-stage img { display: block; max-width: 100%; max-height: min(62vh, 610px); object-fit: contain; }
+.image-preview-stage.failed { min-height: 180px; }
+
 .text-editor-mount,
 .text-editor-mount .cm-editor {
   height: 100%;

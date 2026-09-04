@@ -35,6 +35,7 @@ import type {
   LoginDevice,
   Preferences,
   SecurityPolicy,
+  TailscaleConfig,
   TerminalSession,
   User,
 } from "../types";
@@ -72,6 +73,13 @@ const tab = ref("terminal"),
   devices = ref<LoginDevice[]>([]),
   stats = ref<any>({}),
   backups = ref<any[]>([]),
+  tailscale = ref<TailscaleConfig>({
+    enabled: false,
+    hostname: "velin",
+    controlURL: "",
+    authKeyConfigured: false,
+    status: { enabled: false, state: "disabled", tun: false },
+  }),
   backupKey = ref(""),
   backupBusy = ref<"backup" | "restore">();
 const userDialogOpen = ref(false),
@@ -125,6 +133,14 @@ const aiModelForm = ref({
 });
 const savingAIModel = ref(false),
   testingAIModel = ref(false);
+const tailscaleForm = ref({
+  enabled: false,
+  hostname: "velin",
+  controlURL: "",
+  authKey: "",
+  clearAuthKey: false,
+});
+const savingTailscale = ref(false);
 const terminalDefaults: Preferences = {
   theme: "dark",
   accentColor: "#5b8cff",
@@ -188,20 +204,28 @@ async function load() {
   lockPINConfigured.value = lockPIN.configured;
   if (!lockPIN.configured) props.preferences.lockEnabled = false;
 	if (auth.user?.role === "admin")
-		[users.value, stats.value, policy.value, aiModel.value, backups.value] = await Promise.all([
+		[users.value, stats.value, policy.value, aiModel.value, backups.value, tailscale.value] = await Promise.all([
 			api<User[]>("/api/admin/users"),
 			api<any>("/api/admin/stats"),
 			api<SecurityPolicy>("/api/admin/security-policy"),
 			api<AIModelConfig>("/api/admin/ai-model"),
 			api<any[]>("/api/admin/backups"),
+			api<TailscaleConfig>("/api/admin/tailscale"),
 		]);
   if (auth.user?.role === "admin")
-    aiModelForm.value = {
+		aiModelForm.value = {
       baseURL: aiModel.value.baseURL,
       model: aiModel.value.model,
       apiKey: "",
       clearAPIKey: false,
-    };
+		};
+		tailscaleForm.value = {
+			enabled: tailscale.value.enabled,
+			hostname: tailscale.value.hostname,
+			controlURL: tailscale.value.controlURL,
+			authKey: "",
+			clearAuthKey: false,
+		};
 }
 function normalizePIN(value: string) {
   return value.replace(/\D/g, "").slice(0, 6);
@@ -523,6 +547,32 @@ async function testAIModel() {
     testingAIModel.value = false;
   }
 }
+async function saveTailscale() {
+  const form = tailscaleForm.value;
+  if (!form.hostname.trim()) {
+    ElMessage.warning("请输入 Tailscale 节点名称");
+    return;
+  }
+  savingTailscale.value = true;
+  try {
+    tailscale.value = await api<TailscaleConfig>("/api/admin/tailscale", {
+      method: "PUT",
+      body: json(form),
+    });
+    tailscaleForm.value = {
+      enabled: tailscale.value.enabled,
+      hostname: tailscale.value.hostname,
+      controlURL: tailscale.value.controlURL,
+      authKey: "",
+      clearAuthKey: false,
+    };
+    ElMessage.success("Tailscale 设置已保存");
+  } catch (e) {
+    ElMessage.error(e instanceof Error ? e.message : "Tailscale 设置保存失败");
+  } finally {
+    savingTailscale.value = false;
+  }
+}
 async function backup() {
   if (backupKey.value.length < 12)
     return ElMessage.warning("备份密钥至少需要 12 个字符");
@@ -728,6 +778,13 @@ function forwardBatch(text: string, sessionIDs: string[]) {
         </button>
         <button
           v-if="auth.user?.role === 'admin'"
+          :class="{ active: tab === 'network' }"
+          @click="tab = 'network'"
+        >
+          <Network :size="17" /><span>组网</span>
+        </button>
+        <button
+          v-if="auth.user?.role === 'admin'"
           :class="{ active: tab === 'ai' }"
           @click="tab = 'ai'"
         >
@@ -761,6 +818,7 @@ function forwardBatch(text: string, sessionIDs: string[]) {
             'devices',
             'users',
             'admin',
+            'network',
             'ai',
           ].includes(tab),
         }"
@@ -774,7 +832,7 @@ function forwardBatch(text: string, sessionIDs: string[]) {
         <TaskPanel v-if="tab === 'tasks'" :sessions="sessions" />
         <el-tabs
           v-if="
-            ['terminal', 'devices', 'users', 'admin', 'ai'].includes(tab)
+            ['terminal', 'devices', 'users', 'admin', 'network', 'ai'].includes(tab)
           "
           v-model="tab"
           class="settings-tabs settings-detail-tabs"
@@ -1332,6 +1390,46 @@ function forwardBatch(text: string, sessionIDs: string[]) {
               </div>
               <div v-if="!backups.length" class="empty-small backup-empty">
                 <Database :size="24" /><span>暂无加密备份</span>
+              </div>
+            </div>
+          </el-tab-pane>
+          <el-tab-pane
+            v-if="auth.user?.role === 'admin'"
+            label="组网"
+            name="network"
+          >
+            <div class="settings-section">
+              <div class="security-heading">
+                <div>
+                  <h3>内嵌 Tailscale</h3>
+                  <p>服务默认关闭，仅在开启并保存后启动 Go 网络服务。</p>
+                </div>
+                <span class="security-state" :class="{ enabled: tailscale.status.state === 'Running' }">
+                  {{ tailscale.status.state === "Running" ? "运行中" : tailscale.enabled ? tailscale.status.state : "已关闭" }}
+                </span>
+              </div>
+              <div class="setting-row">
+                <span>服务状态</span>
+                <el-switch v-model="tailscaleForm.enabled" />
+              </div>
+              <el-form label-position="top" class="ai-model-form">
+                <el-form-item label="节点名称">
+                  <el-input v-model="tailscaleForm.hostname" maxlength="63" />
+                </el-form-item>
+                <el-form-item label="控制面地址">
+                  <el-input v-model="tailscaleForm.controlURL" placeholder="官方 Tailscale 留空，Headscale 填写地址" clearable />
+                </el-form-item>
+                <el-form-item label="Auth Key">
+                  <el-input v-model="tailscaleForm.authKey" type="password" show-password autocomplete="new-password" :placeholder="tailscale.authKeyConfigured ? '已配置，留空保持不变' : '输入 Auth Key'" :disabled="tailscaleForm.clearAuthKey" />
+                </el-form-item>
+                <el-checkbox v-if="tailscale.authKeyConfigured" v-model="tailscaleForm.clearAuthKey">清除已保存的 Auth Key</el-checkbox>
+              </el-form>
+              <div v-if="tailscale.status.ips?.length || tailscale.status.authUrl" class="setting-note">
+                <span v-if="tailscale.status.ips?.length">IP: {{ tailscale.status.ips.join(", ") }}</span>
+                <a v-if="tailscale.status.authUrl" :href="tailscale.status.authUrl" target="_blank" rel="noreferrer">打开登录链接</a>
+              </div>
+              <div class="row-actions settings-actions">
+                <el-button :icon="Save" type="primary" :loading="savingTailscale" @click="saveTailscale">保存并应用</el-button>
               </div>
             </div>
           </el-tab-pane>

@@ -62,6 +62,7 @@ import type { HostDropTarget } from "../components/HostGroupNode.vue";
 import TmuxInstallDialog from "../components/TmuxInstallDialog.vue";
 import WebServiceList from "../components/WebServiceList.vue";
 import { useWorkspaceLock } from "../composables/useWorkspaceLock";
+import { launchNativeRDP, nativeRDPAvailable } from "../rdp";
 import {
   applyAccent,
   applyInterfaceTheme,
@@ -98,6 +99,9 @@ const DockerDialog = defineAsyncComponent(
 const GitDialog = defineAsyncComponent(
   () => import("../components/GitDialog.vue"),
 );
+const RemoteDesktopPane = defineAsyncComponent(
+  () => import("../components/RemoteDesktopPane.vue"),
+);
 
 const router = useRouter(),
   auth = useAuthStore();
@@ -105,6 +109,15 @@ const hosts = ref<Host[]>([]),
   credentials = ref<Credential[]>([]),
   sessions = ref<TerminalSession[]>([]),
   webServices = ref<WebService[]>([]);
+const desktopTabs = reactive<
+  Record<
+    string,
+    {
+      host: Host;
+      status: "connecting" | "connected" | "disconnected" | "error";
+    }
+  >
+>({});
 const search = ref(""),
   sessionSearch = ref(""),
   sidebarOpen = ref(true),
@@ -205,12 +218,16 @@ const dockerContext = reactive({
   sessionID: "",
   checking: false,
   conversation: false,
+  installed: undefined as boolean | undefined,
 });
 let dockerContextRequest = 0;
+const gitMenuDisabled = computed(
+  () => dockerContext.checking,
+);
 const dockerMenuDisabled = computed(
   () =>
     dockerContext.checking ||
-    dockerContext.conversation,
+    dockerContext.installed === false,
 );
 const splitDialog = reactive({
   open: false,
@@ -360,6 +377,12 @@ function tabSession(tabID: string) {
       )
     : undefined;
 }
+function tabTitle(tabID: string) {
+  return desktopTabs[tabID]?.host.name || tabSession(tabID)?.name || "已结束会话";
+}
+function tabStatus(tabID: string) {
+  return desktopTabs[tabID]?.status || tabSession(tabID)?.status || "ended";
+}
 function cleanTree(
   node: unknown,
   valid: Set<string>,
@@ -451,11 +474,18 @@ function copyLayout(value: WorkspaceLayout): WorkspaceLayout {
   return JSON.parse(JSON.stringify(value));
 }
 function captureLayout(): WorkspaceLayout {
+  const tabs = layout.tabs.filter((id) => !desktopTabs[id]);
+  const trees = Object.fromEntries(
+    tabs.flatMap((id) => (layout.trees?.[id] ? [[id, layout.trees[id]]] : [])),
+  );
+  const focused = Object.fromEntries(
+    tabs.flatMap((id) => (layout.focused?.[id] ? [[id, layout.focused[id]]] : [])),
+  );
   return copyLayout({
-    tabs: layout.tabs,
-    active: layout.active,
-    trees: layout.trees,
-    focused: layout.focused,
+    tabs,
+    active: tabs.includes(layout.active || "") ? layout.active : tabs[0],
+    trees,
+    focused,
     maximized: {},
     pinnedSessionIDs: pinnedSessionIDs.value,
   });
@@ -718,6 +748,18 @@ async function connect(
   initialCommand = "",
   sessionName = "",
 ) {
+  if ((host.protocol || "ssh") !== "ssh") {
+    if (placement) {
+      ElMessage.warning("远程桌面只能在独立标签中打开，不能加入分屏");
+      return;
+    }
+    if (host.protocol === "rdp" && host.rdpMode === "native") {
+      await openNativeRDP(host);
+      return;
+    }
+    openDesktop(host);
+    return;
+  }
   connecting.value = host.id;
   try {
     const body = {
@@ -781,6 +823,66 @@ async function connect(
   } finally {
     connecting.value = undefined;
   }
+}
+async function openNativeRDP(host: Host) {
+  if (host.jumpHostID) {
+    ElMessage.warning("本地 RDP 客户端不支持 SSH 跳板机，请改用浏览器内连接");
+    return;
+  }
+  try {
+    const result = await startNativeRDP(host);
+    if (result === "launched") ElMessage.success("已启动本地远程桌面");
+    else ElMessage.info("RDP 配置文件已下载，请用远程桌面连接打开");
+  } catch (error) {
+    if (error instanceof ApiError && error.body.code === "credential_required") {
+      try {
+        const { value } = await ElMessageBox.prompt(
+          `输入 ${host.name} 的 RDP 密码`,
+          "临时凭据",
+          {
+            inputType: "password",
+            confirmButtonText: "连接",
+            cancelButtonText: "取消",
+            inputValidator: (input) => Boolean(input) || "请输入密码",
+          },
+        );
+        const result = await startNativeRDP(host, value);
+        if (result === "launched") ElMessage.success("已启动本地远程桌面");
+        else ElMessage.info("RDP 配置文件已下载，请用远程桌面连接打开");
+      } catch (promptError) {
+        if (promptError !== "cancel" && promptError !== "close")
+          ElMessage.error(
+            promptError instanceof Error ? promptError.message : "无法启动本地远程桌面",
+          );
+      }
+      return;
+    }
+    ElMessage.error(error instanceof Error ? error.message : "无法启动本地远程桌面");
+  }
+}
+async function startNativeRDP(host: Host, secret = "") {
+  if (!nativeRDPAvailable()) return launchNativeRDP(host);
+  const session = await api<{ password?: string }>("/api/desktop/sessions", {
+    method: "POST",
+    body: json({ hostID: host.id, native: true, secret }),
+  });
+  return launchNativeRDP(host, session.password || "");
+}
+function openDesktop(host: Host) {
+  const tabID = `desktop-${nodeID()}`;
+  desktopTabs[tabID] = { host: { ...host }, status: "connecting" };
+  layout.tabs.push(tabID);
+  layout.trees![tabID] = leaf(tabID);
+  layout.focused![tabID] = firstLeafID(layout.trees![tabID]);
+  layout.active = tabID;
+  mobileSidebar.value = false;
+  scheduleSave();
+}
+function updateDesktopStatus(
+  tabID: string,
+  status: "connecting" | "connected" | "disconnected" | "error",
+) {
+  if (desktopTabs[tabID]) desktopTabs[tabID].status = status;
 }
 async function promptTemporary(
   host: Host,
@@ -871,24 +973,39 @@ function openContext(event: MouseEvent, leafID: string) {
   const session = tree && sessionForLeaf(tree, leafID);
   dockerContext.sessionID = session?.id || "";
   dockerContext.conversation = Boolean(session && conversationSessions[session.id]);
-  dockerContext.checking = Boolean(session?.sessionMode === "tmux");
+  dockerContext.installed = undefined;
+  dockerContext.checking = Boolean(session);
   contextMenu.x = Math.min(event.clientX, window.innerWidth - 188);
   contextMenu.y = Math.max(
     6,
     Math.min(event.clientY, window.innerHeight - 445),
   );
   const request = ++dockerContextRequest;
-  if (session?.sessionMode === "tmux") {
-    void api<{ command: string }>(`/api/sessions/${session.id}/foreground`)
-      .then((result) => {
-        if (request !== dockerContextRequest || dockerContext.sessionID !== session.id) return;
-        dockerContext.conversation = isConversationCommand(result.command);
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (request === dockerContextRequest) dockerContext.checking = false;
-      });
+  if (!session) {
+    dockerContext.checking = false;
+    return;
   }
+  const checks: Promise<unknown>[] = [
+    api<{ installed: boolean }>(`/api/sessions/${session.id}/docker/status`)
+      .then((result) => {
+        if (request === dockerContextRequest && dockerContext.sessionID === session.id)
+          dockerContext.installed = result.installed;
+      })
+      .catch(() => {}),
+  ];
+  if (session.sessionMode === "tmux") {
+    checks.push(
+      api<{ command: string }>(`/api/sessions/${session.id}/foreground`)
+        .then((result) => {
+          if (request !== dockerContextRequest || dockerContext.sessionID !== session.id) return;
+          dockerContext.conversation = isConversationCommand(result.command);
+        })
+        .catch(() => {}),
+    );
+  }
+  void Promise.all(checks).finally(() => {
+    if (request === dockerContextRequest) dockerContext.checking = false;
+  });
 }
 function isConversationCommand(command: string) {
   return /(?:^|[\s/])(codex|claude|aider|gemini|opencode|goose|crush|cursor-agent)(?:$|\s)/i.test(
@@ -1104,6 +1221,8 @@ function openPaneDocker() {
   contextMenu.open = false;
   if (!session || !host)
     return ElMessage.warning("当前终端没有可用的主机信息");
+  if (dockerContext.installed === false)
+    return ElMessage.warning("当前主机未安装 Docker");
   if (!host.credentialID && !host.hasPassword)
     return ElMessage.warning("请先为当前主机保存 SSH 密码或配置 SSH 凭据");
   dockerHost.value = host;
@@ -1183,6 +1302,7 @@ function updateRatio(nodeIDValue: string, ratio: number) {
   scheduleSave();
 }
 function moveBackground(id: string) {
+  delete desktopTabs[id];
   if (agentTabID.value === id) {
     agentOpen.value = false;
     agentHost.value = undefined;
@@ -1197,6 +1317,10 @@ function moveBackground(id: string) {
   scheduleSave();
 }
 async function closeTab(tabID: string) {
+  if (desktopTabs[tabID]) {
+    moveBackground(tabID);
+    return;
+  }
   const tree = layout.trees?.[tabID];
   if (!tree) return;
   const targets = [...new Set(collectSessionIDs(tree))]
@@ -1498,7 +1622,9 @@ async function testHost(
     if (result.platform) host.platform = result.platform;
     if (result.distribution) host.distribution = result.distribution;
     ElMessage.success(
-      `连接正常 · ${result.latencyMs} ms · ${result.sessionMode === "normal" ? "普通 SSH" : result.tmuxVersion}`,
+      (host.protocol || "ssh") === "ssh"
+        ? `连接正常 · ${result.latencyMs} ms · ${result.sessionMode === "normal" ? "普通 SSH" : result.tmuxVersion}`
+        : `${host.protocol.toUpperCase()} 端口可达 · ${result.latencyMs} ms`,
     );
   } catch (e) {
     host.lastStatus = "offline";
@@ -1529,8 +1655,11 @@ async function testHost(
       e.message.toLowerCase().includes("credential required")
     ) {
       try {
+        const protocol = host.protocol || "ssh";
         const { value } = await ElMessageBox.prompt(
-          `输入 ${host.username}@${host.address} 的 SSH 密码`,
+          protocol === "ssh"
+            ? `输入 ${host.username}@${host.address} 的 SSH 密码`
+            : `输入 ${host.name} 的 ${protocol.toUpperCase()} 密码`,
           "测试连接",
           {
             confirmButtonText: "测试",
@@ -1785,11 +1914,11 @@ async function restoreBackgroundSessions() {
   }
 }
 function statusColor(status: string) {
-  return status === "attached"
+  return status === "attached" || status === "connected"
     ? "online"
     : status === "background"
       ? "idle"
-      : status === "ended"
+      : status === "ended" || status === "disconnected"
         ? "off"
         : "warning";
 }
@@ -2042,11 +2171,9 @@ onBeforeUnmount(() => {
             >
               <span
                 class="status-dot"
-                :class="statusColor(tabSession(id)?.status || 'ended')"
+                :class="statusColor(tabStatus(id))"
               ></span
-              ><span class="tab-title">{{
-                tabSession(id)?.name || "已结束会话"
-              }}</span
+              ><span class="tab-title">{{ tabTitle(id) }}</span
               ><el-tooltip
                 v-if="tabIndicators[id]"
                 :content="tabIndicators[id].label"
@@ -2065,7 +2192,7 @@ onBeforeUnmount(() => {
               </el-tooltip>
               <button
                 class="tab-close danger"
-                title="关闭终端标签"
+                :title="desktopTabs[id] ? '关闭远程桌面标签' : '关闭终端标签'"
                 @click.stop="closeTab(id)"
               >
                 <X :size="13" />
@@ -2125,7 +2252,14 @@ onBeforeUnmount(() => {
           :key="id"
           class="terminal-workspace"
         >
+          <RemoteDesktopPane
+            v-if="desktopTabs[id]"
+            :host="desktopTabs[id].host"
+            :visible="layout.active === id"
+            @status="updateDesktopStatus(id, $event)"
+          />
           <SplitPaneNode
+            v-else
             :ref="(value) => setPaneTreeRef(id, value)"
             :node="layout.trees![id]"
             :sessions="sessions"
@@ -2156,7 +2290,10 @@ onBeforeUnmount(() => {
           >新增主机</el-button
         >
       </div>
-      <div v-if="!locked && activeTree" class="mobile-keybar">
+      <div
+        v-if="!locked && activeTree && !desktopTabs[layout.active || '']"
+        class="mobile-keybar"
+      >
         <button
           class="modifier"
           :class="{ active: mobileCtrl }"
@@ -2212,13 +2349,11 @@ onBeforeUnmount(() => {
         ><button @click="openPaneMonitor">
           <Activity :size="16" /><span>主机监控</span></button
         ><button
-          :disabled="dockerMenuDisabled"
+          :disabled="gitMenuDisabled"
           :title="
             dockerContext.checking
               ? '正在确认当前终端状态'
-              : dockerContext.conversation
-                ? '对话式终端暂不支持 Git 管理'
-                : 'Git 管理'
+              : 'Git 管理'
           "
           @click="openPaneGit"
         >
@@ -2228,8 +2363,8 @@ onBeforeUnmount(() => {
           :title="
             dockerContext.checking
               ? '正在确认当前终端状态'
-              : dockerContext.conversation
-                ? '对话式终端暂不支持 Docker 管理'
+              : dockerContext.installed === false
+                ? '当前主机未安装 Docker'
                 : 'Docker 管理'
           "
           @click="openPaneDocker"
@@ -2285,7 +2420,9 @@ onBeforeUnmount(() => {
         <div class="split-target-section">
           <div class="split-target-heading"><Server :size="15" />连接主机</div>
           <el-radio
-            v-for="host in hosts"
+            v-for="host in hosts.filter(
+              (item) => !item.protocol || item.protocol === 'ssh',
+            )"
             :key="host.id"
             :value="`host:${host.id}`"
             class="split-target"

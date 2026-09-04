@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +52,108 @@ func (a *API) agentProcesses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, nonNil(value))
+}
+
+func (a *API) agentTerminateSSHSession(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		PID      int    `json:"pid"`
+		Terminal string `json:"terminal"`
+		User     string `json:"user"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	if input.PID < 2 || input.PID > 4194304 || !validRemoteToken(input.Terminal) || !validRemoteToken(input.User) {
+		writeError(w, http.StatusBadRequest, "invalid_ssh_session", "SSH 会话参数无效")
+		return
+	}
+	command := fmt.Sprintf(
+		"pid=%s; tty=%s; user=%s; actual_tty=$(ps -p \"$pid\" -o tty= 2>/dev/null | tr -d '[:space:]'); actual_user=$(ps -p \"$pid\" -o user= 2>/dev/null | tr -d '[:space:]'); if [ \"$actual_tty\" != \"$tty\" ] || [ \"$actual_user\" != \"$user\" ]; then printf '目标 SSH 会话已变化或不存在\\n' >&2; exit 1; fi; kill -TERM \"$pid\"",
+		shellQuote(strconv.Itoa(input.PID)), shellQuote(input.Terminal), shellQuote(input.User),
+	)
+	a.runSSHSessionAction(w, r, command)
+}
+
+func (a *API) agentBanSSHAddress(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Address string `json:"address"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	address := net.ParseIP(strings.TrimSpace(input.Address))
+	if address == nil || address.IsUnspecified() || address.IsMulticast() {
+		writeError(w, http.StatusBadRequest, "invalid_ssh_address", "SSH 来源 IP 无效")
+		return
+	}
+	a.runSSHSessionAction(w, r, sshAddressFirewallCommand(address, true))
+}
+
+func (a *API) agentUnbanSSHAddress(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Address string `json:"address"`
+	}
+	if !decode(w, r, &input) {
+		return
+	}
+	address := net.ParseIP(strings.TrimSpace(input.Address))
+	if address == nil || address.IsUnspecified() || address.IsMulticast() {
+		writeError(w, http.StatusBadRequest, "invalid_ssh_address", "SSH 来源 IP 无效")
+		return
+	}
+	a.runSSHSessionAction(w, r, sshAddressFirewallCommand(address, false))
+}
+
+func sshAddressFirewallCommand(address net.IP, block bool) string {
+	ip := address.String()
+	family, tableCommand := "ipv4", "iptables"
+	if address.To4() == nil {
+		family, tableCommand = "ipv6", "ip6tables"
+	}
+	quotedIP := shellQuote(ip)
+	if block {
+		return fmt.Sprintf(
+			"ip=%s; if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then ufw insert deny from \"$ip\" comment 'Velin SSH monitor'; elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --add-rich-rule=\"rule family='%s' source address='$ip' reject\" --permanent && firewall-cmd --reload; elif command -v %s >/dev/null 2>&1; then %s -C INPUT -s \"$ip\" -j DROP 2>/dev/null || %s -I INPUT -s \"$ip\" -j DROP; else printf '未找到可用防火墙工具（ufw、firewall-cmd 或 %s）\\n' >&2; exit 127; fi",
+			quotedIP, family, tableCommand, tableCommand, tableCommand, tableCommand,
+		)
+	}
+	command := fmt.Sprintf(
+		"ip=%s; if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then yes | ufw delete deny from \"$ip\"; elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --remove-rich-rule=\"rule family='%s' source address='$ip' reject\" --permanent && firewall-cmd --reload; elif command -v %s >/dev/null 2>&1; then while %s -C INPUT -s \"$ip\" -j DROP 2>/dev/null; do %s -D INPUT -s \"$ip\" -j DROP || break; done; else printf '未找到可用防火墙工具（ufw、firewall-cmd 或 %s）\\n' >&2; exit 127; fi",
+		quotedIP, family, tableCommand, tableCommand, tableCommand, tableCommand,
+	)
+	return command
+}
+
+func (a *API) runSSHSessionAction(w http.ResponseWriter, r *http.Request, command string) {
+	ctx, cancel := contextWithAgentTimeout(r, 30*time.Second)
+	defer cancel()
+	output, runErr := a.agents.Command(ctx, currentUser(r).ID, chi.URLParam(r, "id"), command)
+	if runErr != nil {
+		if output == "" {
+			writeAgentError(w, runErr)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "ssh_session_action_failed", strings.TrimSpace(output+"\n"+runErr.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "output": output})
+}
+
+func validRemoteToken(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && !strings.ContainsRune("._:/-", char) {
+			return false
+		}
+	}
+	return true
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func (a *API) agentModels(w http.ResponseWriter, r *http.Request) {

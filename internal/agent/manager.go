@@ -221,7 +221,19 @@ func (m *Manager) Processes(ctx context.Context, userID, hostID string) ([]Proce
 	if err != nil {
 		return nil, err
 	}
-	command := `LC_ALL=C ps -eo pid=,user=,stat=,rss=,args= --sort=-rss 2>/dev/null | head -n 2000`
+	command := `LC_ALL=C
+if ps -eo pid=,user=,stat=,rss=,args= --sort=-rss >/dev/null 2>&1; then
+  ps -eo pid=,user=,stat=,rss=,args= --sort=-rss 2>/dev/null | head -n 2000
+else
+  raw=$(ps w 2>/dev/null || ps 2>/dev/null || true)
+  printf '%s\n' "$raw" | awk 'NR > 1 {
+    pid=$1; user=$2; state=""; start=3
+    if ($3 ~ /^[0-9]+$/) { state=$4; start=5 }
+    command=""
+    for (i=start; i<=NF; i++) command = command (command ? " " : "") $i
+    if (pid ~ /^[0-9]+$/ && command != "") printf "%s %s %s 0 %s\n", pid, user, state, command
+  }' | head -n 2000
+fi`
 	if conn.os != "linux" {
 		command = `LC_ALL=C ps -axo pid=,user=,state=,rss=,command= 2>/dev/null | head -n 2000`
 	}

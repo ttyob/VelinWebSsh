@@ -20,6 +20,7 @@ import (
 )
 
 const maxEditableTextSize = 2 << 20
+const maxPreviewImageSize = 32 << 20
 
 type sftpConnection struct {
 	*sftp.Client
@@ -129,6 +130,67 @@ func (a *API) sftpDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", stringInt(info.Size()))
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": path.Base(remotePath)}))
 	_, _ = io.Copy(w, file)
+}
+
+func imagePreviewContentType(file *sftp.File, remotePath string) (string, error) {
+	header := make([]byte, 512)
+	read, err := file.Read(header)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+	if _, err = file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	detected := http.DetectContentType(header[:read])
+	if strings.HasPrefix(detected, "image/") && detected != "image/svg+xml" {
+		return detected, nil
+	}
+	// Newer formats may be reported as application/octet-stream by Go's
+	// sniffer, so use a short extension allowlist as a fallback.
+	allowed := map[string]string{
+		".avif": "image/avif", ".bmp": "image/bmp", ".gif": "image/gif",
+		".jpe": "image/jpeg", ".jpeg": "image/jpeg", ".jpg": "image/jpeg",
+		".png": "image/png", ".webp": "image/webp",
+	}
+	if contentType, ok := allowed[strings.ToLower(path.Ext(remotePath))]; ok && detected == "application/octet-stream" {
+		return contentType, nil
+	}
+	return "", errors.New("文件不是支持的图片格式")
+}
+
+func (a *API) sftpPreviewImage(w http.ResponseWriter, r *http.Request) {
+	client, err := a.openSFTP(r)
+	if err != nil {
+		writeError(w, 502, "sftp_connection_failed", err.Error())
+		return
+	}
+	defer client.Close()
+	remotePath := cleanRemotePath(r.URL.Query().Get("path"))
+	info, err := client.Lstat(remotePath)
+	if err != nil || info.IsDir() || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		writeError(w, 400, "invalid_image_preview", "只能预览普通图片文件")
+		return
+	}
+	if info.Size() <= 0 || info.Size() > maxPreviewImageSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "image_preview_too_large", "图片为空或超过 32 MiB 预览上限")
+		return
+	}
+	file, err := client.Open(remotePath)
+	if err != nil {
+		writeError(w, 502, "sftp_open_failed", err.Error())
+		return
+	}
+	defer file.Close()
+	contentType, err := imagePreviewContentType(file, remotePath)
+	if err != nil {
+		writeError(w, 400, "invalid_image_preview", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", stringInt(info.Size()))
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Cache-Control", "private, max-age=60")
+	_, _ = io.CopyN(w, file, info.Size())
 }
 
 func editableTextVersion(content []byte) string {

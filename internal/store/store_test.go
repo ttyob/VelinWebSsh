@@ -306,6 +306,9 @@ func TestHostMigrationAndConnectionMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if host.Protocol != "ssh" || host.RDPMode != "web" || host.DesktopSecurity != "any" {
+		t.Fatalf("legacy host desktop defaults=%+v", host)
+	}
 	if host.ConnectTimeout != 12 || host.KeepaliveInterval != 30 || host.MaxRetries != 5 || host.TerminalType != "xterm-256color" || host.SessionMode != "tmux" || host.JumpHostID != "" || host.Platform != "" || host.Distribution != "" {
 		t.Fatalf("unexpected migrated defaults: %+v", host)
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/armon/go-socks5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
+	"velin-webssh/internal/netdial"
 	"velin-webssh/internal/store"
 	"velin-webssh/internal/terminal"
 )
@@ -22,13 +23,20 @@ type running struct {
 type Manager struct {
 	store     *store.Store
 	terminals *terminal.Manager
+	dialer    netdial.Dialer
 	mu        sync.Mutex
 	active    map[string]*running
 }
 
 func NewManager(s *store.Store, terminals *terminal.Manager) *Manager {
 	_, _ = s.DB.Exec(`UPDATE port_forwards SET status='stopped',last_error='' WHERE status='running'`)
-	return &Manager{store: s, terminals: terminals, active: make(map[string]*running)}
+	return &Manager{store: s, terminals: terminals, dialer: netdial.Direct{}, active: make(map[string]*running)}
+}
+
+func (m *Manager) SetDialer(dialer netdial.Dialer) {
+	if dialer != nil {
+		m.dialer = dialer
+	}
 }
 func (m *Manager) ActiveCount() int {
 	m.mu.Lock()
@@ -134,7 +142,7 @@ func (m *Manager) accept(userID string, value store.PortForward, listener net.Li
 			var err error
 			target := net.JoinHostPort(value.TargetHost, fmt.Sprint(value.TargetPort))
 			if value.Kind == "remote" {
-				outgoing, err = net.Dial("tcp", target)
+				outgoing, err = m.dialer.DialContext(context.Background(), "tcp", target)
 			} else {
 				outgoing, err = client.Dial("tcp", target)
 			}

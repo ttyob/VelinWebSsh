@@ -18,6 +18,7 @@
 
 - 主机分组、搜索、拖动排序、跳板机和 OpenSSH 配置导入
 - 多标签与分屏终端，支持普通 SSH、tmux 持久会话和断线恢复
+- 页面内 VNC（noVNC）和 RDP（Guacamole）远程桌面，RDP 也支持调用 Windows 本地远程桌面客户端
 - 连接过程直接显示在终端中，并显示连接状态与网络延迟
 - SFTP 文件管理、文本编辑、上传和下载
 - 本地、远程与 SOCKS5 端口转发
@@ -101,7 +102,7 @@ Windows GUI 需要 Microsoft Edge WebView2。解压后在 PowerShell 中执行�
 .\Velin-GUI.exe
 ```
 
-Windows GUI 无需配置，默认自动选择空闲本机端口。数据库、主密钥、录制文件和启动日志均写入 `Velin-GUI.exe` 所在目录；需要覆盖默认值时才从 `.env.example` 创建 `.env`。
+Windows GUI 无需配置，默认自动选择空闲本机端口。数据库、主密钥、录制文件和启动日志均写入 `Velin-GUI.exe` 所在目录；需要覆盖默认值时才从 `.env.example` 创建 `.env`。VNC 可直接使用，RDP 需要在本机 Docker 或其他受信任服务器上单独运行 guacd，并通过 `VELIN_GUACD_ADDR` 指定地址。
 
 ## 配置
 
@@ -115,12 +116,21 @@ Velin 默认读取运行目录中的 `.env`，同名系统环境变量优先。
 | `VELIN_DATA_DIR` | `data` | 数据库、主密钥和录制目录 |
 | `VELIN_COOKIE_SECURE` | `false` | HTTPS 部署时设置为 `true` |
 | `VELIN_HOST_PORT_ADDR` | `127.0.0.1` | 主机端口代理监听地址 |
+| `VELIN_GUACD_ADDR` | `127.0.0.1:4822` | RDP 使用的 guacd 地址 |
+| `VELIN_DESKTOP_PROXY_ADDR` | `127.0.0.1` | RDP 跳板代理监听地址 |
+| `VELIN_RDP_DRIVE_DIR` | `/tmp/velin-rdp-drives` | RDP 磁盘映射目录；使用外部 guacd 时需与 guacd 共享此路径 |
 | `VELIN_AI_BASE_URL` | 空 | OpenAI 兼容 API 地址 |
 | `VELIN_AI_MODEL` | 空 | AI Agent 模型名称 |
 | `VELIN_AI_API_KEY` | 空 | AI API Key |
 | `VELIN_FFMPEG_BINARY` | `ffmpeg` | 终端录制使用的 FFmpeg 路径 |
 
-公网部署请使用 Caddy、Nginx 等反向代理提供 HTTPS，并设置 `VELIN_COOKIE_SECURE=true`；同时通过防火墙限制外部直接访问 `8377` 端口。
+公网部署请使用 Caddy、Nginx 等反向代理提供 HTTPS，并设置 `VELIN_COOKIE_SECURE=true`；同时通过防火墙限制外部直接访问 `8377` 端口。guacd 没有认证能力，Compose 已将其限制在 `127.0.0.1:4822`，不要将该端口暴露到公网。Compose 会自动为 Velin 和 guacd 共享 RDP 磁盘映射目录。
+
+### 内嵌 Tailscale
+
+管理员可在“设置 -> 系统管理 -> 内嵌 Tailscale”中配置节点名称、控制面地址和 Auth Key，并通过服务状态开关启停。默认关闭；只有开启并保存后，Velin 才会在当前进程中启动 `tsnet` 用户态网络。节点身份保存在 `data/tailscale`，升级和重启时必须保留。
+
+启用后，在 Velin 主机列表中直接填写 Tailnet IP 或 MagicDNS 名称；SSH、SFTP、RDP、Web 代理和端口转发的远端出站连接都会通过内嵌节点。Velin 不安装 `tailscaled`、不创建系统 TUN，也不要求容器增加 `NET_ADMIN`。Auth Key 只保存在服务端加密数据中。
 
 ## 数据与备份
 

@@ -1,10 +1,37 @@
 services:
+  rdp-drives-init:
+    image: alpine:3.22
+    user: "0:0"
+    restart: "no"
+    command: ["/bin/sh", "-c", "mkdir -p /tmp/velin-rdp-drives && chmod 0777 /tmp/velin-rdp-drives"]
+    volumes:
+      - rdp-drives:/tmp/velin-rdp-drives
+
+  guacd:
+    image: guacamole/guacd:1.6.0
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      rdp-drives-init:
+        condition: service_completed_successfully
+    volumes:
+      - rdp-drives:/tmp/velin-rdp-drives
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 4822"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+
   velin:
     build:
       context: .
       network: host
     network_mode: host
     restart: unless-stopped
+    depends_on:
+      guacd:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8377/api/health/ready"]
       interval: 30s
@@ -17,6 +44,8 @@ services:
       VELIN_ADMIN_PASSWORD: ${VELIN_ADMIN_PASSWORD:-}
       VELIN_COOKIE_SECURE: ${VELIN_COOKIE_SECURE:-false}
       VELIN_HOST_PORT_ADDR: ${VELIN_HOST_PORT_ADDR:-127.0.0.1}
+      VELIN_GUACD_ADDR: ${VELIN_GUACD_ADDR:-127.0.0.1:4822}
+      VELIN_DESKTOP_PROXY_ADDR: ${VELIN_DESKTOP_PROXY_ADDR:-127.0.0.1}
       VELIN_AI_BASE_URL: ${VELIN_AI_BASE_URL:-}
       VELIN_AI_MODEL: ${VELIN_AI_MODEL:-}
       VELIN_AI_API_KEY: ${VELIN_AI_API_KEY:-}
@@ -24,3 +53,7 @@ services:
       VELIN_CRUSH_DATA_DIR: ${VELIN_CRUSH_DATA_DIR:-/app/data/crush}
     volumes:
       - ./data:/app/data
+      - rdp-drives:/tmp/velin-rdp-drives
+
+volumes:
+  rdp-drives:

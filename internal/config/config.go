@@ -15,23 +15,26 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	DataDir       string
-	DatabasePath  string
-	MasterKeyPath string
-	WebDist       string
-	CookieSecure  bool
-	HostPortAddr  string
-	SessionTTL    time.Duration
-	DeploymentID  string
-	AdminUser     string
-	AdminPassword string
-	AIBaseURL     string
-	AIAPIKey      string
-	AIModel       string
-	CrushBinary   string
-	CrushDataDir  string
-	FFmpegBinary  string
+	Addr             string
+	DataDir          string
+	DatabasePath     string
+	MasterKeyPath    string
+	WebDist          string
+	CookieSecure     bool
+	HostPortAddr     string
+	SessionTTL       time.Duration
+	DeploymentID     string
+	AdminUser        string
+	AdminPassword    string
+	AIBaseURL        string
+	AIAPIKey         string
+	AIModel          string
+	CrushBinary      string
+	CrushDataDir     string
+	FFmpegBinary     string
+	GuacdAddr        string
+	DesktopProxyAddr string
+	RDPDriveDir      string
 }
 
 func Load() (Config, error) {
@@ -50,24 +53,31 @@ func Load() (Config, error) {
 	if parsed := net.ParseIP(hostPortAddr); parsed == nil || parsed.To4() == nil {
 		return Config{}, fmt.Errorf("VELIN_HOST_PORT_ADDR must be an IPv4 address")
 	}
+	desktopProxyAddr := env("VELIN_DESKTOP_PROXY_ADDR", "127.0.0.1")
+	if parsed := net.ParseIP(desktopProxyAddr); parsed == nil || parsed.To4() == nil || parsed.IsUnspecified() {
+		return Config{}, fmt.Errorf("VELIN_DESKTOP_PROXY_ADDR must be a specific IPv4 address")
+	}
 	return Config{
-		Addr:          env("VELIN_ADDR", "0.0.0.0:8377"),
-		DataDir:       dataDir,
-		DatabasePath:  filepath.Join(dataDir, "velin.db"),
-		MasterKeyPath: filepath.Join(dataDir, "master.key"),
-		WebDist:       env("VELIN_WEB_DIST", "web/dist"),
-		CookieSecure:  strings.EqualFold(env("VELIN_COOKIE_SECURE", "false"), "true"),
-		HostPortAddr:  hostPortAddr,
-		SessionTTL:    7 * 24 * time.Hour,
-		DeploymentID:  deploymentID,
-		AdminUser:     env("VELIN_ADMIN_USER", "admin"),
-		AdminPassword: os.Getenv("VELIN_ADMIN_PASSWORD"),
-		AIBaseURL:     strings.TrimRight(env("VELIN_AI_BASE_URL", ""), "/"),
-		AIAPIKey:      strings.TrimSpace(os.Getenv("VELIN_AI_API_KEY")),
-		AIModel:       strings.TrimSpace(os.Getenv("VELIN_AI_MODEL")),
-		CrushBinary:   env("VELIN_CRUSH_BINARY", "/usr/local/bin/crush"),
-		CrushDataDir:  env("VELIN_CRUSH_DATA_DIR", filepath.Join(dataDir, "crush")),
-		FFmpegBinary:  env("VELIN_FFMPEG_BINARY", "ffmpeg"),
+		Addr:             env("VELIN_ADDR", "0.0.0.0:8377"),
+		DataDir:          dataDir,
+		DatabasePath:     filepath.Join(dataDir, "velin.db"),
+		MasterKeyPath:    filepath.Join(dataDir, "master.key"),
+		WebDist:          env("VELIN_WEB_DIST", "web/dist"),
+		CookieSecure:     strings.EqualFold(env("VELIN_COOKIE_SECURE", "false"), "true"),
+		HostPortAddr:     hostPortAddr,
+		SessionTTL:       7 * 24 * time.Hour,
+		DeploymentID:     deploymentID,
+		AdminUser:        env("VELIN_ADMIN_USER", "admin"),
+		AdminPassword:    os.Getenv("VELIN_ADMIN_PASSWORD"),
+		AIBaseURL:        strings.TrimRight(env("VELIN_AI_BASE_URL", ""), "/"),
+		AIAPIKey:         strings.TrimSpace(os.Getenv("VELIN_AI_API_KEY")),
+		AIModel:          strings.TrimSpace(os.Getenv("VELIN_AI_MODEL")),
+		CrushBinary:      env("VELIN_CRUSH_BINARY", "/usr/local/bin/crush"),
+		CrushDataDir:     env("VELIN_CRUSH_DATA_DIR", filepath.Join(dataDir, "crush")),
+		FFmpegBinary:     env("VELIN_FFMPEG_BINARY", "ffmpeg"),
+		GuacdAddr:        env("VELIN_GUACD_ADDR", "127.0.0.1:4822"),
+		DesktopProxyAddr: desktopProxyAddr,
+		RDPDriveDir:      env("VELIN_RDP_DRIVE_DIR", "/tmp/velin-rdp-drives"),
 	}, nil
 }
 

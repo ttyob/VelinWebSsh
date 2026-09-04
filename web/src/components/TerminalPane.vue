@@ -966,6 +966,8 @@ function connectSocket() {
         emit("status", props.session.id, message.status, statusMessage.value);
         if (message.status === "creating")
           writeConnectionNotice("正在建立 SSH 连接，请稍候…");
+        else if (message.status === "auth_required" || message.status === "host_key_required")
+          void recoverConnection(message.status, message.message || "SSH 连接失败", message);
       }
       if (controller.value) flushPendingInput();
       if (seedReplayFromPreview && replayPreviewData?.length) {
@@ -1600,6 +1602,14 @@ function recordingMimeType() {
   return candidates.find((value) => MediaRecorder.isTypeSupported(value)) || "";
 }
 
+function recordingVideoBitsPerSecond(canvas: HTMLCanvasElement) {
+  // Terminal glyphs need more bitrate than ordinary moving video. Scale the
+  // budget with the actual device-pixel dimensions without allowing very large
+  // panes to create unexpectedly huge files.
+  const pixels = canvas.width * canvas.height;
+  return Math.min(30_000_000, Math.max(12_000_000, Math.round(pixels * 4)));
+}
+
 function stopLocalRecorder() {
   const recorder = mediaRecorder;
   if (!recorder) return Promise.resolve<Blob | undefined>(undefined);
@@ -1633,7 +1643,10 @@ async function toggleRecording() {
       const mimeType = recordingMimeType();
       if (!canvas?.captureStream || !mimeType)
         throw new Error("当前浏览器不支持终端视频录制");
-      const recorder = new MediaRecorder(canvas.captureStream(30), { mimeType });
+      const recorder = new MediaRecorder(canvas.captureStream(30), {
+        mimeType,
+        videoBitsPerSecond: recordingVideoBitsPerSecond(canvas),
+      });
       recordingChunks = [];
       recorder.addEventListener("dataavailable", (event) => {
         if (event.data.size) recordingChunks.push(event.data);

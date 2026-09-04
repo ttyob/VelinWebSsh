@@ -148,9 +148,22 @@ func TestIsTmuxTargetMissing(t *testing.T) {
 		"tmux session not found: no server running on /tmp/tmux-0/velin",
 		"can't find session: ws_missing",
 		"tmux session not found: no such session: ws_missing",
+		"tmux session not found: error connecting to /tmp/tmux-0/velin-webssh-04c27398055f (No such file or directory)",
 	} {
 		if !isTmuxTargetMissing(message) {
 			t.Fatalf("isTmuxTargetMissing(%q)=false", message)
+		}
+	}
+	for _, message := range []string{
+		"tmux is required on the remote host: bash: line 1: tmux: command not found",
+		"bash: tmux: not found",
+		"command not found: tmux",
+	} {
+		if !isTmuxMissing(message) {
+			t.Fatalf("isTmuxMissing(%q)=false", message)
+		}
+		if isTmuxTargetMissing(message) {
+			t.Fatalf("isTmuxTargetMissing(%q)=true", message)
 		}
 	}
 	for _, message := range []string{

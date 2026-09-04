@@ -13,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +34,7 @@ import (
 	"velin-webssh/internal/forward"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
+	"velin-webssh/internal/tailnet"
 	"velin-webssh/internal/terminal"
 )
 
@@ -43,6 +46,57 @@ type desktopServer struct {
 	store  *store.Store
 	agent  *agent.Manager
 	once   sync.Once
+}
+
+type desktopApp struct{}
+
+func (d *desktopApp) LaunchRDP(address string, port int, username, domain, password string) error {
+	address = strings.TrimSpace(address)
+	if address == "" || port < 1 || port > 65535 {
+		return errors.New("invalid RDP target")
+	}
+	if strings.HasPrefix(address, "[") && strings.HasSuffix(address, "]") {
+		address = strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
+	}
+	for _, value := range []string{address, username, domain} {
+		if strings.ContainsAny(value, "\r\n") {
+			return errors.New("invalid RDP connection value")
+		}
+	}
+
+	target := net.JoinHostPort(address, strconv.Itoa(port))
+	credentialTarget := "TERMSRV/" + target
+	if password != "" {
+		windowsUser := strings.TrimSpace(username)
+		if strings.TrimSpace(domain) != "" {
+			windowsUser = strings.TrimSpace(domain) + `\` + windowsUser
+		}
+		if err := exec.Command("cmdkey.exe", "/generic:"+credentialTarget, "/user:"+windowsUser, "/pass:"+password).Run(); err != nil {
+			return fmt.Errorf("save Windows RDP credential: %w", err)
+		}
+	}
+	process := exec.Command("mstsc.exe", "/v:"+target)
+	if err := process.Start(); err != nil {
+		if password != "" {
+			_ = exec.Command("cmdkey.exe", "/delete:"+credentialTarget).Run()
+		}
+		return fmt.Errorf("start Windows Remote Desktop: %w", err)
+	}
+	if password != "" {
+		go func() {
+			_ = process.Wait()
+			_ = exec.Command("cmdkey.exe", "/delete:"+credentialTarget).Run()
+		}()
+	}
+	return nil
+}
+
+func (d *desktopApp) GetClipboardText() (string, error) {
+	return wailsruntime.ClipboardGetText(context.Background())
+}
+
+func (d *desktopApp) SetClipboardText(text string) error {
+	return wailsruntime.ClipboardSetText(context.Background(), text)
 }
 
 type desktopCredentialNotice struct {
@@ -178,7 +232,19 @@ func runDesktop() (runErr error) {
 		credentialNotice = &desktopCredentialNotice{username: user.Username, password: password, reset: true}
 		slog.Warn("GUI ADMIN PASSWORD RESET", "username", user.Username, "password", password, "notice", "save this password and change it after login")
 	}
-	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary)
+	tailscaleSettings, err := tailnet.LoadSettings(s, vault)
+	if err != nil {
+		return err
+	}
+	tailscaleManager, err := tailnet.New(cfg)
+	if err != nil {
+		return err
+	}
+	if err = tailscaleManager.Apply(tailscaleSettings); err != nil {
+		return err
+	}
+	defer tailscaleManager.Close()
+	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary, tailscaleManager)
 	forwardManager := forward.NewManager(s, manager)
 	agentManager := agent.NewManager(
 		manager,
@@ -186,7 +252,7 @@ func runDesktop() (runErr error) {
 		agent.CrushConfig{Binary: cfg.CrushBinary, DataDir: cfg.CrushDataDir},
 	)
 	appServer := &desktopServer{store: s, agent: agentManager}
-	appServer.server = &http.Server{Addr: cfg.Addr, Handler: api.New(cfg, s, vault, manager, forwardManager, agentManager).Router(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	appServer.server = &http.Server{Addr: cfg.Addr, Handler: api.NewWithTailnet(cfg, s, vault, manager, forwardManager, agentManager, tailscaleManager).Router(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp4", cfg.Addr)
 	if err != nil && errors.Is(err, syscall.EADDRINUSE) {
 		slog.Warn("configured desktop port is in use, selecting a free loopback port", "addr", cfg.Addr)
@@ -235,6 +301,7 @@ func runDesktop() (runErr error) {
 			_, _ = w.Write(page)
 		})},
 		Windows: &windows.Options{Theme: windows.Dark},
+		Bind:    []interface{}{&desktopApp{}},
 		OnStartup: func(ctx context.Context) {
 			copyDesktopCredential(ctx, credentialNotice)
 		},

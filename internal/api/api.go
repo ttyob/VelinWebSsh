@@ -33,8 +33,11 @@ import (
 	"velin-webssh/internal/agent"
 	"velin-webssh/internal/config"
 	"velin-webssh/internal/forward"
+	"velin-webssh/internal/netdial"
+	"velin-webssh/internal/remotedesktop"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
+	"velin-webssh/internal/tailnet"
 	"velin-webssh/internal/terminal"
 )
 
@@ -49,6 +52,8 @@ type API struct {
 	forwards   *forward.Manager
 	agents     *agent.Manager
 	webProxies *webProxyManager
+	desktops   *remotedesktop.Manager
+	tailscale  *tailnet.Manager
 	started    time.Time
 	requests   atomic.Int64
 	websockets atomic.Int64
@@ -87,7 +92,18 @@ func (a *API) securityPolicy() securityPolicy {
 }
 
 func New(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Manager, forwards *forward.Manager, agents *agent.Manager) *API {
-	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, agents: agents, webProxies: newWebProxyManager(t, cfg.HostPortAddr), started: time.Now(), taskQueue: make(chan commandTaskRequest, 100)}
+	return newAPI(cfg, s, v, t, forwards, agents, netdial.Direct{}, nil)
+}
+
+func NewWithTailnet(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Manager, forwards *forward.Manager, agents *agent.Manager, tailscale *tailnet.Manager) *API {
+	return newAPI(cfg, s, v, t, forwards, agents, tailscale, tailscale)
+}
+
+func newAPI(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Manager, forwards *forward.Manager, agents *agent.Manager, dialer netdial.Dialer, tailscale *tailnet.Manager) *API {
+	desktops := remotedesktop.NewManager(s, v, t, cfg.GuacdAddr, cfg.DesktopProxyAddr, cfg.RDPDriveDir)
+	desktops.SetDialer(dialer)
+	forwards.SetDialer(dialer)
+	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, agents: agents, tailscale: tailscale, webProxies: newWebProxyManager(t, cfg.HostPortAddr), desktops: desktops, started: time.Now(), taskQueue: make(chan commandTaskRequest, 100)}
 	a.restoreAIModelConfig()
 	a.restoreHostPortWebServices()
 	go a.commandTaskWorker()
@@ -128,11 +144,17 @@ func (a *API) Router() http.Handler {
 		r.Post("/api/hosts/reorder", a.reorderHosts)
 		r.Put("/api/hosts/{id}", a.saveHost)
 		r.Post("/api/hosts/{id}/test", a.testHost)
+		r.Post("/api/desktop/sessions", a.createDesktopSession)
+		r.Get("/ws/desktop/vnc/{token}", a.desktopVNC)
+		r.Get("/ws/desktop/rdp/{token}", a.desktopRDP)
 		r.Get("/api/hosts/{id}/sessions", a.hostSessions)
 		r.Get("/api/hosts/{id}/agent", a.agentStatus)
 		r.Post("/api/hosts/{id}/agent/connect", a.connectAgent)
 		r.Get("/api/hosts/{id}/agent/snapshot", a.agentSnapshot)
 		r.Get("/api/hosts/{id}/agent/processes", a.agentProcesses)
+		r.Post("/api/hosts/{id}/agent/ssh-sessions/terminate", a.agentTerminateSSHSession)
+		r.Post("/api/hosts/{id}/agent/ssh-sessions/ban", a.agentBanSSHAddress)
+		r.Post("/api/hosts/{id}/agent/ssh-sessions/unban", a.agentUnbanSSHAddress)
 		r.Get("/api/agent/models", a.agentModels)
 		r.Get("/api/agent/backends", a.agentBackends)
 		r.Post("/api/hosts/{id}/agent/chat", a.agentChat)
@@ -148,6 +170,7 @@ func (a *API) Router() http.Handler {
 		r.Post("/api/sessions/{id}/restore", a.restoreSession)
 		r.Get("/api/sessions/{id}/directory", a.sessionDirectory)
 		r.Get("/api/sessions/{id}/foreground", a.sessionForeground)
+		r.Get("/api/sessions/{id}/docker/status", a.sessionDockerStatus)
 		r.Patch("/api/sessions/{id}", a.updateSession)
 		r.Delete("/api/sessions/{id}", a.terminateSession)
 		r.Get("/api/tasks", a.tasks)
@@ -165,6 +188,7 @@ func (a *API) Router() http.Handler {
 		r.Delete("/api/snippets/{id}", a.deleteSnippet)
 		r.Get("/api/sftp/{hostID}/list", a.sftpList)
 		r.Get("/api/sftp/{hostID}/download", a.sftpDownload)
+		r.Get("/api/sftp/{hostID}/preview-image", a.sftpPreviewImage)
 		r.Get("/api/sftp/{hostID}/text", a.sftpReadText)
 		r.Put("/api/sftp/{hostID}/text", a.sftpWriteText)
 		r.Put("/api/sftp/{hostID}/upload", a.sftpUpload)
@@ -205,6 +229,8 @@ func (a *API) Router() http.Handler {
 			r.Get("/api/admin/ai-model", a.getAIModelConfig)
 			r.Put("/api/admin/ai-model", a.saveAIModelConfig)
 			r.Post("/api/admin/ai-model/test", a.testAIModelConfig)
+			r.Get("/api/admin/tailscale", a.tailscaleStatus)
+			r.Put("/api/admin/tailscale", a.saveTailscale)
 			r.Get("/api/admin/stats", a.stats)
 			r.Get("/api/admin/metrics", a.metrics)
 			r.Post("/api/admin/backup", a.backup)
@@ -344,7 +370,7 @@ func (w *statusWriter) Flush() {
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func logRequestPath(path string) string {
-	for _, prefix := range []string{"/web-proxy/", "/web-service-proxy/"} {
+	for _, prefix := range []string{"/web-proxy/", "/web-service-proxy/", "/ws/desktop/vnc/", "/ws/desktop/rdp/"} {
 		if !strings.HasPrefix(path, prefix) {
 			continue
 		}
@@ -361,6 +387,7 @@ func (a *API) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Permissions-Policy", "clipboard-read=(self), clipboard-write=(self)")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			// API responses opened as documents get an opaque origin. Fetch clients are unaffected.
 			w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'")
@@ -845,6 +872,9 @@ func (a *API) validateJumpHost(userID, targetID, jumpHostID string) error {
 		if err != nil {
 			return err
 		}
+		if jumpHost.Protocol != "" && jumpHost.Protocol != "ssh" {
+			return fmt.Errorf("主机“%s”不是 SSH 主机，不能作为跳板机", jumpHost.Name)
+		}
 		if jumpHost.CredentialID == "" && !jumpHost.HasPassword {
 			return fmt.Errorf("跳板机“%s”需要保存主机密码或绑定已保存的凭据", jumpHost.Name)
 		}
@@ -923,15 +953,33 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 	h.UserID = u.ID
 	h.Name = strings.TrimSpace(h.Name)
 	h.Address = strings.TrimSpace(h.Address)
+	h.Protocol = strings.ToLower(strings.TrimSpace(h.Protocol))
 	h.Username = strings.TrimSpace(h.Username)
+	h.RDPMode = strings.ToLower(strings.TrimSpace(h.RDPMode))
+	h.DesktopDomain = strings.TrimSpace(h.DesktopDomain)
+	h.DesktopSecurity = strings.ToLower(strings.TrimSpace(h.DesktopSecurity))
 	h.GroupName = normalizeHostGroup(h.GroupName)
 	h.JumpHostID = strings.TrimSpace(h.JumpHostID)
 	if len([]rune(h.GroupName)) > 1024 {
 		writeError(w, 400, "invalid_host_group", "分组路径不能超过 1024 个字符")
 		return
 	}
+	if h.Protocol == "" {
+		h.Protocol = "ssh"
+	}
+	if h.Protocol != "ssh" && h.Protocol != "vnc" && h.Protocol != "rdp" {
+		writeError(w, 400, "invalid_host_protocol", "不支持的主机协议")
+		return
+	}
 	if h.Port == 0 {
-		h.Port = 22
+		switch h.Protocol {
+		case "vnc":
+			h.Port = 5900
+		case "rdp":
+			h.Port = 3389
+		default:
+			h.Port = 22
+		}
 	}
 	if h.ConnectTimeout == 0 {
 		h.ConnectTimeout = 12
@@ -948,12 +996,46 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 	if h.SessionMode == "" {
 		h.SessionMode = "tmux"
 	}
+	if h.DesktopSecurity == "" {
+		h.DesktopSecurity = "any"
+	}
+	if h.RDPMode == "" {
+		h.RDPMode = "web"
+	}
+	if h.RDPQuality == "" {
+		h.RDPQuality = "crisp"
+	}
+	if h.Protocol != "rdp" {
+		h.RDPMode = "web"
+		h.RDPQuality = "crisp"
+		h.RDPClipboard = false
+		h.RDPAudio = false
+		h.RDPDrive = false
+		h.RDPPrinting = false
+		h.RDPMultiMonitor = false
+	}
 	if h.ConnectTimeout < 3 || h.ConnectTimeout > 120 || h.KeepaliveInterval < 0 || h.KeepaliveInterval > 300 || h.MaxRetries < 0 || h.MaxRetries > 20 || (h.TerminalType != "xterm-256color" && h.TerminalType != "xterm" && h.TerminalType != "screen-256color") || (h.SessionMode != "tmux" && h.SessionMode != "normal") {
 		writeError(w, 400, "invalid_host_options", "连接参数超出允许范围")
 		return
 	}
-	if h.Name == "" || h.Address == "" || h.Username == "" || h.Port < 1 || h.Port > 65535 {
+	if h.Name == "" || h.Address == "" || (h.Protocol != "vnc" && h.Username == "") || h.Port < 1 || h.Port > 65535 {
 		writeError(w, 400, "invalid_host", "请完整填写主机名称、地址、端口和用户名")
+		return
+	}
+	if h.Protocol == "rdp" && h.DesktopSecurity != "any" && h.DesktopSecurity != "nla" && h.DesktopSecurity != "tls" && h.DesktopSecurity != "rdp" {
+		writeError(w, 400, "invalid_desktop_security", "不支持的 RDP 安全模式")
+		return
+	}
+	if h.Protocol == "rdp" && h.RDPMode != "web" && h.RDPMode != "native" {
+		writeError(w, 400, "invalid_rdp_mode", "不支持的 RDP 连接方式")
+		return
+	}
+	if h.Protocol == "rdp" && h.RDPQuality != "crisp" && h.RDPQuality != "smooth" {
+		writeError(w, 400, "invalid_rdp_quality", "不支持的 RDP 画质模式")
+		return
+	}
+	if h.Protocol == "rdp" && h.RDPMode == "native" && h.JumpHostID != "" {
+		writeError(w, 400, "invalid_rdp_mode", "本地 RDP 客户端不支持 SSH 跳板机")
 		return
 	}
 	if err := a.validateJumpHost(u.ID, h.ID, h.JumpHostID); err != nil {
@@ -989,7 +1071,7 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 		} else if existingPassword != "" {
 			h.PasswordEnc = existingPassword
 		} else {
-			writeError(w, 400, "invalid_password", "请填写 SSH 密码")
+			writeError(w, 400, "invalid_password", "请填写连接密码")
 			return
 		}
 		h.CredentialID = ""
@@ -999,8 +1081,13 @@ func (a *API) saveHost(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "invalid_credential", "请选择凭据")
 			return
 		}
-		if _, err := a.store.Credential(u.ID, h.CredentialID); err != nil {
+		credential, err := a.store.Credential(u.ID, h.CredentialID)
+		if err != nil {
 			writeError(w, 400, "invalid_credential", "凭据不存在")
+			return
+		}
+		if h.Protocol != "ssh" && credential.Kind != "password" {
+			writeError(w, 400, "invalid_credential", "VNC/RDP 只能使用密码凭据")
 			return
 		}
 	case "prompt":
@@ -1031,6 +1118,18 @@ func (a *API) testHost(w http.ResponseWriter, r *http.Request) {
 	host, err := a.store.Host(u.ID, chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, 404, "host_not_found", "主机不存在")
+		return
+	}
+	if host.Protocol == "vnc" || host.Protocol == "rdp" {
+		latency, testErr := a.desktops.Test(r.Context(), u.ID, host)
+		if testErr != nil {
+			_ = a.store.UpdateHostConnection(u.ID, host.ID, "offline", 0)
+			writeError(w, 502, connectionErrorCode(testErr), testErr.Error())
+			return
+		}
+		latencyMS := int(latency.Milliseconds())
+		_ = a.store.UpdateHostConnection(u.ID, host.ID, "online", latencyMS)
+		writeJSON(w, 200, map[string]any{"latencyMs": latencyMS, "protocol": host.Protocol})
 		return
 	}
 	var in sessionInput
@@ -1066,7 +1165,7 @@ func (a *API) testHost(w http.ResponseWriter, r *http.Request) {
 func connectionErrorCode(err error) string {
 	message := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(message, "tmux is required"):
+	case strings.Contains(message, "tmux is required"), strings.Contains(message, "tmux: command not found"):
 		return "tmux_missing"
 	case strings.Contains(message, "unable to authenticate"), strings.Contains(message, "permission denied"):
 		return "authentication_failed"
@@ -1171,6 +1270,10 @@ func (a *API) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "host_not_found", "主机不存在")
 		return
 	}
+	if host.Protocol != "" && host.Protocol != "ssh" {
+		writeError(w, 400, "invalid_terminal_host", "VNC/RDP 主机只能打开远程桌面")
+		return
+	}
 	var cred store.Credential
 	if in.CredentialID == "" {
 		in.CredentialID = host.CredentialID
@@ -1232,6 +1335,15 @@ func (a *API) sessionForeground(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"command": command})
+}
+
+func (a *API) sessionDockerStatus(w http.ResponseWriter, r *http.Request) {
+	installed, err := a.terminals.DockerInstalled(r.Context(), currentUser(r).ID, chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, 502, "docker_status_unavailable", "无法检测远端 Docker")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"installed": installed})
 }
 func (a *API) updateSession(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)

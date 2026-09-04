@@ -39,7 +39,7 @@ COPY --from=web-build /src/web/dist /app/web/dist
 COPY --from=crush-download /usr/local/bin/crush /usr/local/bin/crush
 RUN mkdir /app/data && chown -R velin:velin /app
 USER velin
-ENV VELIN_ADDR=0.0.0.0:8377 VELIN_DATA_DIR=/app/data VELIN_WEB_DIST=/app/web/dist VELIN_HOST_PORT_ADDR=127.0.0.1
+ENV VELIN_ADDR=0.0.0.0:8377 VELIN_DATA_DIR=/app/data VELIN_WEB_DIST=/app/web/dist VELIN_HOST_PORT_ADDR=127.0.0.1 VELIN_GUACD_ADDR=127.0.0.1:4822 VELIN_DESKTOP_PROXY_ADDR=127.0.0.1
 VOLUME ["/app/data"]
 EXPOSE 8377
 ENTRYPOINT ["/app/velin"]

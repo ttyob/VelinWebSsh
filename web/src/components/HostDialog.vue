@@ -18,6 +18,7 @@ const defaults = (): Host => ({
   id: "",
   name: "",
   address: "",
+  protocol: "ssh",
   port: 22,
   username: "root",
   credentialID: "",
@@ -31,10 +32,28 @@ const defaults = (): Host => ({
   terminalType: "xterm-256color",
   sessionMode: "tmux",
   jumpHostID: "",
+  rdpMode: "web",
+  rdpQuality: "crisp",
+  rdpClipboard: true,
+  rdpAudio: false,
+  rdpDrive: false,
+  rdpPrinting: false,
+  rdpMultiMonitor: false,
+  desktopDomain: "",
+  desktopSecurity: "any",
+  ignoreCertificate: true,
+  desktopReadOnly: false,
 });
 const form = reactive<Host>(defaults());
 const availableJumpHosts = computed(() =>
-  props.hosts.filter((host) => host.id !== form.id),
+  props.hosts.filter(
+    (host) => host.id !== form.id && (!host.protocol || host.protocol === "ssh"),
+  ),
+);
+const availableCredentials = computed(() =>
+  form.protocol === "ssh"
+    ? props.credentials
+    : props.credentials.filter((credential) => credential.kind === "password"),
 );
 const advancedOpen = ref<string[]>([]),
   authMode = ref<"password" | "credential" | "prompt">("password"),
@@ -56,6 +75,26 @@ watch(
     }
   },
 );
+watch(
+  () => form.protocol,
+  (protocol, previous) => {
+    const ports = { ssh: 22, vnc: 5900, rdp: 3389 } as const;
+    if (!form.port || form.port === ports[previous || "ssh"])
+      form.port = ports[protocol];
+    if (protocol !== "ssh") {
+      form.sessionMode = "normal";
+      form.terminalType = "xterm-256color";
+      if (
+        form.credentialID &&
+        !props.credentials.some(
+          (credential) =>
+            credential.id === form.credentialID && credential.kind === "password",
+        )
+      )
+        form.credentialID = "";
+    }
+  },
+);
 async function save() {
   try {
     if (
@@ -63,7 +102,7 @@ async function save() {
       !password.value &&
       !form.hasPassword
     )
-      return ElMessage.warning("请输入 SSH 密码");
+      return ElMessage.warning(`请输入 ${form.protocol.toUpperCase()} 密码`);
     if (authMode.value === "credential" && !form.credentialID)
       return ElMessage.warning("请选择凭据");
     const method = form.id ? "PUT" : "POST";
@@ -97,6 +136,29 @@ async function save() {
       <section class="host-form-section">
         <h3>基础设置</h3>
         <div class="form-grid">
+          <el-form-item label="连接协议" class="span-2">
+            <el-segmented
+              v-model="form.protocol"
+              :options="[
+                { label: 'SSH 终端', value: 'ssh' },
+                { label: 'VNC 桌面', value: 'vnc' },
+                { label: 'RDP 桌面', value: 'rdp' },
+              ]"
+            />
+          </el-form-item>
+          <el-form-item
+            v-if="form.protocol === 'rdp'"
+            label="RDP 连接方式"
+            class="span-2"
+          >
+            <el-segmented
+              v-model="form.rdpMode"
+              :options="[
+                { label: '浏览器内连接', value: 'web' },
+                { label: '调用本地远程桌面', value: 'native' },
+              ]"
+            />
+          </el-form-item>
           <el-form-item label="名称"
             ><el-input v-model="form.name"
           /></el-form-item>
@@ -115,7 +177,7 @@ async function save() {
               :max="65535"
               controls-position="right"
           /></el-form-item>
-          <el-form-item label="用户名"
+          <el-form-item v-if="form.protocol !== 'vnc'" label="用户名"
             ><el-input v-model="form.username"
           /></el-form-item>
           <el-form-item label="认证方式" class="span-2">
@@ -130,7 +192,7 @@ async function save() {
           </el-form-item>
           <el-form-item
             v-if="authMode === 'password'"
-            label="SSH 密码"
+            :label="`${form.protocol.toUpperCase()} 密码`"
             class="span-2"
           >
             <el-input
@@ -147,12 +209,16 @@ async function save() {
             class="span-2"
             ><el-select v-model="form.credentialID" placeholder="选择已保存凭据"
               ><el-option
-                v-for="credential in credentials"
+                v-for="credential in availableCredentials"
                 :key="credential.id"
                 :label="credential.name"
                 :value="credential.id" /></el-select
           ></el-form-item>
-          <el-form-item label="终端会话" class="span-2">
+          <el-form-item
+            v-if="form.protocol === 'ssh'"
+            label="终端会话"
+            class="span-2"
+          >
             <el-segmented
               v-model="form.sessionMode"
               :options="[
@@ -189,7 +255,10 @@ async function save() {
                 />
               </el-select>
             </el-form-item>
-            <el-form-item label="启动目录" class="span-2"
+            <el-form-item
+              v-if="form.protocol === 'ssh'"
+              label="启动目录"
+              class="span-2"
               ><el-input
                 v-model="form.initialDirectory"
                 placeholder="例如 /srv/app，留空使用远程默认目录"
@@ -201,21 +270,21 @@ async function save() {
                 :max="120"
                 controls-position="right"
             /></el-form-item>
-            <el-form-item label="Keepalive（秒）"
+            <el-form-item v-if="form.protocol === 'ssh'" label="Keepalive（秒）"
               ><el-input-number
                 v-model="form.keepaliveInterval"
                 :min="0"
                 :max="300"
                 controls-position="right"
             /></el-form-item>
-            <el-form-item label="最大重试次数"
+            <el-form-item v-if="form.protocol === 'ssh'" label="最大重试次数"
               ><el-input-number
                 v-model="form.maxRetries"
                 :min="0"
                 :max="20"
                 controls-position="right"
             /></el-form-item>
-            <el-form-item label="终端类型"
+            <el-form-item v-if="form.protocol === 'ssh'" label="终端类型"
               ><el-select v-model="form.terminalType"
                 ><el-option
                   label="xterm-256color"
@@ -225,6 +294,61 @@ async function save() {
                   label="screen-256color"
                   value="screen-256color" /></el-select
             ></el-form-item>
+            <el-form-item
+              v-if="form.protocol === 'rdp'"
+              label="Windows 域"
+            >
+              <el-input v-model="form.desktopDomain" placeholder="可选" />
+            </el-form-item>
+            <el-form-item
+              v-if="form.protocol === 'rdp'"
+              label="RDP 安全模式"
+            >
+              <el-select v-model="form.desktopSecurity">
+                <el-option label="自动协商" value="any" />
+                <el-option label="NLA" value="nla" />
+                <el-option label="TLS" value="tls" />
+                <el-option label="RDP" value="rdp" />
+              </el-select>
+            </el-form-item>
+            <el-form-item
+              v-if="form.protocol === 'rdp'"
+              label="忽略服务器证书"
+            >
+              <el-switch v-model="form.ignoreCertificate" />
+            </el-form-item>
+            <el-form-item
+              v-if="form.protocol !== 'ssh'"
+              label="只读模式"
+            >
+              <el-switch v-model="form.desktopReadOnly" />
+            </el-form-item>
+            <template v-if="form.protocol === 'rdp' && form.rdpMode === 'web'">
+              <el-form-item label="画质模式" class="span-2">
+                <el-segmented
+                  v-model="form.rdpQuality"
+                  :options="[
+                    { label: '清晰', value: 'crisp' },
+                    { label: '流畅', value: 'smooth' },
+                  ]"
+                />
+              </el-form-item>
+              <el-form-item label="剪贴板">
+                <el-switch v-model="form.rdpClipboard" />
+              </el-form-item>
+              <el-form-item label="音频">
+                <el-switch v-model="form.rdpAudio" />
+              </el-form-item>
+              <el-form-item label="磁盘映射">
+                <el-switch v-model="form.rdpDrive" />
+              </el-form-item>
+              <el-form-item label="打印机映射">
+                <el-switch v-model="form.rdpPrinting" />
+              </el-form-item>
+              <el-form-item label="多显示器">
+                <el-switch v-model="form.rdpMultiMonitor" />
+              </el-form-item>
+            </template>
           </div>
         </el-collapse-item>
       </el-collapse>

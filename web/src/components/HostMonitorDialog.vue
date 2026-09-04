@@ -2,11 +2,13 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import {
   Activity,
+  Ban,
   Clock3,
   Cpu,
   Gauge,
   HardDrive,
   LogIn,
+  LogOut,
   MemoryStick,
   Network,
   RefreshCw,
@@ -15,7 +17,7 @@ import {
   ShieldCheck,
   ShieldX,
 } from "@lucide/vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { api, json } from "../api";
 import {
   deriveCounterRates,
@@ -58,6 +60,7 @@ const activeTab = ref<MonitorTab>("basic");
 const counterSnapshot = ref<MonitorCounters>();
 const samples = ref<MonitorSample[]>([]);
 const sshMonitor = ref<SSHMonitor>();
+const sshActionKey = ref("");
 let refreshTimer: number | undefined;
 
 const connected = computed(() => status.value?.state === "connected");
@@ -116,6 +119,23 @@ function formatDateTime(value?: string) {
 
 function formatRate(value: number) {
   return `${formatBytes(value)}/s`;
+}
+
+function formatSessionDuration(value: string) {
+  const started = new Date(value).getTime();
+  if (!Number.isFinite(started)) return "--";
+  const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remaining = seconds % 60;
+  if (days) return `${days} 天 ${hours} 小时`;
+  if (hours) return `${hours} 小时 ${minutes} 分钟`;
+  return `${minutes} 分 ${remaining} 秒`;
+}
+
+function canBanAddress(value: string) {
+  return Boolean(value) && value !== "-" && value !== "localhost" && value !== "::1" && !value.startsWith("127.");
 }
 
 function progressStatus(value: number): "success" | "warning" | "exception" {
@@ -177,12 +197,88 @@ async function refresh(showMessage = false) {
       processes.value = Array.isArray(nextProcesses) ? nextProcesses : [];
     }
     if (activeTab.value === "ssh") sshMonitor.value = parseSSHMonitor(results[resultIndex] as string);
-    if (showMessage) ElMessage.success("主机状态已刷新");
+if (showMessage) ElMessage.success("主机状态已刷新");
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "主机状态获取失败";
   } finally {
     refreshing.value = false;
     initialLoading.value = false;
+  }
+}
+
+async function terminateSSHSession(session: SSHMonitor["sessions"][number]) {
+  if (!props.host || !session.pid) return;
+  try {
+    await ElMessageBox.confirm(
+      `确定强制退出 ${session.user} 在 ${session.terminal} 上的 SSH 会话？`,
+      "强制退出 SSH 会话",
+      { confirmButtonText: "强制退出", cancelButtonText: "取消", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  sshActionKey.value = `terminate:${session.terminal}:${session.pid}`;
+  try {
+    await api(`/api/hosts/${props.host.id}/agent/ssh-sessions/terminate`, {
+      method: "POST",
+      body: json({ pid: session.pid, terminal: session.terminal, user: session.user }),
+    });
+    ElMessage.success("SSH 会话已发送退出信号");
+    await refresh();
+  } catch (cause) {
+    ElMessage.error(cause instanceof Error ? cause.message : "强制退出失败");
+  } finally {
+    sshActionKey.value = "";
+  }
+}
+
+async function banSSHAddress(address: string) {
+  if (!props.host || !canBanAddress(address)) return;
+  try {
+    await ElMessageBox.confirm(
+      `封禁来源 IP ${address} 后，远端防火墙将拒绝该地址的连接。确认继续？`,
+      "封禁 SSH 来源 IP",
+      { confirmButtonText: "封禁 IP", cancelButtonText: "取消", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  sshActionKey.value = `ban:${address}`;
+  try {
+    await api(`/api/hosts/${props.host.id}/agent/ssh-sessions/ban`, {
+      method: "POST",
+      body: json({ address }),
+    });
+    ElMessage.success(`已提交封禁 ${address}`);
+  } catch (cause) {
+    ElMessage.error(cause instanceof Error ? cause.message : "封禁 IP 失败");
+  } finally {
+    sshActionKey.value = "";
+  }
+}
+
+async function unbanSSHAddress(address: string) {
+  if (!props.host || !canBanAddress(address)) return;
+  try {
+    await ElMessageBox.confirm(
+      `确定解除远端防火墙对 ${address} 的封禁？`,
+      "解除 SSH 来源 IP 封禁",
+      { confirmButtonText: "解除封禁", cancelButtonText: "取消", type: "info" },
+    );
+  } catch {
+    return;
+  }
+  sshActionKey.value = `unban:${address}`;
+  try {
+    await api(`/api/hosts/${props.host.id}/agent/ssh-sessions/unban`, {
+      method: "POST",
+      body: json({ address }),
+    });
+    ElMessage.success(`已提交解除 ${address} 封禁`);
+  } catch (cause) {
+    ElMessage.error(cause instanceof Error ? cause.message : "解除封禁失败");
+  } finally {
+    sshActionKey.value = "";
   }
 }
 
@@ -339,6 +435,25 @@ onBeforeUnmount(() => {
               <section><Network :size="18" /><span>当前会话</span><strong>{{ sshMonitor?.activeSessions || 0 }}</strong><small>who 活跃记录</small></section>
             </div>
             <el-alert v-if="sshMonitor && !sshMonitor.available" type="warning" :closable="false" title="当前 SSH 账号无法读取认证日志，成功和失败次数可能不可用" />
+            <section class="monitor-section monitor-ssh-sessions">
+              <header><div><Network :size="17" /><strong>当前 SSH 会话</strong><span>{{ sshMonitor?.sessions.length || 0 }} 个</span></div><span>来自远端 who -u</span></header>
+              <el-table :data="sshMonitor?.sessions || []" height="250" empty-text="暂无活动 SSH 会话">
+                <el-table-column prop="user" label="用户" width="120" show-overflow-tooltip />
+                <el-table-column prop="terminal" label="终端" width="100" />
+                <el-table-column label="连接时间" width="170"><template #default="{ row }">{{ formatDateTime(row.loginTime) }}</template></el-table-column>
+                <el-table-column label="连接时长" width="130"><template #default="{ row }">{{ formatSessionDuration(row.loginTime) }}</template></el-table-column>
+                <el-table-column prop="address" label="来源 IP" min-width="150" show-overflow-tooltip>
+                  <template #default="{ row }">{{ row.address || "未知" }}</template>
+                </el-table-column>
+                <el-table-column label="操作" width="270" fixed="right">
+                  <template #default="{ row }">
+                    <el-button text type="warning" :icon="LogOut" :loading="sshActionKey === `terminate:${row.terminal}:${row.pid}`" :disabled="!row.pid || Boolean(sshActionKey)" title="强制退出此 SSH 会话" @click="terminateSSHSession(row)">退出</el-button>
+                    <el-button text type="danger" :icon="Ban" :loading="sshActionKey === `ban:${row.address}`" :disabled="!canBanAddress(row.address) || Boolean(sshActionKey)" title="在远端防火墙封禁此来源 IP" @click="banSSHAddress(row.address)">封禁 IP</el-button>
+                    <el-button text :icon="ShieldCheck" :loading="sshActionKey === `unban:${row.address}`" :disabled="!canBanAddress(row.address) || Boolean(sshActionKey)" title="撤销远端防火墙对该来源 IP 的封禁" @click="unbanSSHAddress(row.address)">解封 IP</el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </section>
             <section class="monitor-section monitor-ssh-records">
               <header><div><LogIn :size="17" /><strong>登录记录</strong><span>{{ sshMonitor?.records.length || 0 }} 条 · {{ sshMonitor?.source || '日志不可用' }}</span></div></header>
               <el-table :data="sshMonitor?.records || []" height="390" empty-text="暂无 SSH 登录记录">
@@ -397,7 +512,7 @@ onBeforeUnmount(() => {
 .monitor-disk-row code { overflow: hidden; text-overflow: ellipsis; color: #d8e0db; white-space: nowrap; }
 .monitor-disk-row strong { text-align: right; color: #d8e0db; }
 .monitor-process-search { width: min(310px, 40vw); }
-.monitor-processes :deep(.el-table), .monitor-ssh-records :deep(.el-table) { --el-table-bg-color: transparent; --el-table-tr-bg-color: transparent; --el-table-header-bg-color: #1b2125; --el-table-row-hover-bg-color: #202b31; --el-table-border-color: #303a34; color: #cdd6d0; }
+.monitor-processes :deep(.el-table), .monitor-ssh-sessions :deep(.el-table), .monitor-ssh-records :deep(.el-table) { --el-table-bg-color: transparent; --el-table-tr-bg-color: transparent; --el-table-header-bg-color: #1b2125; --el-table-row-hover-bg-color: #202b31; --el-table-border-color: #303a34; color: #cdd6d0; }
 .monitor-command { font: 11px var(--font-mono, monospace); }
 .ssh-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; padding: 12px 0; }
 .ssh-summary section { min-width: 0; display: grid; grid-template-columns: auto 1fr; gap: 5px 8px; padding: 12px; border: 1px solid #354039; border-radius: 6px; background: #171c20; color: #8fa098; }

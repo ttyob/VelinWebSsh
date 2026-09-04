@@ -94,6 +94,8 @@ function distributionBadge(value?: string) {
   );
 }
 function systemLabel(host: Host) {
+  if (host.protocol === "vnc") return "VNC 桌面";
+  if (host.protocol === "rdp") return "RDP 桌面";
   if (host.distribution) return distributionBadge(host.distribution).label;
   const labels: Record<string, string> = {
     linux: "Linux",
@@ -224,12 +226,14 @@ function dropHost(event: DragEvent, host: Host) {
         <span
           class="host-icon"
           :class="{
-            detected: Boolean(host.platform),
-            distribution: Boolean(host.distribution),
+            detected:
+              (host.protocol || 'ssh') === 'ssh' && Boolean(host.platform),
+            distribution:
+              (host.protocol || 'ssh') === 'ssh' && Boolean(host.distribution),
           }"
           :title="systemLabel(host)"
           :style="
-            host.distribution
+            (host.protocol || 'ssh') === 'ssh' && host.distribution
               ? {
                   color: distributionBadge(host.distribution).color,
                   borderColor: `${distributionBadge(host.distribution).color}66`,
@@ -238,8 +242,13 @@ function dropHost(event: DragEvent, host: Host) {
               : undefined
           "
         >
+          <Monitor
+            v-if="host.protocol === 'vnc' || host.protocol === 'rdp'"
+            :size="17"
+            :stroke-width="1.8"
+          />
           <svg
-            v-if="host.distribution && distributionLogos[host.distribution]"
+            v-else-if="host.distribution && distributionLogos[host.distribution]"
             class="distribution-logo"
             viewBox="0 0 24 24"
             aria-hidden="true"
@@ -256,6 +265,9 @@ function dropHost(event: DragEvent, host: Host) {
         </span>
         <div class="host-copy">
           <strong>{{ host.name }}</strong>
+          <small>
+            {{ (host.protocol || "ssh").toUpperCase() }} · {{ host.address }}:{{ host.port }}
+          </small>
         </div>
         <span v-if="!selecting" class="host-row-actions"
           ><el-dropdown
@@ -268,7 +280,9 @@ function dropHost(event: DragEvent, host: Host) {
                 ><el-dropdown-item @click="emit('connect', host)"
                   >连接</el-dropdown-item
                 ><el-dropdown-item
-                  :disabled="!host.credentialID"
+                  :disabled="
+                    (host.protocol || 'ssh') !== 'ssh' || !host.credentialID
+                  "
                   @click="emit('web', host)"
                   >访问内网 Web</el-dropdown-item
                 ><el-dropdown-item

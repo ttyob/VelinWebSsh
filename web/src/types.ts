@@ -29,6 +29,23 @@ export interface AIModelConfig {
   apiKeyConfigured: boolean;
   configured: boolean;
 }
+export interface TailscaleConfig {
+  enabled: boolean;
+  hostname: string;
+  controlURL: string;
+  authKeyConfigured: boolean;
+  status: TailscaleStatus;
+}
+export interface TailscaleStatus {
+  enabled: boolean;
+  state: string;
+  tun: boolean;
+  ips?: string[];
+  magicDnsSuffix?: string;
+  version?: string;
+  authUrl?: string;
+  health?: string[];
+}
 export interface Snippet {
   id: string;
   userID?: string;
@@ -71,6 +88,7 @@ export interface Host {
   userID?: string;
   name: string;
   address: string;
+  protocol: "ssh" | "vnc" | "rdp";
   port: number;
   username: string;
   credentialID: string;
@@ -86,6 +104,17 @@ export interface Host {
   terminalType: string;
   sessionMode: "tmux" | "normal";
   jumpHostID: string;
+  rdpMode: "web" | "native";
+  rdpQuality: "crisp" | "smooth";
+  rdpClipboard: boolean;
+  rdpAudio: boolean;
+  rdpDrive: boolean;
+  rdpPrinting: boolean;
+  rdpMultiMonitor: boolean;
+  desktopDomain: string;
+  desktopSecurity: "any" | "nla" | "tls" | "rdp";
+  ignoreCertificate: boolean;
+  desktopReadOnly: boolean;
   platform?: "linux" | "windows" | "macos" | "bsd" | "unix" | "";
   distribution?: string;
   lastStatus?: string;

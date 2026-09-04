@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
+	"velin-webssh/internal/netdial"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
 )
@@ -62,6 +63,7 @@ type Manager struct {
 	deploymentID string
 	recordingDir string
 	ffmpegBinary string
+	dialer       netdial.Dialer
 	mu           sync.RWMutex
 	tmuxLocks    sync.Map
 	sessions     map[string]*Session
@@ -173,13 +175,16 @@ func NewManager(s *store.Store, vault *security.Vault, deploymentID string, reco
 	if len(recordingDirs) > 0 && recordingDirs[0] != "" {
 		recordingDir = recordingDirs[0]
 	}
-	return &Manager{store: s, vault: vault, deploymentID: deploymentID, recordingDir: recordingDir, ffmpegBinary: "ffmpeg", sessions: make(map[string]*Session)}
+	return &Manager{store: s, vault: vault, deploymentID: deploymentID, recordingDir: recordingDir, ffmpegBinary: "ffmpeg", dialer: netdial.Direct{}, sessions: make(map[string]*Session)}
 }
 
-func NewManagerWithFFmpeg(s *store.Store, vault *security.Vault, deploymentID, recordingDir, ffmpegBinary string) *Manager {
+func NewManagerWithFFmpeg(s *store.Store, vault *security.Vault, deploymentID, recordingDir, ffmpegBinary string, dialers ...netdial.Dialer) *Manager {
 	manager := NewManager(s, vault, deploymentID, recordingDir)
 	if strings.TrimSpace(ffmpegBinary) != "" {
 		manager.ffmpegBinary = ffmpegBinary
+	}
+	if len(dialers) > 0 && dialers[0] != nil {
+		manager.dialer = dialers[0]
 	}
 	return manager
 }
@@ -458,7 +463,8 @@ func (m *Manager) UploadRecording(ctx context.Context, userID, recordingID strin
 	command := exec.CommandContext(ctx, m.ffmpegBinary,
 		"-hide_banner", "-loglevel", "error", "-y",
 		"-i", tempInput,
-		"-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+		"-an", "-c:v", "libx264", "-preset", "slow", "-crf", "16",
+		"-pix_fmt", "yuv420p", "-movflags", "+faststart",
 		"-f", "mp4",
 		tempOutput,
 	)
@@ -551,7 +557,7 @@ func (m *Manager) Terminate(ctx context.Context, userID, id string, secret, pass
 	}
 	defer client.Close()
 	if err = validateOwnership(client, meta); err != nil {
-		if isTmuxTargetMissing(err.Error()) {
+		if isTmuxTargetMissing(err.Error()) || isTmuxMissing(err.Error()) {
 			return m.store.UpdateTerminalStatus(userID, id, "ended", "Terminated by user")
 		}
 		return err
@@ -586,6 +592,24 @@ func (s *Session) CurrentDirectory() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func (m *Manager) DockerInstalled(ctx context.Context, userID, sessionID string) (bool, error) {
+	session, err := m.Get(userID, sessionID)
+	if err != nil {
+		return false, err
+	}
+	session.mu.RLock()
+	client := session.sshClient
+	session.mu.RUnlock()
+	if client == nil {
+		return false, errors.New("terminal connection is not available")
+	}
+	out, err := session.runCommand(client, "command -v docker 2>/dev/null || true")
+	if err != nil {
+		return false, fmt.Errorf("check Docker installation: %w", err)
+	}
+	return strings.TrimSpace(string(out)) != "", nil
 }
 
 func (s *Session) ForegroundCommand() (string, error) {
@@ -911,8 +935,7 @@ func (m *Manager) dialHost(ctx context.Context, userID string, host store.Host, 
 		}
 		conn, err = dialThroughJump(dialCtx, jumpClient, addr)
 	} else {
-		dialer := net.Dialer{Timeout: timeout}
-		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
+		conn, err = m.dialer.DialContext(dialCtx, "tcp", addr)
 	}
 	if err != nil {
 		if jumpClient != nil {
@@ -984,7 +1007,11 @@ func validateOwnership(client *ssh.Client, meta store.TerminalSession) error {
 	cmd := fmt.Sprintf("tmux -L %s show-options -t %s -v @velin_owner", meta.TmuxSocket, meta.TmuxName)
 	out, err := run(client, cmd)
 	if err != nil {
-		return fmt.Errorf("tmux session not found: %s", cleanOutput(out, err))
+		message := cleanOutput(out, err)
+		if isTmuxMissing(message) {
+			return fmt.Errorf("tmux is required on the remote host: %s", message)
+		}
+		return fmt.Errorf("tmux session not found: %s", message)
 	}
 	if strings.TrimSpace(string(out)) != meta.OwnerMarker {
 		return errors.New("tmux ownership marker mismatch")
@@ -996,7 +1023,15 @@ func isTmuxTargetMissing(message string) bool {
 	message = strings.ToLower(message)
 	return strings.Contains(message, "can't find session") ||
 		strings.Contains(message, "no such session") ||
-		strings.Contains(message, "no server running on")
+		strings.Contains(message, "no server running on") ||
+		(strings.Contains(message, "error connecting to ") && strings.Contains(message, "no such file or directory"))
+}
+
+func isTmuxMissing(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "tmux: command not found") ||
+		strings.Contains(message, "tmux: not found") ||
+		strings.Contains(message, "command not found: tmux")
 }
 
 func run(client *ssh.Client, cmd string) ([]byte, error) {
@@ -1709,7 +1744,7 @@ func (s *Session) killRemote(ctx context.Context) error {
 		return nil
 	}
 	if err := validateOwnership(client, meta); err != nil {
-		if isTmuxTargetMissing(err.Error()) {
+		if isTmuxTargetMissing(err.Error()) || isTmuxMissing(err.Error()) {
 			return nil
 		}
 		return err

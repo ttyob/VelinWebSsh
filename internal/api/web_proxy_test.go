@@ -249,6 +249,53 @@ func TestModifyResponseDoesNotRewriteJavaScript(t *testing.T) {
 	}
 }
 
+func TestRewriteViteDevelopmentJavaScript(t *testing.T) {
+	target, _ := url.Parse("http://cleaner.internal")
+	prefix := "/web-service-proxy/cleaner"
+	source := `import RefreshRuntime from "/@react-refresh"; import App from "/src/App.tsx"; import("/src/lazy.tsx"); const api = "/api/status";`
+	actual := string(rewriteViteJavaScript([]byte(source), prefix, target))
+	for _, expected := range []string{
+		`from "/web-service-proxy/cleaner/@react-refresh"`,
+		`from "/web-service-proxy/cleaner/src/App.tsx"`,
+		`import("/web-service-proxy/cleaner/src/lazy.tsx")`,
+		`const api = "/api/status"`,
+	} {
+		if !strings.Contains(actual, expected) {
+			t.Errorf("rewritten Vite JavaScript missing %q: %s", expected, actual)
+		}
+	}
+}
+
+func TestViteModeOnlyRewritesJavaScriptAfterDevelopmentHTML(t *testing.T) {
+	target, _ := url.Parse("http://cleaner.internal")
+	session := &webProxySession{routePrefix: "/web-service-proxy/cleaner", target: target}
+	htmlRequest, _ := http.NewRequest(http.MethodGet, "http://velin.example/web-service-proxy/cleaner/", nil)
+	htmlResponse := &http.Response{
+		Header:  http.Header{"Content-Type": {"text/html; charset=utf-8"}},
+		Body:    io.NopCloser(strings.NewReader(`<html><head><script type="module" src="/@vite/client"></script></head></html>`)),
+		Request: htmlRequest,
+	}
+	if err := session.modifyResponse(htmlResponse); err != nil {
+		t.Fatal(err)
+	}
+	jsRequest, _ := http.NewRequest(http.MethodGet, "http://velin.example/web-service-proxy/cleaner/src/main.tsx", nil)
+	jsResponse := &http.Response{
+		Header:  http.Header{"Content-Type": {"application/javascript; charset=utf-8"}},
+		Body:    io.NopCloser(strings.NewReader(`import App from "/src/App.tsx";`)),
+		Request: jsRequest,
+	}
+	if err := session.modifyResponse(jsResponse); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(jsResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `from "/web-service-proxy/cleaner/src/App.tsx"`) {
+		t.Fatalf("Vite module import was not rewritten: %s", body)
+	}
+}
+
 func TestPathProxyDisablesConditionalUpstreamCache(t *testing.T) {
 	target, _ := url.Parse("http://router.internal")
 	session := &webProxySession{routePrefix: "/web-service-proxy/id", target: target, upstream: "router.internal"}
