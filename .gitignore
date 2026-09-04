@@ -6,6 +6,8 @@ web/*.tsbuildinfo
 web/vite.config.js
 web/vite.config.d.ts
 artifacts/
+dist/fnos/
+*.fpk
 *.log
 .env
 .DS_Store

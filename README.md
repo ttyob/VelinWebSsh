@@ -88,6 +88,23 @@ docker compose down
 - `velin-linux-web-arm64.tar.gz`
 - `velin-windows-gui-amd64.zip`
 
+### 飞牛 fnOS 应用包
+
+仓库同时提供飞牛 fnOS 的 `.fpk` 应用包构建入口。该包通过 fnOS Docker 项目运行 Velin 和 guacd，数据保存到 fnOS 应用数据目录，不影响现有 Compose 部署：
+
+```bash
+packaging/fnos/build.sh
+```
+
+构建脚本默认使用 GHCR 的当前 `0.3.17` 镜像，也可以指定版本或镜像：
+
+```bash
+VELIN_FNOS_VERSION=0.3.17 packaging/fnos/build.sh
+VELIN_FNOS_IMAGE=ghcr.io/ttyob/velinwebssh:latest packaging/fnos/build.sh
+```
+
+将生成的 `dist/fnos/velin-fnos-*.fpk` 在飞牛应用中心手动安装。首次安装向导会设置管理员账号和密码；安装前请确认飞牛已启用 Docker，并能拉取 Velin、guacd 和 Alpine 镜像。
+
 Linux 包解压后复制配置并运行：
 
 ```bash

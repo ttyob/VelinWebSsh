@@ -1,0 +1,22 @@
+#!/bin/bash
+set -u
+
+CONTAINER_NAME="velin-fnos"
+
+case "${1:-}" in
+  start|stop)
+    # Docker project resources are started and stopped by fnOS.
+    exit 0
+    ;;
+  status)
+    state="$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+    if [ "$state" = "true" ]; then
+      exit 0
+    fi
+    exit 3
+    ;;
+  *)
+    printf 'Unknown command: %s\n' "${1:-}" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    exit 1
+    ;;
+esac

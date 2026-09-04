@@ -1,0 +1,25 @@
+[
+  {
+    "stepTitle": "服务配置",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_ai_base_url",
+        "label": "AI API 地址",
+        "initValue": ""
+      },
+      {
+        "type": "text",
+        "field": "wizard_ai_model",
+        "label": "AI 模型",
+        "initValue": ""
+      },
+      {
+        "type": "password",
+        "field": "wizard_ai_api_key",
+        "label": "AI API Key",
+        "initValue": ""
+      }
+    ]
+  }
+]

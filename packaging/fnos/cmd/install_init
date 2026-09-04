@@ -1,0 +1,5 @@
+#!/bin/bash
+set -eu
+
+mkdir -p "$TRIM_PKGVAR/data" "$TRIM_PKGTMP/rdp-drives"
+chmod 700 "$TRIM_PKGVAR/data" "$TRIM_PKGTMP/rdp-drives"

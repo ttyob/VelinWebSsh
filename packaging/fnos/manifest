@@ -1,0 +1,13 @@
+appname=velin
+version=0.3.17
+display_name=Velin Web SSH
+desc=Self-hosted browser SSH workspace with remote desktop and private networking.
+platform=all
+source=thirdparty
+maintainer=Velin Web SSH
+distributor=Velin Web SSH
+desktop_uidir=ui
+desktop_applaunchname=velin.main
+service_port=8377
+checkport=true
+ctl_stop=true

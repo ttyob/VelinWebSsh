@@ -119,9 +119,24 @@ jobs:
           name: windows-desktop-release
           path: release/velin-windows-gui-amd64.zip
 
+  fnos-package:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fnOS application package
+        env:
+          VELIN_FNOS_VERSION: ${{ github.ref_name }}
+        run: packaging/fnos/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fnos-package
+          path: dist/fnos/*.fpk
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, windows-desktop]
+    needs: [test, windows-desktop, fnos-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -139,6 +154,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: windows-desktop-release
+          path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: fnos-package
           path: release
       - name: Build frontend
         working-directory: web
@@ -160,7 +179,7 @@ jobs:
             tar -C release -czf "release/${package}.tar.gz" "${package}"
           done
           cd release
-          sha256sum velin-linux-*.tar.gz velin-windows-*.zip > checksums.txt
+          sha256sum velin-linux-*.tar.gz velin-windows-*.zip velin-fnos-*.fpk > checksums.txt
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -169,4 +188,5 @@ jobs:
             release/velin-linux-web-amd64.tar.gz
             release/velin-linux-web-arm64.tar.gz
             release/velin-windows-gui-amd64.zip
+            release/velin-fnos-*.fpk
             release/checksums.txt

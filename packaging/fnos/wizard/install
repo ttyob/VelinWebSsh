@@ -1,0 +1,38 @@
+[
+  {
+    "stepTitle": "Velin Web SSH",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_admin_user",
+        "label": "管理员账号",
+        "initValue": "admin",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入管理员账号"
+          },
+          {
+            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "message": "只能使用字母、数字、点、下划线和短横线"
+          }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "管理员密码",
+        "rules": [
+          {
+            "required": true,
+            "message": "请输入管理员密码"
+          },
+          {
+            "pattern": "^.{10,}$",
+            "message": "密码至少需要 10 个字符"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,4 @@
+#!/bin/bash
+set -eu
+# Keep TRIM_PKGVAR so an uninstall does not silently remove the database or keys.
+exit 0
