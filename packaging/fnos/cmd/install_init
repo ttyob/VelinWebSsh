@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
-# fnOS does not provide a stable writable path during install-init. Runtime
-# directories and configuration are created by install_callback/main instead.
-exit 0
+. "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/common"
+
+# install_callback/main runs as the package user. Create the roots while this
+# hook still runs as root and give that user ownership of them.
+mkdir -p "$DATA_ROOT/data" "$DATA_ROOT/run" "$DATA_ROOT/log" \
+  "$RDP_DRIVE_ROOT"
+chown -R velin:velin "$DATA_ROOT" "$RDP_DRIVE_ROOT"
+chmod 700 "$DATA_ROOT/data" "$DATA_ROOT/run" "$DATA_ROOT/log" \
+  "$RDP_DRIVE_ROOT"

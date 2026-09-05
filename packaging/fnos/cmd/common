@@ -5,6 +5,7 @@ DATA_ROOT="${TRIM_PKGVAR:-$APP_ROOT/var}"
 RUN_ROOT="$DATA_ROOT/run"
 LOG_ROOT="$DATA_ROOT/log"
 ENV_FILE="$DATA_ROOT/velin.env"
+RDP_DRIVE_ROOT="${TRIM_PKGTMP:-$APP_ROOT/tmp}/rdp-drives"
 
 load_config() {
   if [ -f "$ENV_FILE" ]; then
