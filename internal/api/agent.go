@@ -170,11 +170,11 @@ func (a *API) agentModels(w http.ResponseWriter, r *http.Request) {
 		// when a compatible provider temporarily does not expose /models.
 		fallback := make([]agent.ModelInfo, 0, 1)
 		if defaultModel != "" {
-			fallback = append(fallback, agent.ModelInfo{ID: defaultModel, ContextWindow: agent.CrushDefaultContextWindow})
+			fallback = append(fallback, agent.ModelInfo{ID: defaultModel})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"defaultModel":         defaultModel,
-			"defaultContextWindow": agent.CrushDefaultContextWindow,
+			"defaultContextWindow": 0,
 			"models":               fallback,
 			"backends":             a.agents.Backends(),
 			"warning":              err.Error(),
@@ -183,7 +183,7 @@ func (a *API) agentModels(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"defaultModel":         defaultModel,
-		"defaultContextWindow": agent.CrushDefaultContextWindow,
+		"defaultContextWindow": 0,
 		"models":               nonNil(models),
 		"backends":             a.agents.Backends(),
 	})

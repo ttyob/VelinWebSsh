@@ -623,7 +623,7 @@ function writeTerminal(data: Uint8Array, callback?: () => void) {
 
 function updateConversationMode() {
   if (!terminal) return;
-  const titleMatch = /(?:^|[\s/])(codex|claude|aider|gemini|opencode|goose|crush|cursor-agent)(?:$|\s)/i.test(
+  const titleMatch = /(?:^|[\s/])(codex|claude|aider|gemini|opencode|goose|cursor-agent)(?:$|\s)/i.test(
     terminalTitle.trim(),
   );
   const activeScreen = terminal.buffer.active.type === "alternate";

@@ -1008,7 +1008,7 @@ function openContext(event: MouseEvent, leafID: string) {
   });
 }
 function isConversationCommand(command: string) {
-  return /(?:^|[\s/])(codex|claude|aider|gemini|opencode|goose|crush|cursor-agent)(?:$|\s)/i.test(
+  return /(?:^|[\s/])(codex|claude|aider|gemini|opencode|goose|cursor-agent)(?:$|\s)/i.test(
     command.trim(),
   );
 }

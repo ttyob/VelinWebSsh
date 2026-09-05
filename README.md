@@ -99,12 +99,11 @@ packaging/fnos/build.sh
 构建脚本默认构建当前主机架构，也可以显式指定架构：
 
 ```bash
-VELIN_FNOS_VERSION=0.3.19 VELIN_FNOS_ARCH=amd64 packaging/fnos/build.sh
-VELIN_FNOS_VERSION=0.3.19 VELIN_FNOS_ARCH=arm64 packaging/fnos/build.sh
-VELIN_FNOS_INCLUDE_CRUSH=1 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.20 VELIN_FNOS_ARCH=amd64 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.20 VELIN_FNOS_ARCH=arm64 packaging/fnos/build.sh
 ```
 
-默认包不携带可选的 Crush AI Agent，以减少约 90 MB 体积；需要时可设置 `VELIN_FNOS_INCLUDE_CRUSH=1`。将生成的 `dist/fnos/velin-fnos-native-*.fpk` 在飞牛应用中心手动安装。首次安装向导会设置管理员账号和密码。构建脚本需要 Docker 和 GitHub 网络来提取对应架构的 guacd 运行库；安装后的 NAS 不需要 Docker。
+将生成的 `dist/fnos/velin-fnos-native-*.fpk` 在飞牛应用中心手动安装。首次安装向导会设置管理员账号和密码。构建脚本需要 Docker 和 GitHub 网络来提取对应架构的 guacd 运行库；安装后的 NAS 不需要 Docker。
 
 Linux 包解压后复制配置并运行：
 
@@ -157,9 +156,8 @@ Velin 默认读取运行目录中的 `.env`，同名系统环境变量优先。
 - `velin.db`：用户、主机、会话和设置
 - `master.key`：SSH 敏感数据的加密主密钥
 - `recordings/`：终端录制
-- `crush/`：可选 AI 后端数据
 
-管理员可以在设置中创建密钥加密备份。备份包含数据库和 `master.key`，不包含 `.env`、终端录制和 Crush 数据。恢复时必须使用创建备份时输入的同一密钥。
+管理员可以在设置中创建密钥加密备份。备份包含数据库和 `master.key`，不包含 `.env` 和终端录制。恢复时必须使用创建备份时输入的同一密钥。
 
 ## 开发
 

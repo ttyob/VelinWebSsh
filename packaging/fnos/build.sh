@@ -3,12 +3,10 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${VELIN_FNOS_VERSION:-0.3.19}"
+VERSION="${VELIN_FNOS_VERSION:-0.3.20}"
 VERSION="${VERSION#v}"
 ARCH="${VELIN_FNOS_ARCH:-$(uname -m)}"
 GUACD_IMAGE="${VELIN_FNOS_GUACD_IMAGE:-guacamole/guacd:1.6.0}"
-CRUSH_VERSION="${VELIN_FNOS_CRUSH_VERSION:-0.91.0}"
-INCLUDE_CRUSH="${VELIN_FNOS_INCLUDE_CRUSH:-0}"
 OUTPUT_DIR="${VELIN_FNOS_OUTPUT_DIR:-$REPO_DIR/dist/fnos}"
 PREBUILT_BINARY="${VELIN_FNOS_BINARY:-}"
 FNPACK_BIN="${FNPACK_BIN:-}"
@@ -21,15 +19,11 @@ case "$ARCH" in
     ARCH=amd64
     GOARCH=amd64
     FNOS_PLATFORM=x86
-    CRUSH_ARCH=x86_64
-    CRUSH_CHECKSUM=74afc41d03243894b5221f03b1bbc4032f1a219671ec9116148946dc2af4c708
     ;;
   aarch64|arm64)
     ARCH=arm64
     GOARCH=arm64
     FNOS_PLATFORM=arm
-    CRUSH_ARCH=arm64
-    CRUSH_CHECKSUM=bd9a88dba0c694bf63f679da3e7f0adef86125d35b466c8e30fadfe8bd9548f6
     ;;
   *)
     echo "Unsupported fnOS architecture: $ARCH" >&2
@@ -133,23 +127,6 @@ if [ -z "$LOADER" ]; then
   exit 1
 fi
 
-if [ "$INCLUDE_CRUSH" = "1" ] || [ "$INCLUDE_CRUSH" = "true" ]; then
-  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
-  CRUSH_ARCHIVE="$TMP_DIR/crush.tar.gz"
-  CRUSH_URL="https://github.com/charmbracelet/crush/releases/download/v${CRUSH_VERSION}/crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}.tar.gz"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$CRUSH_URL" -o "$CRUSH_ARCHIVE"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$CRUSH_ARCHIVE" "$CRUSH_URL"
-  else
-    echo "curl or wget is required to download Crush" >&2
-    exit 1
-  fi
-  printf '%s  %s\n' "$CRUSH_CHECKSUM" "$CRUSH_ARCHIVE" | sha256sum -c -
-  tar -xzf "$CRUSH_ARCHIVE" -C "$STAGE_DIR/app/bin" --strip-components=1 \
-    "crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}/crush"
-  chmod 755 "$STAGE_DIR/app/bin/crush"
-fi
 chmod 755 "$STAGE_DIR/app/bin/velin"
 
 cat > "$STAGE_DIR/app/bin/guacd" <<'EOF'

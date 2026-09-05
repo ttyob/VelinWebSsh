@@ -49,8 +49,6 @@ services:
       VELIN_AI_BASE_URL: ${VELIN_AI_BASE_URL:-}
       VELIN_AI_MODEL: ${VELIN_AI_MODEL:-}
       VELIN_AI_API_KEY: ${VELIN_AI_API_KEY:-}
-      VELIN_CRUSH_BINARY: ${VELIN_CRUSH_BINARY:-/usr/local/bin/crush}
-      VELIN_CRUSH_DATA_DIR: ${VELIN_CRUSH_DATA_DIR:-/app/data/crush}
     volumes:
       - ./data:/app/data
       - rdp-drives:/tmp/velin-rdp-drives

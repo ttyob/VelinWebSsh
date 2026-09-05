@@ -87,9 +87,6 @@ type Manager struct {
 	terminals *terminal.Manager
 	aiMu      sync.RWMutex
 	ai        AIConfig
-	crush     CrushConfig
-	crushMu   sync.Mutex
-	crushRuns map[string]*sync.Mutex
 	mu        sync.RWMutex
 	conns     map[string]*connection
 	statuses  map[string]Status
@@ -106,24 +103,8 @@ type connection struct {
 	done      chan struct{}
 }
 
-func NewManager(terminals *terminal.Manager, ai AIConfig, crush ...CrushConfig) *Manager {
-	crushConfig := CrushConfig{}
-	if len(crush) > 0 {
-		crushConfig = crush[0]
-	}
-	return &Manager{terminals: terminals, ai: ai, crush: crushConfig, crushRuns: make(map[string]*sync.Mutex), conns: make(map[string]*connection), statuses: make(map[string]Status)}
-}
-
-func (m *Manager) lockCrush(workspaceKey string) func() {
-	m.crushMu.Lock()
-	lock := m.crushRuns[workspaceKey]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		m.crushRuns[workspaceKey] = lock
-	}
-	m.crushMu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+func NewManager(terminals *terminal.Manager, ai AIConfig) *Manager {
+	return &Manager{terminals: terminals, ai: ai, conns: make(map[string]*connection), statuses: make(map[string]Status)}
 }
 
 func (m *Manager) AIConfig() AIConfig {
@@ -483,6 +464,10 @@ func dockerLoginCommand(registry, username string) string {
 		return "docker login --username " + shellQuote(username) + " --password-stdin"
 	}
 	return "docker login " + shellQuote(registry) + " --username " + shellQuote(username) + " --password-stdin"
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func parseKeyValues(output string) map[string]string {

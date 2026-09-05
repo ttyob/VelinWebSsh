@@ -485,7 +485,7 @@ async function requestAIOnce(conversationID: string) {
         messages: chatHistory.value.slice(-40),
         model: selectedModel.value || undefined,
         reasoningEffort: reasoningEffort.value || undefined,
-        backend: "crush",
+        backend: "native",
         conversationID,
       }),
     });

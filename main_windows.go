@@ -246,11 +246,7 @@ func runDesktop() (runErr error) {
 	defer tailscaleManager.Close()
 	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary, tailscaleManager)
 	forwardManager := forward.NewManager(s, manager)
-	agentManager := agent.NewManager(
-		manager,
-		agent.AIConfig{BaseURL: cfg.AIBaseURL, APIKey: cfg.AIAPIKey, Model: cfg.AIModel},
-		agent.CrushConfig{Binary: cfg.CrushBinary, DataDir: cfg.CrushDataDir},
-	)
+	agentManager := agent.NewManager(manager, agent.AIConfig{BaseURL: cfg.AIBaseURL, APIKey: cfg.AIAPIKey, Model: cfg.AIModel})
 	appServer := &desktopServer{store: s, agent: agentManager}
 	appServer.server = &http.Server{Addr: cfg.Addr, Handler: api.NewWithTailnet(cfg, s, vault, manager, forwardManager, agentManager, tailscaleManager).Router(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	listener, err := net.Listen("tcp4", cfg.Addr)

@@ -74,11 +74,7 @@ func main() {
 	defer tailscaleManager.Close()
 	manager := terminal.NewManagerWithFFmpeg(s, vault, cfg.DeploymentID, filepath.Join(cfg.DataDir, "recordings"), cfg.FFmpegBinary, tailscaleManager)
 	forwardManager := forward.NewManager(s, manager)
-	agentManager := agent.NewManager(
-		manager,
-		agent.AIConfig{BaseURL: cfg.AIBaseURL, APIKey: cfg.AIAPIKey, Model: cfg.AIModel},
-		agent.CrushConfig{Binary: cfg.CrushBinary, DataDir: cfg.CrushDataDir},
-	)
+	agentManager := agent.NewManager(manager, agent.AIConfig{BaseURL: cfg.AIBaseURL, APIKey: cfg.AIAPIKey, Model: cfg.AIModel})
 	defer agentManager.Close()
 	handler := api.NewWithTailnet(cfg, s, vault, manager, forwardManager, agentManager, tailscaleManager).Router()
 	server := &http.Server{Addr: cfg.Addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}

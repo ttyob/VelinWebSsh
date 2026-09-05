@@ -67,6 +67,10 @@ type ModelInfo struct {
 	MaxOutputTokens int    `json:"maxOutputTokens,omitempty"`
 }
 
+func (m *Manager) Backends() []BackendInfo {
+	return []BackendInfo{{ID: "native", Label: "Velin", Available: true}}
+}
+
 func (m *Manager) Chat(ctx context.Context, history []ChatMessage, hostContext string, options ...ChatOptions) (ChatResponse, error) {
 	selected := ChatOptions{}
 	if len(options) > 0 {
@@ -74,8 +78,6 @@ func (m *Manager) Chat(ctx context.Context, history []ChatMessage, hostContext s
 	}
 	switch strings.TrimSpace(selected.Backend) {
 	case "", "native":
-	case "crush":
-		return m.chatCrush(ctx, history, hostContext, selected)
 	default:
 		return ChatResponse{}, errors.New("invalid agent backend")
 	}
