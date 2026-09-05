@@ -1,7 +1,6 @@
 #!/bin/sh
 set -eu
 
-# fnOS owns the package-variable root. Do not change its mode during the
-# install-init phase; later callbacks create the remaining runtime paths.
-mkdir -p "$TRIM_PKGVAR/data"
-chmod 700 "$TRIM_PKGVAR/data"
+# fnOS does not provide a stable writable path during install-init. Runtime
+# directories and configuration are created by install_callback/main instead.
+exit 0

@@ -1,5 +1,5 @@
 appname=velin
-version=0.3.23
+version=0.3.24
 display_name=Velin Web SSH
 desc=Native browser SSH workspace with remote desktop and private networking.
 platform=x86
