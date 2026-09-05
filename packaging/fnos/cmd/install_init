@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-. "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/common"
-mkdir -p "$DATA_ROOT/data" "$DATA_ROOT/run" "$DATA_ROOT/log" "$DATA_ROOT/rdp-drives"
-chmod 700 "$DATA_ROOT" "$DATA_ROOT/data" "$DATA_ROOT/run" "$DATA_ROOT/log" "$DATA_ROOT/rdp-drives"
-write_config
+# fnOS owns the package-variable root. Do not change its mode during the
+# install-init phase; later callbacks create the remaining runtime paths.
+mkdir -p "$TRIM_PKGVAR/data"
+chmod 700 "$TRIM_PKGVAR/data"
