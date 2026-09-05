@@ -3,4 +3,3 @@ set -eu
 . "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/common"
 load_config
 write_config
-"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/main" start

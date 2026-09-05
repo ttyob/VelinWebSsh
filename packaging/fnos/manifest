@@ -1,13 +1,13 @@
-appname=velin
-version=0.3.27
+appname=velin-web-ssh
+version=0.3.33
 display_name=Velin Web SSH
-desc=Native browser SSH workspace with remote desktop and private networking.
+desc=浏览器端 SSH 工作台，支持远程桌面、文件管理和内网穿透。
 platform=x86
 source=thirdparty
 maintainer=Velin Web SSH
 distributor=Velin Web SSH
 desktop_uidir=ui
-desktop_applaunchname=velin.main
+desktop_applaunchname=velin-web-ssh.main
 service_port=8377
 checkport=true
 ctl_stop=true

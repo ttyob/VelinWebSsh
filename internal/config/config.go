@@ -21,6 +21,7 @@ type Config struct {
 	MasterKeyPath    string
 	WebDist          string
 	CookieSecure     bool
+	AllowEmbed       bool
 	HostPortAddr     string
 	SessionTTL       time.Duration
 	DeploymentID     string
@@ -62,6 +63,7 @@ func Load() (Config, error) {
 		MasterKeyPath:    filepath.Join(dataDir, "master.key"),
 		WebDist:          env("VELIN_WEB_DIST", "web/dist"),
 		CookieSecure:     strings.EqualFold(env("VELIN_COOKIE_SECURE", "false"), "true"),
+		AllowEmbed:       strings.EqualFold(env("VELIN_ALLOW_EMBED", "false"), "true"),
 		HostPortAddr:     hostPortAddr,
 		SessionTTL:       7 * 24 * time.Hour,
 		DeploymentID:     deploymentID,

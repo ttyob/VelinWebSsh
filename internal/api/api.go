@@ -386,13 +386,19 @@ func (a *API) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		w.Header().Set("X-Frame-Options", "DENY")
+		if !a.cfg.AllowEmbed {
+			w.Header().Set("X-Frame-Options", "DENY")
+		}
 		w.Header().Set("Permissions-Policy", "clipboard-read=(self), clipboard-write=(self)")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			// API responses opened as documents get an opaque origin. Fetch clients are unaffected.
 			w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'")
 		} else {
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; font-src 'self' data:")
+			csp := "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; font-src 'self' data:"
+			if a.cfg.AllowEmbed {
+				csp += "; frame-ancestors *"
+			}
+			w.Header().Set("Content-Security-Policy", csp)
 		}
 		next.ServeHTTP(w, r)
 	})
