@@ -99,8 +99,8 @@ packaging/fnos/build.sh
 构建脚本默认构建当前主机架构，也可以显式指定架构：
 
 ```bash
-VELIN_FNOS_VERSION=0.3.21 VELIN_FNOS_ARCH=amd64 packaging/fnos/build.sh
-VELIN_FNOS_VERSION=0.3.21 VELIN_FNOS_ARCH=arm64 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.22 VELIN_FNOS_ARCH=amd64 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.22 VELIN_FNOS_ARCH=arm64 packaging/fnos/build.sh
 ```
 
 将生成的 `dist/fnos/velin-fnos-native-*.fpk` 在飞牛应用中心手动安装。首次安装向导会设置管理员账号和密码。构建脚本需要 Docker 和 GitHub 网络来提取对应架构的 guacd 运行库；安装后的 NAS 不需要 Docker。

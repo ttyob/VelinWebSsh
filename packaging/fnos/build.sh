@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${VELIN_FNOS_VERSION:-0.3.21}"
+VERSION="${VELIN_FNOS_VERSION:-0.3.22}"
 VERSION="${VERSION#v}"
 ARCH="${VELIN_FNOS_ARCH:-$(uname -m)}"
 GUACD_IMAGE="${VELIN_FNOS_GUACD_IMAGE:-guacamole/guacd:1.6.0}"
@@ -121,6 +121,13 @@ find "$STAGE_DIR/app/native/guacd-root" -type f \( -name '*.a' -o -name '*.la' \
 find "$STAGE_DIR/app/native/guacd-root" -type d \( -name cmake -o -name pkgconfig \) -prune -exec rm -rf {} +
 find "$STAGE_DIR/app/native/guacd-root/usr/lib" -maxdepth 1 -name 'libgs.so*' -delete
 rm -rf "$STAGE_DIR/app/native/guacd-root/usr/share/fonts"
+# fnOS rejects archives containing absolute symbolic links. These are only
+# container font and certificate links; guacd uses the NAS system paths.
+rm -rf "$STAGE_DIR/app/native/guacd-root/etc"
+if find "$STAGE_DIR/app/native/guacd-root" -type l -lname '/*' -print -quit | grep -q .; then
+  echo "guacd runtime contains unsupported absolute symbolic links" >&2
+  exit 1
+fi
 
 LOADER="$(find "$STAGE_DIR/app/native/guacd-root/lib" -maxdepth 1 -name 'ld-musl-*.so.1' -type f -print -quit)"
 if [ -z "$LOADER" ]; then
