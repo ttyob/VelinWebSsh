@@ -90,7 +90,7 @@ docker compose down
 
 ### 飞牛 fnOS 原生应用包
 
-仓库提供不依赖 Docker 的飞牛 fnOS `.fpk` 原生应用包。包内直接运行 Velin Go 服务、guacd 和 Crush，数据保存到 fnOS 应用数据目录，不影响现有 Compose 部署：
+仓库提供不依赖 Docker 的飞牛 fnOS `.fpk` 原生应用包。包内直接运行 Velin Go 服务和 guacd，数据保存到 fnOS 应用数据目录，不影响现有 Compose 部署：
 
 ```bash
 packaging/fnos/build.sh
@@ -99,11 +99,12 @@ packaging/fnos/build.sh
 构建脚本默认构建当前主机架构，也可以显式指定架构：
 
 ```bash
-VELIN_FNOS_VERSION=0.3.18 VELIN_FNOS_ARCH=amd64 packaging/fnos/build.sh
-VELIN_FNOS_VERSION=0.3.18 VELIN_FNOS_ARCH=arm64 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.19 VELIN_FNOS_ARCH=amd64 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.19 VELIN_FNOS_ARCH=arm64 packaging/fnos/build.sh
+VELIN_FNOS_INCLUDE_CRUSH=1 packaging/fnos/build.sh
 ```
 
-将生成的 `dist/fnos/velin-fnos-native-*.fpk` 在飞牛应用中心手动安装。首次安装向导会设置管理员账号和密码。构建脚本需要 Docker 和 GitHub 网络来提取对应架构的 guacd 运行库；安装后的 NAS 不需要 Docker。
+默认包不携带可选的 Crush AI Agent，以减少约 90 MB 体积；需要时可设置 `VELIN_FNOS_INCLUDE_CRUSH=1`。将生成的 `dist/fnos/velin-fnos-native-*.fpk` 在飞牛应用中心手动安装。首次安装向导会设置管理员账号和密码。构建脚本需要 Docker 和 GitHub 网络来提取对应架构的 guacd 运行库；安装后的 NAS 不需要 Docker。
 
 Linux 包解压后复制配置并运行：
 

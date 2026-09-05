@@ -13,11 +13,12 @@ packaging/fnos/build.sh
 Build a package for the current host architecture:
 
 ```sh
-VELIN_FNOS_VERSION=0.3.18 packaging/fnos/build.sh
+VELIN_FNOS_VERSION=0.3.19 packaging/fnos/build.sh
 ```
 
 The release workflow builds separate `amd64` and `arm64` packages. The build
 machine needs Docker to extract the matching guacd runtime files, but Docker is
 not needed after installation. Install the matching `.fpk` through fnOS App
-Center. The package includes Velin, guacd and Crush; ffmpeg is optional and
-uses the NAS `ffmpeg` command when recordings are enabled.
+Center. Crush is optional; set `VELIN_FNOS_INCLUDE_CRUSH=1` when the AI Agent
+is needed. ffmpeg is optional and uses the NAS `ffmpeg` command when
+recordings are enabled.

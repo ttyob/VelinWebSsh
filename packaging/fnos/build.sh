@@ -3,11 +3,12 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${VELIN_FNOS_VERSION:-0.3.18}"
+VERSION="${VELIN_FNOS_VERSION:-0.3.19}"
 VERSION="${VERSION#v}"
 ARCH="${VELIN_FNOS_ARCH:-$(uname -m)}"
 GUACD_IMAGE="${VELIN_FNOS_GUACD_IMAGE:-guacamole/guacd:1.6.0}"
 CRUSH_VERSION="${VELIN_FNOS_CRUSH_VERSION:-0.91.0}"
+INCLUDE_CRUSH="${VELIN_FNOS_INCLUDE_CRUSH:-0}"
 OUTPUT_DIR="${VELIN_FNOS_OUTPUT_DIR:-$REPO_DIR/dist/fnos}"
 PREBUILT_BINARY="${VELIN_FNOS_BINARY:-}"
 FNPACK_BIN="${FNPACK_BIN:-}"
@@ -119,27 +120,37 @@ docker export "$CONTAINER_ID" | tar -xpf - -C "$STAGE_DIR/app/native/guacd-root"
 docker rm "$CONTAINER_ID" >/dev/null
 CONTAINER_ID=""
 
+# The guacd image also contains build metadata, CJK fonts and Ghostscript.
+# Keep only runtime files needed by the native guacd process.
+find "$STAGE_DIR/app/native/guacd-root" -type f \( -name '*.a' -o -name '*.la' \) -delete
+find "$STAGE_DIR/app/native/guacd-root" -type d \( -name cmake -o -name pkgconfig \) -prune -exec rm -rf {} +
+find "$STAGE_DIR/app/native/guacd-root/usr/lib" -maxdepth 1 -name 'libgs.so*' -delete
+rm -rf "$STAGE_DIR/app/native/guacd-root/usr/share/fonts/noto"
+
 LOADER="$(find "$STAGE_DIR/app/native/guacd-root/lib" -maxdepth 1 -name 'ld-musl-*.so.1' -type f -print -quit)"
 if [ -z "$LOADER" ]; then
   echo "guacd runtime loader was not found in $GUACD_IMAGE" >&2
   exit 1
 fi
 
-TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
-CRUSH_ARCHIVE="$TMP_DIR/crush.tar.gz"
-CRUSH_URL="https://github.com/charmbracelet/crush/releases/download/v${CRUSH_VERSION}/crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}.tar.gz"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$CRUSH_URL" -o "$CRUSH_ARCHIVE"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$CRUSH_ARCHIVE" "$CRUSH_URL"
-else
-  echo "curl or wget is required to download Crush" >&2
-  exit 1
+if [ "$INCLUDE_CRUSH" = "1" ] || [ "$INCLUDE_CRUSH" = "true" ]; then
+  TMP_DIR="${TMP_DIR:-$(mktemp -d)}"
+  CRUSH_ARCHIVE="$TMP_DIR/crush.tar.gz"
+  CRUSH_URL="https://github.com/charmbracelet/crush/releases/download/v${CRUSH_VERSION}/crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}.tar.gz"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$CRUSH_URL" -o "$CRUSH_ARCHIVE"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$CRUSH_ARCHIVE" "$CRUSH_URL"
+  else
+    echo "curl or wget is required to download Crush" >&2
+    exit 1
+  fi
+  printf '%s  %s\n' "$CRUSH_CHECKSUM" "$CRUSH_ARCHIVE" | sha256sum -c -
+  tar -xzf "$CRUSH_ARCHIVE" -C "$STAGE_DIR/app/bin" --strip-components=1 \
+    "crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}/crush"
+  chmod 755 "$STAGE_DIR/app/bin/crush"
 fi
-printf '%s  %s\n' "$CRUSH_CHECKSUM" "$CRUSH_ARCHIVE" | sha256sum -c -
-tar -xzf "$CRUSH_ARCHIVE" -C "$STAGE_DIR/app/bin" --strip-components=1 \
-  "crush_${CRUSH_VERSION}_Linux_${CRUSH_ARCH}/crush"
-chmod 755 "$STAGE_DIR/app/bin/velin" "$STAGE_DIR/app/bin/crush"
+chmod 755 "$STAGE_DIR/app/bin/velin"
 
 cat > "$STAGE_DIR/app/bin/guacd" <<'EOF'
 #!/bin/sh
