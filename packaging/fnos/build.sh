@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)"
-VERSION="${VELIN_FNOS_VERSION:-0.3.20}"
+VERSION="${VELIN_FNOS_VERSION:-0.3.21}"
 VERSION="${VERSION#v}"
 ARCH="${VELIN_FNOS_ARCH:-$(uname -m)}"
 GUACD_IMAGE="${VELIN_FNOS_GUACD_IMAGE:-guacamole/guacd:1.6.0}"
@@ -114,12 +114,13 @@ docker export "$CONTAINER_ID" | tar -xpf - -C "$STAGE_DIR/app/native/guacd-root"
 docker rm "$CONTAINER_ID" >/dev/null
 CONTAINER_ID=""
 
-# The guacd image also contains build metadata, CJK fonts and Ghostscript.
-# Keep only runtime files needed by the native guacd process.
+# The guacd image also contains build metadata, fonts and Ghostscript.
+# Keep only runtime files needed by the native guacd process. fnOS extracts
+# app.tgz into a temporary area, so avoid shipping the image's font bundle.
 find "$STAGE_DIR/app/native/guacd-root" -type f \( -name '*.a' -o -name '*.la' \) -delete
 find "$STAGE_DIR/app/native/guacd-root" -type d \( -name cmake -o -name pkgconfig \) -prune -exec rm -rf {} +
 find "$STAGE_DIR/app/native/guacd-root/usr/lib" -maxdepth 1 -name 'libgs.so*' -delete
-rm -rf "$STAGE_DIR/app/native/guacd-root/usr/share/fonts/noto"
+rm -rf "$STAGE_DIR/app/native/guacd-root/usr/share/fonts"
 
 LOADER="$(find "$STAGE_DIR/app/native/guacd-root/lib" -maxdepth 1 -name 'ld-musl-*.so.1' -type f -print -quit)"
 if [ -z "$LOADER" ]; then
@@ -157,6 +158,16 @@ mkdir -p "$OUTPUT_DIR"
 PACKAGE_FILE="$(find "$STAGE_DIR" -maxdepth 1 -type f -name '*.fpk' -print -quit)"
 if [ -z "$PACKAGE_FILE" ]; then
   echo "fnpack did not produce an .fpk file" >&2
+  exit 1
+fi
+
+# Catch incomplete archives before they are uploaded as release assets.
+if ! tar -xOf "$PACKAGE_FILE" app.tgz | gzip -t; then
+  echo "fnpack produced a corrupt app.tgz archive" >&2
+  exit 1
+fi
+if ! tar -xOf "$PACKAGE_FILE" app.tgz | tar -tzf - >/dev/null; then
+  echo "fnpack produced an invalid app.tgz tar archive" >&2
   exit 1
 fi
 
