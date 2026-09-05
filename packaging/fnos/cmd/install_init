@@ -3,8 +3,8 @@ set -eu
 
 . "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/common"
 
-# install_callback/main runs as the package user. Create the roots while this
-# hook still runs as root and give that user ownership of them.
+# Create the roots while this hook runs as root, then keep runtime data owned
+# by the package user for the application process and future upgrades.
 mkdir -p "$DATA_ROOT/data" "$DATA_ROOT/run" "$DATA_ROOT/log" \
   "$RDP_DRIVE_ROOT"
 chown -R velin:velin "$DATA_ROOT" "$RDP_DRIVE_ROOT"
