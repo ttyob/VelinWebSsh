@@ -1,1 +1,22 @@
-{}
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "velin",
+        "permission": {
+          "rw": [
+            "velin"
+          ]
+        }
+      },
+      {
+        "name": "velin/data",
+        "permission": {
+          "rw": [
+            "velin"
+          ]
+        }
+      }
+    ]
+  }
+}
