@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"log/slog"
 	"net"
@@ -58,7 +59,23 @@ func main() {
 		if err = s.CreateUser(uuid.NewString(), cfg.AdminUser, hash, "admin"); err != nil {
 			log.Fatal(err)
 		}
-		slog.Warn("initial administrator created", "username", cfg.AdminUser, "password", password, "notice", "change this password after login")
+		user, _, lookupErr := s.UserByUsername(cfg.AdminUser)
+		if lookupErr != nil {
+			log.Fatal(lookupErr)
+		}
+		if err = s.SetForcePasswordChange(user.ID, true); err != nil {
+			log.Fatal(err)
+		}
+		if cfg.AdminPassword == "" {
+			credentialPath := filepath.Join(cfg.DataDir, "initial-admin-credentials.txt")
+			content := fmt.Sprintf("username=%s\npassword=%s\n", cfg.AdminUser, password)
+			if err = os.WriteFile(credentialPath, []byte(content), 0o600); err != nil {
+				log.Fatal(err)
+			}
+			slog.Warn("initial administrator created; change the generated password after login", "username", cfg.AdminUser, "credentials_file", credentialPath)
+		} else {
+			slog.Warn("initial administrator created; change the configured password after login", "username", cfg.AdminUser)
+		}
 	}
 	tailscaleSettings, err := tailnet.LoadSettings(s, vault)
 	if err != nil {

@@ -296,6 +296,20 @@ func (s *Store) CreateUser(id, username, hash, role string) error {
 	_, err := s.DB.Exec(`INSERT INTO users(id,username,password_hash,role) VALUES(?,?,?,?)`, id, username, hash, role)
 	return err
 }
+func (s *Store) SetForcePasswordChange(userID string, force bool) error {
+	result, err := s.DB.Exec(`UPDATE users SET force_password_change=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, force, userID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
 func (s *Store) UserCount() (int, error) {
 	var n int
 	err := s.DB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n)
@@ -455,22 +469,85 @@ func (s *Store) ResetUserPassword(userID, newHash string, forceChange bool) erro
 }
 
 func (s *Store) LoginLock(identity, ip string) (time.Time, error) {
-	var locked sql.NullTime
-	err := s.DB.QueryRow(`SELECT locked_until FROM login_attempts WHERE identity=? AND ip=?`, strings.ToLower(identity), ip).Scan(&locked)
-	if errors.Is(err, sql.ErrNoRows) || !locked.Valid {
-		return time.Time{}, nil
+	keys := loginRateLimitKeys(identity, ip)
+	rows, err := s.DB.Query(`SELECT locked_until FROM login_attempts WHERE (identity=? AND ip=?) OR (identity=? AND ip=?) OR (identity=? AND ip=?)`,
+		keys[0].identity, keys[0].ip, keys[1].identity, keys[1].ip, keys[2].identity, keys[2].ip)
+	if err != nil {
+		return time.Time{}, err
 	}
-	return locked.Time, err
+	defer rows.Close()
+	var latest time.Time
+	for rows.Next() {
+		var locked sql.NullTime
+		if err = rows.Scan(&locked); err != nil {
+			return time.Time{}, err
+		}
+		if locked.Valid && locked.Time.After(latest) {
+			latest = locked.Time
+		}
+	}
+	return latest, rows.Err()
+}
+func (s *Store) LoginFailureCount(identity, ip string) (int, error) {
+	keys := loginRateLimitKeys(identity, ip)
+	rows, err := s.DB.Query(`SELECT failures FROM login_attempts WHERE (identity=? AND ip=?) OR (identity=? AND ip=?) OR (identity=? AND ip=?)`,
+		keys[0].identity, keys[0].ip, keys[1].identity, keys[1].ip, keys[2].identity, keys[2].ip)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	maxFailures := 0
+	for rows.Next() {
+		var failures int
+		if err = rows.Scan(&failures); err != nil {
+			return 0, err
+		}
+		if failures > maxFailures {
+			maxFailures = failures
+		}
+	}
+	return maxFailures, rows.Err()
 }
 func (s *Store) RecordLoginFailure(identity, ip string, threshold, lockMinutes int) error {
-	_, err := s.DB.Exec(`INSERT INTO login_attempts(identity,ip,failures,locked_until) VALUES(?,?,1,NULL)
-		ON CONFLICT(identity,ip) DO UPDATE SET failures=CASE WHEN locked_until IS NOT NULL AND locked_until<CURRENT_TIMESTAMP THEN 1 ELSE failures+1 END,
-		locked_until=CASE WHEN (CASE WHEN locked_until IS NOT NULL AND locked_until<CURRENT_TIMESTAMP THEN 1 ELSE failures+1 END)>=? THEN datetime('now',?) ELSE locked_until END,updated_at=CURRENT_TIMESTAMP`, strings.ToLower(identity), ip, threshold, fmt.Sprintf("+%d minutes", lockMinutes))
-	return err
+	keys := loginRateLimitKeys(identity, ip)
+	thresholds := []int{threshold, maxInt(threshold*2, 10), maxInt(threshold*4, 20)}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for index, key := range keys {
+		if _, err = tx.Exec(`INSERT INTO login_attempts(identity,ip,failures,locked_until) VALUES(?,?,1,NULL)
+			ON CONFLICT(identity,ip) DO UPDATE SET failures=CASE WHEN locked_until IS NOT NULL AND locked_until<CURRENT_TIMESTAMP THEN 1 ELSE failures+1 END,
+			locked_until=CASE WHEN (CASE WHEN locked_until IS NOT NULL AND locked_until<CURRENT_TIMESTAMP THEN 1 ELSE failures+1 END)>=? THEN datetime('now',?) ELSE locked_until END,updated_at=CURRENT_TIMESTAMP`, key.identity, key.ip, thresholds[index], fmt.Sprintf("+%d minutes", lockMinutes)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 func (s *Store) ClearLoginFailures(identity, ip string) error {
-	_, err := s.DB.Exec(`DELETE FROM login_attempts WHERE identity=? AND ip=?`, strings.ToLower(identity), ip)
+	keys := loginRateLimitKeys(identity, ip)
+	_, err := s.DB.Exec(`DELETE FROM login_attempts WHERE (identity=? AND ip=?) OR (identity=? AND ip=?) OR (identity=? AND ip=?)`,
+		keys[0].identity, keys[0].ip, keys[1].identity, keys[1].ip, keys[2].identity, keys[2].ip)
 	return err
+}
+
+type loginRateLimitKey struct{ identity, ip string }
+
+func loginRateLimitKeys(identity, ip string) [3]loginRateLimitKey {
+	identity = strings.ToLower(strings.TrimSpace(identity))
+	return [3]loginRateLimitKey{
+		{identity: identity, ip: ip},
+		{identity: identity, ip: "*"},
+		{identity: "*", ip: ip},
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 func (s *Store) SystemSetting(key string, dst any) error {
 	var raw string

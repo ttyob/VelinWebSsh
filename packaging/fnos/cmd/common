@@ -29,12 +29,14 @@ write_config() {
   ai_base_url="${wizard_ai_base_url:-${VELIN_AI_BASE_URL:-}}"
   ai_model="${wizard_ai_model:-${VELIN_AI_MODEL:-}}"
   ai_api_key="${wizard_ai_api_key:-${VELIN_AI_API_KEY:-}}"
+  embed_origins="${wizard_embed_origins:-${VELIN_EMBED_ORIGINS:-}}"
   {
     printf 'VELIN_ADMIN_USER=%s\n' "$(quote_env "$admin_user")"
     printf 'VELIN_ADMIN_PASSWORD=%s\n' "$(quote_env "$admin_password")"
     printf 'VELIN_AI_BASE_URL=%s\n' "$(quote_env "$ai_base_url")"
     printf 'VELIN_AI_MODEL=%s\n' "$(quote_env "$ai_model")"
     printf 'VELIN_AI_API_KEY=%s\n' "$(quote_env "$ai_api_key")"
+    printf 'VELIN_EMBED_ORIGINS=%s\n' "$(quote_env "$embed_origins")"
   } > "$temp_file"
   mv "$temp_file" "$ENV_FILE"
 }

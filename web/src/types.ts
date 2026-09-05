@@ -258,6 +258,7 @@ export interface WorkspaceLayout {
 export interface ApiErrorBody {
   code: string;
   message: string;
+  captchaRequired?: boolean;
   fingerprint?: string;
   hostName?: string;
   hostAddress?: string;

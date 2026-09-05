@@ -131,7 +131,9 @@ Velin 默认读取运行目录中的 `.env`，同名系统环境变量优先。
 | `VELIN_ADMIN_USER` | `admin` | 首次启动创建的管理员账号 |
 | `VELIN_ADMIN_PASSWORD` | 空 | 首次启动管理员密码 |
 | `VELIN_DATA_DIR` | `data` | 数据库、主密钥和录制目录 |
-| `VELIN_COOKIE_SECURE` | `false` | HTTPS 部署时设置为 `true` |
+| `VELIN_COOKIE_SECURE` | `true` | 会话 Cookie 仅通过 HTTPS 发送；纯 HTTP 内网部署必须显式设置为 `false` |
+| `VELIN_EMBED_ORIGINS` | 空 | 允许嵌入 Velin 的可信来源，多个来源用逗号分隔，例如 `https://nas.example.com` |
+| `VELIN_TRUSTED_PROXY_CIDRS` | 空 | 可信反向代理网段，只有来自这些网段的请求才会读取 `X-Real-IP` |
 | `VELIN_HOST_PORT_ADDR` | `127.0.0.1` | 主机端口代理监听地址 |
 | `VELIN_GUACD_ADDR` | `127.0.0.1:4822` | RDP 使用的 guacd 地址 |
 | `VELIN_DESKTOP_PROXY_ADDR` | `127.0.0.1` | RDP 跳板代理监听地址 |
@@ -141,7 +143,7 @@ Velin 默认读取运行目录中的 `.env`，同名系统环境变量优先。
 | `VELIN_AI_API_KEY` | 空 | AI API Key |
 | `VELIN_FFMPEG_BINARY` | `ffmpeg` | 终端录制使用的 FFmpeg 路径 |
 
-公网部署请使用 Caddy、Nginx 等反向代理提供 HTTPS，并设置 `VELIN_COOKIE_SECURE=true`；同时通过防火墙限制外部直接访问 `8377` 端口。guacd 没有认证能力，Compose 已将其限制在 `127.0.0.1:4822`，不要将该端口暴露到公网。Compose 会自动为 Velin 和 guacd 共享 RDP 磁盘映射目录。
+公网部署请使用 Caddy、Nginx 等反向代理提供 HTTPS；同时通过防火墙限制外部直接访问 `8377` 端口。配置内嵌页面时只填写明确的 `VELIN_EMBED_ORIGINS`，不要使用通配来源。反向代理必须覆盖而不是追加 `X-Real-IP`，并将代理网段写入 `VELIN_TRUSTED_PROXY_CIDRS`。guacd 没有认证能力，Compose 已将其限制在 `127.0.0.1:4822`，不要将该端口暴露到公网。Compose 会自动为 Velin 和 guacd 共享 RDP 磁盘映射目录。
 
 ### 内嵌 Tailscale
 

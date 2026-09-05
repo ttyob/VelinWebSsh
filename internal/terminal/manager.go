@@ -308,6 +308,9 @@ func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, t
 	existing := m.sessions[id]
 	m.mu.RUnlock()
 	if existing != nil {
+		if existing.meta.UserID != userID {
+			return nil, sql.ErrNoRows
+		}
 		return existing, nil
 	}
 	meta, err := m.store.Terminal(userID, id)
@@ -336,6 +339,9 @@ func (m *Manager) Restore(ctx context.Context, userID, id, secret, passphrase, t
 	m.mu.Lock()
 	if prior := m.sessions[id]; prior != nil {
 		m.mu.Unlock()
+		if prior.meta.UserID != userID {
+			return nil, sql.ErrNoRows
+		}
 		return prior, nil
 	}
 	m.sessions[id] = sess

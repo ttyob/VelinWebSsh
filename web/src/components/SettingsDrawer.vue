@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
   Bot,
@@ -23,6 +24,7 @@ import {
   Shield,
   ShieldCheck,
   Trash2,
+  Upload,
   UserPlus,
   Users,
 } from "@lucide/vue";
@@ -68,6 +70,7 @@ const emit = defineEmits<{
   credentialDeleted: [string];
 }>();
 const auth = useAuthStore();
+const router = useRouter();
 const tab = ref("terminal"),
   users = ref<User[]>([]),
   devices = ref<LoginDevice[]>([]),
@@ -81,7 +84,8 @@ const tab = ref("terminal"),
     status: { enabled: false, state: "disabled", tun: false },
   }),
   backupKey = ref(""),
-  backupBusy = ref<"backup" | "restore">();
+  backupBusy = ref<"backup" | "restore">(),
+  backupFileInput = ref<HTMLInputElement | null>(null);
 const userDialogOpen = ref(false),
   userPasswordDialogOpen = ref(false),
   savingUser = ref(false),
@@ -108,10 +112,6 @@ let preferenceSaveInFlight = false;
 let preferenceSaveQueued = false;
 let preferenceSaveNotice = false;
 let savedPreferenceSnapshot = "";
-const totp = ref({ enabled: false, recoveryCodesRemaining: 0 }),
-  totpSetup = ref<{ secret: string; uri: string } | null>(null),
-  totpForm = ref({ password: "", code: "" }),
-  recoveryCodes = ref<string[]>([]);
 const policy = ref<SecurityPolicy>({
   passwordMinLength: 10,
   loginFailureThreshold: 5,
@@ -194,13 +194,11 @@ function formatDuration(seconds: number) {
 }
 
 async function load() {
-  const [loadedDevices, loadedTOTP, lockPIN] = await Promise.all([
+  const [loadedDevices, lockPIN] = await Promise.all([
     api<LoginDevice[]>("/api/auth/devices"),
-    api<{ enabled: boolean; recoveryCodesRemaining: number }>("/api/auth/totp"),
     api<{ configured: boolean }>("/api/auth/lock-pin"),
   ]);
   devices.value = loadedDevices;
-  totp.value = loadedTOTP;
   lockPINConfigured.value = lockPIN.configured;
   if (!lockPIN.configured) props.preferences.lockEnabled = false;
 	if (auth.user?.role === "admin")
@@ -387,6 +385,10 @@ async function revokeAll() {
     await api("/api/auth/devices/revoke-all", { method: "POST" });
     emit("logout");
   } catch {}
+}
+function openSecuritySettings() {
+  emit("update:modelValue", false);
+  void router.push("/settings/security");
 }
 function openCreateUser() {
   userForm.value = {
@@ -597,6 +599,35 @@ function downloadBackup(file: string) {
 	link.href = `/api/admin/backups/${encodeURIComponent(file)}/download`;
 	link.click();
 }
+function chooseBackupFile() {
+  if (backupKey.value.length < 12) {
+    ElMessage.warning("请先输入创建该备份时使用的密钥");
+    return;
+  }
+  backupFileInput.value?.click();
+}
+async function uploadBackup(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  form.append("key", backupKey.value);
+  backupBusy.value = "restore";
+  try {
+    await api<{ file: string; sha256: string }>("/api/admin/backups/upload", {
+      method: "POST",
+      body: form,
+    });
+    backups.value = await api<any[]>("/api/admin/backups");
+    ElMessage.success("备份已上传并通过密钥与完整性校验，请在列表中点击恢复");
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : "备份上传失败");
+  } finally {
+    input.value = "";
+    backupBusy.value = undefined;
+  }
+}
 async function restoreBackup(file: string) {
 	if (backupKey.value.length < 12)
 		return ElMessage.warning("请输入创建该备份时使用的密钥");
@@ -643,90 +674,6 @@ async function changePassword() {
     ElMessage.error(e instanceof Error ? e.message : "修改失败");
   }
 }
-async function beginTOTP() {
-  try {
-    totpSetup.value = await api<{ secret: string; uri: string }>(
-      "/api/auth/totp/setup",
-      { method: "POST" },
-    );
-    totpForm.value = { password: "", code: "" };
-    recoveryCodes.value = [];
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : "无法生成双因素认证设置");
-  }
-}
-async function enableTOTP() {
-  if (!totpForm.value.password || !totpForm.value.code)
-    return ElMessage.warning("请输入当前密码和验证器动态码");
-  try {
-    const result = await api<{ enabled: boolean; recoveryCodes: string[] }>(
-      "/api/auth/totp/enable",
-      { method: "POST", body: json(totpForm.value) },
-    );
-    totp.value = {
-      enabled: true,
-      recoveryCodesRemaining: result.recoveryCodes.length,
-    };
-    recoveryCodes.value = result.recoveryCodes;
-    totpSetup.value = null;
-    totpForm.value = { password: "", code: "" };
-    ElMessage.success("双因素认证已启用，请立即保存恢复码");
-  } catch (e) {
-    ElMessage.error(e instanceof Error ? e.message : "启用失败");
-  }
-}
-async function disableTOTP() {
-  try {
-    const password = await ElMessageBox.prompt(
-      "请输入当前登录密码。",
-      "关闭双因素认证",
-      {
-        confirmButtonText: "下一步",
-        cancelButtonText: "取消",
-        inputType: "password",
-        inputValidator: (v) => Boolean(v) || "请输入当前密码",
-      },
-    );
-    const code = await ElMessageBox.prompt(
-      "请输入验证器中的 6 位动态码。",
-      "确认关闭",
-      {
-        confirmButtonText: "关闭",
-        cancelButtonText: "取消",
-        inputValidator: (v) => /^\d{6}$/.test(v.trim()) || "请输入 6 位动态码",
-      },
-    );
-    await api("/api/auth/totp", {
-      method: "DELETE",
-      body: json({ password: password.value, code: code.value.trim() }),
-    });
-    totp.value = { enabled: false, recoveryCodesRemaining: 0 };
-    totpSetup.value = null;
-    recoveryCodes.value = [];
-    ElMessage.success("双因素认证已关闭");
-  } catch (e: any) {
-    if (e !== "cancel" && e !== "close")
-      ElMessage.error(e instanceof Error ? e.message : "关闭失败");
-  }
-}
-async function copyValue(value: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(value);
-    ElMessage.success(`${label}已复制`);
-  } catch {
-    ElMessage.warning("浏览器未允许复制，请手动选择文本");
-  }
-}
-function downloadRecoveryCodes() {
-  const content = `Velin Web SSH 恢复码\n账号：${auth.user?.username || ""}\n生成时间：${new Date().toLocaleString()}\n\n${recoveryCodes.value.join("\n")}\n`;
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(
-    new Blob([content], { type: "text/plain;charset=utf-8" }),
-  );
-  link.download = "velin-recovery-codes.txt";
-  link.click();
-  URL.revokeObjectURL(link.href);
-}
 function forwardBatch(text: string, sessionIDs: string[]) {
   emit("batchExecute", text, sessionIDs);
 }
@@ -755,6 +702,9 @@ function forwardBatch(text: string, sessionIDs: string[]) {
         </button>
         <button :class="{ active: tab === 'devices' }" @click="tab = 'devices'">
           <Shield :size="17" /><span>账户与设备</span>
+        </button>
+        <button @click="openSecuritySettings">
+          <ShieldCheck :size="17" /><span>安全设置</span>
         </button>
         <button
           :class="{ active: tab === 'credentials' }"
@@ -1095,88 +1045,6 @@ function forwardBatch(text: string, sessionIDs: string[]) {
                 /><el-button @click="changePassword">修改</el-button>
               </div>
             </div>
-            <div class="settings-section totp-section">
-              <div class="security-heading">
-                <div>
-                  <h3>双因素认证</h3>
-                  <p>
-                    登录时使用验证器动态码，恢复码可在无法访问验证器时使用一次。
-                  </p>
-                </div>
-                <span
-                  class="security-state"
-                  :class="{ enabled: totp.enabled }"
-                  >{{ totp.enabled ? "已启用" : "未启用" }}</span
-                >
-              </div>
-              <template v-if="totp.enabled"
-                ><p class="muted">
-                  剩余恢复码：{{ totp.recoveryCodesRemaining }} 个
-                </p>
-                <el-button type="danger" plain @click="disableTOTP"
-                  >关闭双因素认证</el-button
-                ></template
-              >
-              <template v-else-if="totpSetup"
-                ><div class="totp-secret">
-                  <span>验证器密钥</span><code>{{ totpSetup.secret }}</code
-                  ><el-button text @click="copyValue(totpSetup.secret, '密钥')"
-                    >复制</el-button
-                  >
-                </div>
-                <div class="totp-secret">
-                  <span>配置 URI</span
-                  ><code class="totp-uri">{{ totpSetup.uri }}</code
-                  ><el-button text @click="copyValue(totpSetup.uri, '配置 URI')"
-                    >复制</el-button
-                  >
-                </div>
-                <div class="inline-form totp-confirm">
-                  <el-input
-                    v-model="totpForm.password"
-                    type="password"
-                    show-password
-                    placeholder="当前密码"
-                  /><el-input
-                    v-model="totpForm.code"
-                    maxlength="6"
-                    inputmode="numeric"
-                    placeholder="6 位动态码"
-                  /><el-button
-                    type="primary"
-                    :icon="ShieldCheck"
-                    @click="enableTOTP"
-                    >确认启用</el-button
-                  >
-                </div></template
-              >
-              <el-button
-                v-else
-                :icon="ShieldCheck"
-                type="primary"
-                @click="beginTOTP"
-                >设置双因素认证</el-button
-              >
-              <div v-if="recoveryCodes.length" class="recovery-panel">
-                <strong>恢复码仅显示这一次</strong>
-                <p>每个恢复码只能使用一次，请保存在安全位置。</p>
-                <div class="recovery-grid">
-                  <code v-for="code in recoveryCodes" :key="code">{{
-                    code
-                  }}</code>
-                </div>
-                <div class="row-actions">
-                  <el-button
-                    @click="copyValue(recoveryCodes.join('\n'), '恢复码')"
-                    >复制全部</el-button
-                  ><el-button
-                    :icon="HardDriveDownload"
-                    @click="downloadRecoveryCodes"
-                    >下载文本</el-button
-                  >
-                </div>
-              </div>
-            </div>
             <div class="settings-section">
               <h3>登录设备</h3>
               <div class="list-stack">
@@ -1367,6 +1235,19 @@ function forwardBatch(text: string, sessionIDs: string[]) {
                   :disabled="backupBusy === 'restore'"
                   @click="backup"
                 >创建加密备份</el-button>
+                <input
+                  ref="backupFileInput"
+                  class="visually-hidden"
+                  type="file"
+                  accept=".enc,application/octet-stream"
+                  @change="uploadBackup"
+                />
+                <el-button
+                  :icon="Upload"
+                  :loading="backupBusy === 'restore'"
+                  :disabled="backupBusy === 'backup'"
+                  @click="chooseBackupFile"
+                >上传并校验备份</el-button>
               </div>
               <p class="setting-note">
                 恢复时请输入创建该备份时使用的密钥。忘记密钥无法恢复备份；建议通过 HTTPS 使用此功能。

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,28 @@ func TestLoadRejectsInvalidDotEnv(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "load .env") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestParseOriginsRejectsWildcardsAndPaths(t *testing.T) {
+	origins, err := parseOrigins("https://nas.example.com, http://127.0.0.1:8080")
+	if err != nil || len(origins) != 2 {
+		t.Fatalf("origins=%v err=%v", origins, err)
+	}
+	for _, invalid := range []string{"*", "https://nas.example.com/path", "javascript:alert(1)"} {
+		if _, err = parseOrigins(invalid); err == nil {
+			t.Fatalf("invalid origin %q was accepted", invalid)
+		}
+	}
+}
+
+func TestParseCIDRs(t *testing.T) {
+	networks, err := parseCIDRs("127.0.0.1, 10.0.0.0/8")
+	if err != nil || len(networks) != 2 || !networks[0].Contains(net.ParseIP("127.0.0.1")) || !networks[1].Contains(net.ParseIP("10.1.2.3")) {
+		t.Fatalf("networks=%v err=%v", networks, err)
+	}
+	if _, err = parseCIDRs("not-a-network"); err == nil {
+		t.Fatal("invalid proxy network was accepted")
 	}
 }
 

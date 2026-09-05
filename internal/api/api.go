@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -67,6 +68,8 @@ type API struct {
 	wsTotal    atomic.Uint64
 	taskQueue  chan commandTaskRequest
 	backupMu   sync.Mutex
+	captchaMu  sync.Mutex
+	captchas   map[string]loginCaptcha
 }
 
 type contextKey string
@@ -103,7 +106,7 @@ func newAPI(cfg config.Config, s *store.Store, v *security.Vault, t *terminal.Ma
 	desktops := remotedesktop.NewManager(s, v, t, cfg.GuacdAddr, cfg.DesktopProxyAddr, cfg.RDPDriveDir)
 	desktops.SetDialer(dialer)
 	forwards.SetDialer(dialer)
-	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, agents: agents, tailscale: tailscale, webProxies: newWebProxyManager(t, cfg.HostPortAddr), desktops: desktops, started: time.Now(), taskQueue: make(chan commandTaskRequest, 100)}
+	a := &API{cfg: cfg, store: s, vault: v, terminals: t, forwards: forwards, agents: agents, tailscale: tailscale, webProxies: newWebProxyManager(t, cfg.HostPortAddr), desktops: desktops, started: time.Now(), taskQueue: make(chan commandTaskRequest, 100), captchas: make(map[string]loginCaptcha)}
 	a.restoreAIModelConfig()
 	a.restoreHostPortWebServices()
 	go a.commandTaskWorker()
@@ -119,6 +122,7 @@ func (a *API) Router() http.Handler {
 	r.Get("/api/health/ready", a.ready)
 	r.Get("/api/csrf", a.csrfToken)
 	r.Post("/api/auth/login", a.login)
+	r.Get("/api/auth/captcha", a.loginCaptcha)
 	r.Group(func(r chi.Router) {
 		r.Use(a.authenticate)
 		r.Use(a.requirePasswordChange)
@@ -235,6 +239,7 @@ func (a *API) Router() http.Handler {
 			r.Get("/api/admin/metrics", a.metrics)
 			r.Post("/api/admin/backup", a.backup)
 			r.Get("/api/admin/backups", a.backups)
+			r.Post("/api/admin/backups/upload", a.uploadBackup)
 			r.Get("/api/admin/backups/{file}/download", a.downloadBackup)
 			r.Post("/api/admin/backups/{file}/restore", a.restoreBackup)
 		})
@@ -386,7 +391,7 @@ func (a *API) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
-		if !a.cfg.AllowEmbed {
+		if len(a.cfg.EmbedOrigins) == 0 {
 			w.Header().Set("X-Frame-Options", "DENY")
 		}
 		w.Header().Set("Permissions-Policy", "clipboard-read=(self), clipboard-write=(self)")
@@ -395,8 +400,10 @@ func (a *API) securityHeaders(next http.Handler) http.Handler {
 			w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'")
 		} else {
 			csp := "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; font-src 'self' data:"
-			if a.cfg.AllowEmbed {
-				csp += "; frame-ancestors *"
+			if len(a.cfg.EmbedOrigins) > 0 {
+				csp += "; frame-ancestors " + strings.Join(a.cfg.EmbedOrigins, " ")
+			} else {
+				csp += "; frame-ancestors 'none'"
 			}
 			w.Header().Set("Content-Security-Policy", csp)
 		}
@@ -452,41 +459,98 @@ func currentAuthTokenHash(r *http.Request) string {
 }
 func ipOf(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		if net.ParseIP(host).IsLoopback() {
-			if forwarded := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(forwarded) != nil {
-				return forwarded
-			}
-		}
+	if err == nil && net.ParseIP(host) != nil {
 		return host
 	}
 	return r.RemoteAddr
 }
 
+func (a *API) clientIP(r *http.Request) string {
+	remote := ipOf(r)
+	parsedRemote := net.ParseIP(remote)
+	for _, network := range a.cfg.TrustedProxyCIDRs {
+		if parsedRemote != nil && network.Contains(parsedRemote) {
+			forwarded := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+			if net.ParseIP(forwarded) != nil {
+				return forwarded
+			}
+			break
+		}
+	}
+	return remote
+}
+
+func sameOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host)
+}
+
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Username, Password, TOTPCode string
-		Remember                     bool
+		Username  string `json:"username"`
+		Password  string `json:"password"`
+		TOTPCode  string `json:"totpCode"`
+		CaptchaID string `json:"captchaID"`
+		Captcha   string `json:"captcha"`
+		Remember  bool   `json:"remember"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	identity, ip := strings.TrimSpace(in.Username), ipOf(r)
-	policy := a.securityPolicy()
-	if locked, _ := a.store.LoginLock(identity, ip); locked.After(time.Now()) {
-		writeJSONStatus(w, http.StatusTooManyRequests, map[string]any{"code": "login_locked", "message": "登录尝试过多，请稍后再试", "lockedUntil": locked})
-		return
-	}
-	u, hash, err := a.store.UserByUsername(identity)
-	if err != nil || u.Disabled || !security.VerifyPassword(hash, in.Password) {
-		_ = a.store.RecordLoginFailure(identity, ip, policy.LoginFailureThreshold, policy.LockMinutes)
+	identity, ip := strings.TrimSpace(in.Username), a.clientIP(r)
+	if identity == "" || len([]rune(identity)) > 128 {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
+	policy := a.securityPolicy()
+	locked, lockErr := a.store.LoginLock(identity, ip)
+	if lockErr != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "登录失败，请稍后重试")
+		return
+	}
+	if locked.After(time.Now()) {
+		writeJSONStatus(w, http.StatusTooManyRequests, map[string]any{"code": "login_locked", "message": "登录尝试过多，请稍后再试", "lockedUntil": locked})
+		return
+	}
+	failures, failureErr := a.store.LoginFailureCount(identity, ip)
+	if failureErr != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "登录失败，请稍后重试")
+		return
+	}
+	captchaRequired := failures > 0
+	if captchaRequired {
+		valid, captchaCode := a.validateLoginCaptcha(identity, ip, in.CaptchaID, in.Captcha)
+		if !valid {
+			if captchaCode == "" {
+				captchaCode = "captcha_required"
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"code": captchaCode, "message": "请输入正确的图形验证码", "captchaRequired": true})
+			return
+		}
+	}
+	u, hash, err := a.store.UserByUsername(identity)
+	if err != nil || u.Disabled || !security.VerifyPassword(hash, in.Password) {
+		if recordErr := a.store.RecordLoginFailure(identity, ip, policy.LoginFailureThreshold, policy.LockMinutes); recordErr != nil {
+			slog.Error("record login failure", "error", recordErr)
+		}
+		if captchaRequired {
+			a.deleteLoginCaptcha(in.CaptchaID)
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"code": "invalid_credentials", "message": "用户名或密码错误", "captchaRequired": true})
+		return
+	}
 	secretEnc, recoveryHashes, totpEnabled, totpErr := a.store.TOTP(u.ID)
-	if totpErr == nil && totpEnabled {
+	if totpErr != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", "登录失败，请稍后重试")
+		return
+	}
+	if totpEnabled {
 		if in.TOTPCode == "" {
-			writeError(w, http.StatusUnauthorized, "totp_required", "请输入双因素验证码或恢复码")
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"code": "totp_required", "message": "请输入双因素验证码或恢复码", "captchaRequired": captchaRequired})
 			return
 		}
 		secret, decryptErr := a.vault.Decrypt(secretEnc)
@@ -499,8 +563,10 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !valid {
-			_ = a.store.RecordLoginFailure(identity, ip, policy.LoginFailureThreshold, policy.LockMinutes)
-			writeError(w, http.StatusUnauthorized, "invalid_totp", "双因素验证码无效")
+			if recordErr := a.store.RecordLoginFailure(identity, ip, policy.LoginFailureThreshold, policy.LockMinutes); recordErr != nil {
+				slog.Error("record login failure", "error", recordErr)
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"code": "invalid_totp", "message": "双因素验证码无效", "captchaRequired": true})
 			return
 		}
 	}
@@ -518,6 +584,9 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	if err = a.store.CreateAuthSession(sid, u.ID, security.TokenHash(token), r.UserAgent(), ip, time.Now().Add(ttl)); err != nil {
 		writeError(w, 500, "database_error", "登录失败")
 		return
+	}
+	if captchaRequired {
+		a.deleteLoginCaptcha(in.CaptchaID)
 	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: token, Path: "/", HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: int(ttl.Seconds())})
 	writeJSON(w, 200, map[string]any{"user": u})
@@ -646,6 +715,7 @@ func (a *API) changePassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "password_change_failed", "当前密码错误")
 		return
 	}
+	_ = os.Remove(filepath.Join(a.cfg.DataDir, "initial-admin-credentials.txt"))
 	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 func (a *API) totpStatus(w http.ResponseWriter, r *http.Request) {
@@ -1714,7 +1784,10 @@ func (a *API) createUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if policy.ForceChangeOnCreate {
-		_, _ = a.store.DB.Exec(`UPDATE users SET force_password_change=1 WHERE id=?`, id)
+		if err = a.store.SetForcePasswordChange(id, true); err != nil {
+			writeError(w, http.StatusInternalServerError, "database_error", "创建用户失败")
+			return
+		}
 	}
 	u, _ := a.store.UserByID(id)
 	writeJSON(w, 201, u)
@@ -2042,7 +2115,7 @@ func (a *API) terminalWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "session_not_attached", "请先恢复会话")
 		return
 	}
-	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }, ReadBufferSize: 4096, WriteBufferSize: 32768}
+	up := websocket.Upgrader{CheckOrigin: sameOrigin, ReadBufferSize: 4096, WriteBufferSize: 32768}
 	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
 		return

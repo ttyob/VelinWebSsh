@@ -2051,6 +2051,17 @@ body {
 	align-items: center;
 }
 .backup-key-form .el-input { min-width: 0; }
+.visually-hidden {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
+	border: 0;
+}
 .backup-empty { height: 96px; }
 .backup-row { align-items: center; }
 .file-upload-queue { display: grid; gap: 8px; margin-top: 12px; padding: 10px; border: 1px solid var(--line); background: var(--surface-2); }

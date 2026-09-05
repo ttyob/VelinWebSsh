@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,25 +16,26 @@ import (
 )
 
 type Config struct {
-	Addr             string
-	DataDir          string
-	DatabasePath     string
-	MasterKeyPath    string
-	WebDist          string
-	CookieSecure     bool
-	AllowEmbed       bool
-	HostPortAddr     string
-	SessionTTL       time.Duration
-	DeploymentID     string
-	AdminUser        string
-	AdminPassword    string
-	AIBaseURL        string
-	AIAPIKey         string
-	AIModel          string
-	FFmpegBinary     string
-	GuacdAddr        string
-	DesktopProxyAddr string
-	RDPDriveDir      string
+	Addr              string
+	DataDir           string
+	DatabasePath      string
+	MasterKeyPath     string
+	WebDist           string
+	CookieSecure      bool
+	EmbedOrigins      []string
+	TrustedProxyCIDRs []*net.IPNet
+	HostPortAddr      string
+	SessionTTL        time.Duration
+	DeploymentID      string
+	AdminUser         string
+	AdminPassword     string
+	AIBaseURL         string
+	AIAPIKey          string
+	AIModel           string
+	FFmpegBinary      string
+	GuacdAddr         string
+	DesktopProxyAddr  string
+	RDPDriveDir       string
 }
 
 func Load() (Config, error) {
@@ -56,26 +58,35 @@ func Load() (Config, error) {
 	if parsed := net.ParseIP(desktopProxyAddr); parsed == nil || parsed.To4() == nil || parsed.IsUnspecified() {
 		return Config{}, fmt.Errorf("VELIN_DESKTOP_PROXY_ADDR must be a specific IPv4 address")
 	}
+	embedOrigins, err := parseOrigins(os.Getenv("VELIN_EMBED_ORIGINS"))
+	if err != nil {
+		return Config{}, err
+	}
+	trustedProxyCIDRs, err := parseCIDRs(os.Getenv("VELIN_TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
-		Addr:             env("VELIN_ADDR", "0.0.0.0:8377"),
-		DataDir:          dataDir,
-		DatabasePath:     filepath.Join(dataDir, "velin.db"),
-		MasterKeyPath:    filepath.Join(dataDir, "master.key"),
-		WebDist:          env("VELIN_WEB_DIST", "web/dist"),
-		CookieSecure:     strings.EqualFold(env("VELIN_COOKIE_SECURE", "false"), "true"),
-		AllowEmbed:       strings.EqualFold(env("VELIN_ALLOW_EMBED", "false"), "true"),
-		HostPortAddr:     hostPortAddr,
-		SessionTTL:       7 * 24 * time.Hour,
-		DeploymentID:     deploymentID,
-		AdminUser:        env("VELIN_ADMIN_USER", "admin"),
-		AdminPassword:    os.Getenv("VELIN_ADMIN_PASSWORD"),
-		AIBaseURL:        strings.TrimRight(env("VELIN_AI_BASE_URL", ""), "/"),
-		AIAPIKey:         strings.TrimSpace(os.Getenv("VELIN_AI_API_KEY")),
-		AIModel:          strings.TrimSpace(os.Getenv("VELIN_AI_MODEL")),
-		FFmpegBinary:     env("VELIN_FFMPEG_BINARY", "ffmpeg"),
-		GuacdAddr:        env("VELIN_GUACD_ADDR", "127.0.0.1:4822"),
-		DesktopProxyAddr: desktopProxyAddr,
-		RDPDriveDir:      env("VELIN_RDP_DRIVE_DIR", "/tmp/velin-rdp-drives"),
+		Addr:              env("VELIN_ADDR", "0.0.0.0:8377"),
+		DataDir:           dataDir,
+		DatabasePath:      filepath.Join(dataDir, "velin.db"),
+		MasterKeyPath:     filepath.Join(dataDir, "master.key"),
+		WebDist:           env("VELIN_WEB_DIST", "web/dist"),
+		CookieSecure:      strings.EqualFold(env("VELIN_COOKIE_SECURE", "true"), "true"),
+		EmbedOrigins:      embedOrigins,
+		TrustedProxyCIDRs: trustedProxyCIDRs,
+		HostPortAddr:      hostPortAddr,
+		SessionTTL:        7 * 24 * time.Hour,
+		DeploymentID:      deploymentID,
+		AdminUser:         env("VELIN_ADMIN_USER", "admin"),
+		AdminPassword:     os.Getenv("VELIN_ADMIN_PASSWORD"),
+		AIBaseURL:         strings.TrimRight(env("VELIN_AI_BASE_URL", ""), "/"),
+		AIAPIKey:          strings.TrimSpace(os.Getenv("VELIN_AI_API_KEY")),
+		AIModel:           strings.TrimSpace(os.Getenv("VELIN_AI_MODEL")),
+		FFmpegBinary:      env("VELIN_FFMPEG_BINARY", "ffmpeg"),
+		GuacdAddr:         env("VELIN_GUACD_ADDR", "127.0.0.1:4822"),
+		DesktopProxyAddr:  desktopProxyAddr,
+		RDPDriveDir:       env("VELIN_RDP_DRIVE_DIR", "/tmp/velin-rdp-drives"),
 	}, nil
 }
 
@@ -84,6 +95,39 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func parseOrigins(raw string) ([]string, error) {
+	var origins []string
+	for _, value := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+		parsed, err := url.Parse(value)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
+			return nil, fmt.Errorf("VELIN_EMBED_ORIGINS contains invalid origin %q", value)
+		}
+		origins = append(origins, parsed.Scheme+"://"+parsed.Host)
+	}
+	return origins, nil
+}
+
+func parseCIDRs(raw string) ([]*net.IPNet, error) {
+	var networks []*net.IPNet
+	for _, value := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+		if ip := net.ParseIP(value); ip != nil {
+			bits := 128
+			if ip.To4() != nil {
+				bits = 32
+				ip = ip.To4()
+			}
+			networks = append(networks, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		_, network, err := net.ParseCIDR(value)
+		if err != nil {
+			return nil, fmt.Errorf("VELIN_TRUSTED_PROXY_CIDRS contains invalid network %q", value)
+		}
+		networks = append(networks, network)
+	}
+	return networks, nil
 }
 
 func persistedID(path string) (string, error) {

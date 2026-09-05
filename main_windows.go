@@ -161,6 +161,10 @@ func runDesktop() (runErr error) {
 	if os.Getenv("VELIN_ADDR") == "" {
 		_ = os.Setenv("VELIN_ADDR", defaultDesktopAddr)
 	}
+	if os.Getenv("VELIN_COOKIE_SECURE") == "" {
+		// The desktop WebView talks to the local HTTP listener.
+		_ = os.Setenv("VELIN_COOKIE_SECURE", "false")
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -200,8 +204,17 @@ func runDesktop() (runErr error) {
 			_ = s.Close()
 			return err
 		}
+		created, lookupErr := s.UserByUsername(cfg.AdminUser)
+		if lookupErr != nil {
+			_ = s.Close()
+			return lookupErr
+		}
+		if err = s.SetForcePasswordChange(created.ID, true); err != nil {
+			_ = s.Close()
+			return err
+		}
 		credentialNotice = &desktopCredentialNotice{username: cfg.AdminUser, password: password}
-		slog.Warn("GUI ADMIN CREDENTIALS", "username", cfg.AdminUser, "password", password, "notice", "save this password and change it after login")
+		slog.Warn("GUI administrator created; credentials are shown in the application", "username", cfg.AdminUser)
 	} else if desktopArgumentPresent("--reset-admin-password") {
 		user, _, lookupErr := s.UserByUsername(cfg.AdminUser)
 		if lookupErr != nil {
@@ -230,7 +243,7 @@ func runDesktop() (runErr error) {
 			return fmt.Errorf("reset desktop administrator password: %w", err)
 		}
 		credentialNotice = &desktopCredentialNotice{username: user.Username, password: password, reset: true}
-		slog.Warn("GUI ADMIN PASSWORD RESET", "username", user.Username, "password", password, "notice", "save this password and change it after login")
+		slog.Warn("GUI administrator password reset; credentials are shown in the application", "username", user.Username)
 	}
 	tailscaleSettings, err := tailnet.LoadSettings(s, vault)
 	if err != nil {

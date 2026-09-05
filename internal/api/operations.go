@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 )
 
 const maxRecordingUploadBytes int64 = 1 << 30
+const maxBackupUploadBytes int64 = 1 << 30
 
 type commandTaskRequest struct {
 	UserID string
@@ -228,6 +230,88 @@ func (a *API) downloadBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	servePrivateFile(w, r, path, filepath.Base(path), "application/octet-stream")
+}
+
+func (a *API) uploadBackup(w http.ResponseWriter, r *http.Request) {
+	a.backupMu.Lock()
+	defer a.backupMu.Unlock()
+	if r.ContentLength > maxBackupUploadBytes+2<<20 {
+		writeError(w, http.StatusRequestEntityTooLarge, "backup_too_large", "备份文件不能超过 1 GB")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBackupUploadBytes+2<<20)
+	if err := r.ParseMultipartForm(2 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_backup_upload", "上传的备份文件无效")
+		return
+	}
+	key := r.FormValue("key")
+	if err := security.ValidateBackupKey(key); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_backup_key", "备份密钥至少 12 个字符且不能超过 256 个字符")
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "backup_file_required", "请选择加密备份文件")
+		return
+	}
+	defer file.Close()
+	upload, err := os.CreateTemp(a.cfg.DataDir, ".velin-upload-*.db.enc")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backup_upload_failed", "无法创建上传临时文件")
+		return
+	}
+	uploadPath := upload.Name()
+	defer os.Remove(uploadPath)
+	written, copyErr := io.Copy(upload, io.LimitReader(file, maxBackupUploadBytes+1))
+	closeErr := upload.Close()
+	if copyErr != nil || closeErr != nil {
+		writeError(w, http.StatusBadRequest, "backup_upload_failed", "读取备份文件失败")
+		return
+	}
+	if written > maxBackupUploadBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "backup_too_large", "备份文件不能超过 1 GB")
+		return
+	}
+	verifyDB, err := os.CreateTemp(a.cfg.DataDir, ".velin-upload-verify-*.db")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backup_upload_failed", "无法验证备份文件")
+		return
+	}
+	verifyDBPath := verifyDB.Name()
+	_ = verifyDB.Close()
+	defer os.Remove(verifyDBPath)
+	verifyMaster, err := os.CreateTemp(a.cfg.DataDir, ".velin-upload-verify-master-*")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "backup_upload_failed", "无法验证备份文件")
+		return
+	}
+	verifyMasterPath := verifyMaster.Name()
+	_ = verifyMaster.Close()
+	defer os.Remove(verifyMasterPath)
+	if err = security.DecryptBackupBundle(uploadPath, verifyDBPath, verifyMasterPath, key); err != nil {
+		writeError(w, http.StatusBadRequest, "backup_decrypt_failed", "备份密钥错误或备份文件已损坏")
+		return
+	}
+	if err = store.VerifyBackup(verifyDBPath); err != nil {
+		writeError(w, http.StatusBadRequest, "backup_invalid", "备份完整性校验失败")
+		return
+	}
+	name := "velin-upload-" + time.Now().UTC().Format("20060102-150405") + "-" + uuid.NewString()[:8] + ".db.enc"
+	path := filepath.Join(a.cfg.DataDir, name)
+	if err = os.Rename(uploadPath, path); err != nil {
+		writeError(w, http.StatusInternalServerError, "backup_upload_failed", "无法保存上传备份")
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		_ = os.Remove(path)
+		writeError(w, http.StatusInternalServerError, "backup_upload_failed", "无法读取上传备份")
+		return
+	}
+	sum := sha256.Sum256(raw)
+	checksum := hex.EncodeToString(sum[:])
+	_ = os.WriteFile(path+".sha256", []byte(checksum+"  "+name+"\n"), 0o600)
+	writeJSON(w, http.StatusCreated, map[string]any{"file": name, "sha256": checksum, "verified": true, "encrypted": true})
 }
 
 func (a *API) restoreBackup(w http.ResponseWriter, r *http.Request) {

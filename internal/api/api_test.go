@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/pquerna/otp/totp"
+	"velin-webssh/internal/config"
 	"velin-webssh/internal/security"
 	"velin-webssh/internal/store"
 	"velin-webssh/internal/terminal"
@@ -227,6 +229,93 @@ func TestCSRFProtectionDoesNotConsumeProxiedApplicationRequests(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusNoContent {
 		t.Fatalf("proxy POST status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestSameOriginRejectsCrossOriginWebSocket(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://velin.example/ws/sessions/id", nil)
+	request.Header.Set("Origin", "https://evil.example")
+	if sameOrigin(request) {
+		t.Fatal("cross-origin WebSocket request was accepted")
+	}
+	request.Header.Set("Origin", "http://velin.example")
+	if !sameOrigin(request) {
+		t.Fatal("same-origin WebSocket request was rejected")
+	}
+}
+
+func TestClientIPDoesNotTrustUnconfiguredForwardedHeader(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "http://velin.example/api/auth/login", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("X-Real-IP", "203.0.113.20")
+	api := &API{}
+	if got := api.clientIP(request); got != "127.0.0.1" {
+		t.Fatalf("client IP=%q, want proxy address", got)
+	}
+}
+
+func TestClientIPUsesForwardedHeaderOnlyForTrustedProxy(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "http://velin.example/api/auth/login", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("X-Real-IP", "203.0.113.20")
+	_, network, err := net.ParseCIDR("127.0.0.1/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &API{cfg: config.Config{TrustedProxyCIDRs: []*net.IPNet{network}}}
+	if got := api.clientIP(request); got != "203.0.113.20" {
+		t.Fatalf("client IP=%q, want forwarded address", got)
+	}
+}
+
+func TestLoginRequiresCaptchaAfterCredentialFailure(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "captcha-login.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	hash, err := security.HashPassword("correct-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = database.CreateUser("admin", "admin", hash, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err = database.SaveTOTP("admin", "", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	a := &API{cfg: config.Config{CookieSecure: false}, store: database, captchas: make(map[string]loginCaptcha)}
+
+	bad := httptest.NewRequest(http.MethodPost, "http://velin.example/api/auth/login", strings.NewReader(`{"username":"admin","password":"wrong"}`))
+	bad.RemoteAddr = "192.0.2.10:1234"
+	badRecorder := httptest.NewRecorder()
+	a.login(badRecorder, bad)
+	if badRecorder.Code != http.StatusUnauthorized || !strings.Contains(badRecorder.Body.String(), `"captchaRequired":true`) {
+		t.Fatalf("first failed login status=%d body=%s", badRecorder.Code, badRecorder.Body.String())
+	}
+
+	captchaRequest := httptest.NewRequest(http.MethodGet, "http://velin.example/api/auth/captcha?username=admin", nil)
+	captchaRequest.RemoteAddr = bad.RemoteAddr
+	captchaRecorder := httptest.NewRecorder()
+	a.loginCaptcha(captchaRecorder, captchaRequest)
+	if captchaRecorder.Code != http.StatusOK {
+		t.Fatalf("captcha status=%d body=%s", captchaRecorder.Code, captchaRecorder.Body.String())
+	}
+	var challenge struct {
+		ID string `json:"id"`
+	}
+	if err = json.NewDecoder(captchaRecorder.Body).Decode(&challenge); err != nil {
+		t.Fatal(err)
+	}
+	code := a.captchas[challenge.ID].Code
+
+	goodBody := fmt.Sprintf(`{"username":"admin","password":"correct-password","captchaID":%q,"captcha":%q}`, challenge.ID, code)
+	good := httptest.NewRequest(http.MethodPost, "http://velin.example/api/auth/login", strings.NewReader(goodBody))
+	good.RemoteAddr = bad.RemoteAddr
+	goodRecorder := httptest.NewRecorder()
+	a.login(goodRecorder, good)
+	if goodRecorder.Code != http.StatusOK {
+		t.Fatalf("captcha login status=%d body=%s", goodRecorder.Code, goodRecorder.Body.String())
 	}
 }
 

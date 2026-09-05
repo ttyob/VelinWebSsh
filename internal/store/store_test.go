@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,6 +177,45 @@ func TestResetUserPasswordInvalidatesSessions(t *testing.T) {
 	}
 	if err = s.ResetUserPassword("missing", newHash, true); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing user reset error=%v", err)
+	}
+}
+
+func TestLoginFailuresAreScopedToAccountIPAndIP(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "login.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for i := 0; i < 5; i++ {
+		if err = s.RecordLoginFailure("admin", "192.0.2.10", 5, 15); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if locked, err := s.LoginLock("admin", "192.0.2.10"); err != nil || !locked.After(time.Now()) {
+		t.Fatalf("account/IP lock=%v err=%v", locked, err)
+	}
+	for i := 0; i < 5; i++ {
+		if err = s.RecordLoginFailure("admin", "192.0.2.11", 5, 15); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if locked, err := s.LoginLock("admin", "192.0.2.11"); err != nil || locked.IsZero() {
+		t.Fatalf("account-wide lock=%v err=%v", locked, err)
+	}
+	for i := 0; i < 15; i++ {
+		if err = s.RecordLoginFailure(fmt.Sprintf("other-%d", i), "192.0.2.10", 5, 15); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if locked, err := s.LoginLock("other", "192.0.2.10"); err != nil || locked.IsZero() {
+		t.Fatalf("IP-wide lock=%v err=%v", locked, err)
+	}
+	if err = s.ClearLoginFailures("admin", "192.0.2.10"); err != nil {
+		t.Fatal(err)
+	}
+	if locked, err := s.LoginLock("admin", "192.0.2.10"); err != nil || !locked.IsZero() {
+		t.Fatalf("cleared lock=%v err=%v", locked, err)
 	}
 }
 

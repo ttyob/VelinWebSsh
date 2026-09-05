@@ -7,6 +7,7 @@ const router = createRouter({
     { path: '/login', component: () => import('./views/LoginView.vue'), meta: { public: true } },
     { path: '/change-password', component: () => import('./views/ChangePasswordView.vue') },
     { path: '/workspace', component: () => import('./views/WorkspaceView.vue') },
+    { path: '/settings/security', component: () => import('./views/SecuritySettingsView.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/workspace' },
   ],
 })

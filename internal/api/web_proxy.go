@@ -1549,10 +1549,13 @@ func webProxyCSP(host, prefix string) string {
 	wssPath := "wss://" + host + proxyPath
 	web := strings.Join([]string{httpPath, httpsPath}, " ")
 	connect := strings.Join([]string{httpPath, httpsPath, wsPath, wssPath}, " ")
-	return "default-src 'self' data: blob:; " +
-		"script-src 'self' http: https: 'unsafe-inline' 'unsafe-eval'; " +
-		"style-src 'self' http: https: 'unsafe-inline'; img-src 'self' http: https: data: blob:; " +
-		"font-src 'self' http: https: data:; media-src 'self' http: https: blob:; " +
+	return "default-src 'none'; " +
+		// The proxy page is intentionally sandboxed without allow-same-origin. This
+		// keeps an untrusted upstream application from sharing the Velin origin.
+		"sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads; " +
+		"script-src " + web + " 'unsafe-inline'; " +
+		"style-src " + web + " 'unsafe-inline'; img-src " + web + " data: blob:; " +
+		"font-src " + web + " data:; media-src " + web + " blob:; " +
 		"connect-src " + connect + "; form-action " + web + "; frame-src " + web + "; " +
-		"worker-src " + web + " blob:; object-src 'none'; base-uri 'self'"
+		"worker-src " + web + " blob:; object-src 'none'; base-uri 'none'"
 }
